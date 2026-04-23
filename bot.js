@@ -9,7 +9,7 @@ const client = new Client({
 });
 
 // ─── CONFIG ────────────────────────────────────────────────
-const YOUR_USER_ID    = 'YOUR_DISCORD_USER_ID_HERE'; // your Discord user ID
+const YOUR_USER_ID    = '1087369198801526836'; // your Discord user ID
 const REMIND_AFTER_MS = 60 * 60 * 1000;              // 1 hour in ms
 const BOT_WAIT_MS     = 8000;                         // wait up to 8s for game bot reply
 // ───────────────────────────────────────────────────────────
