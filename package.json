@@ -1,0 +1,12 @@
+{
+  "name": "cgdrop-reminder-bot",
+  "version": "1.0.0",
+  "description": "Reminds you to claim cgdrop every hour",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.0.0"
+  }
+}
