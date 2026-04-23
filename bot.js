@@ -21,7 +21,6 @@ client.once('ready', () => {
 });
 
 client.on('messageCreate', async (message) => {
-  // Ignore bots, ignore other users
   if (message.author.bot) return;
   if (message.author.id !== YOUR_USER_ID) return;
 
@@ -31,9 +30,9 @@ client.on('messageCreate', async (message) => {
   const channel = message.channel;
   const userId  = message.author.id;
 
-  console.log(`🎯 Detected cgdrop — waiting up to ${BOT_WAIT_MS / 1000}s for game bot response...`);
+  console.log(`🎯 Detected cgdrop — waiting ${BOT_WAIT_MS / 1000}s for game bot response...`);
 
-  // ── Wait for the first bot reply in this channel ──
+  // Wait for first bot reply
   let replyMsg = null;
   try {
     const collected = await channel.awaitMessages({
@@ -43,63 +42,54 @@ client.on('messageCreate', async (message) => {
       errors: [],
     });
     if (collected.size > 0) replyMsg = collected.first();
-  } catch (_) { /* timeout, no reply */ }
+  } catch (_) {}
 
   if (replyMsg) {
     const allText = extractText(replyMsg).toLowerCase();
-    console.log(`📨 Game bot replied: "${allText.slice(0, 120)}..."`);
+    console.log(`📨 Game bot replied: "${allText.slice(0, 200)}"`);
 
-    // Check for cooldown phrases (based on what CG bot sends)
-    // "Claim your next player in 21 minutes" / "cooldown" etc.
-    const cooldownRegex = /claim your next(?:\s+player)?\s+in\s+(\d+)\s*min/i;
-    const match = allText.match(cooldownRegex);
+    // Match "Claim your next player in X minutes" OR just "cooldown" in title
+    const isCooldown =
+      /claim your next/i.test(allText) ||
+      /cooldown/i.test(allText);
 
-    if (match) {
-      const minsLeft = match[1];
+    const minsMatch = allText.match(/in\s+(\d+)\s*min/i);
+    const minsLeft = minsMatch ? minsMatch[1] : '?';
+
+    if (isCooldown) {
       console.log(`⏳ Cooldown active — ${minsLeft} min left. Skipping reminder.`);
-
-      // React with hourglass so you know bot saw it
       await message.react('⏳').catch(() => {});
-
-      // DM you the time left
       try {
         const user = await client.users.fetch(userId);
         await user.send(`⏳ Cooldown still active — **${minsLeft} minutes** left before you can claim again!`);
-      } catch (_) { /* DMs closed, skip */ }
-
-      return; // ← Do NOT set reminder
+      } catch (_) {}
+      return;
     }
 
-    // No cooldown found → claim succeeded
     console.log(`✅ No cooldown detected. Claim succeeded!`);
   } else {
-    // No bot response in time — could mean claim succeeded silently or bot is slow
     console.log(`⚠️ No game bot response in ${BOT_WAIT_MS / 1000}s. Assuming claim succeeded.`);
   }
 
-  // ── Cancel existing reminder if any ──
+  // Cancel existing reminder
   if (activeReminders.has(userId)) {
     clearTimeout(activeReminders.get(userId));
     console.log(`🔄 Reset existing reminder.`);
   }
 
-  // ── Confirm with reaction ──
   await message.react('⏰').catch(() => {});
 
-  // ── Set 1-hour reminder ──
   const timeout = setTimeout(async () => {
     activeReminders.delete(userId);
     console.log(`🔔 1 hour up! Pinging ${message.author.tag}`);
-
     try {
       await channel.send(`<@${userId}> ⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁`);
     } catch (_) {
-      // Channel ping failed, try DM
       try {
         const user = await client.users.fetch(userId);
         await user.send(`⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁`);
       } catch (err) {
-        console.error('Could not send reminder anywhere:', err);
+        console.error('Could not send reminder:', err);
       }
     }
   }, REMIND_AFTER_MS);
@@ -109,7 +99,6 @@ client.on('messageCreate', async (message) => {
   console.log(`✅ Reminder set. Will ping at ${pingAt.toLocaleTimeString()}`);
 });
 
-// ── Pull all text from a message including embeds ──
 function extractText(msg) {
   let text = msg.content || '';
   for (const embed of msg.embeds) {
@@ -127,7 +116,6 @@ process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
 });
 
-// ── Dummy HTTP server so Render doesn't shut us down ──
 const http = require('http');
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => res.end('Bot is running!')).listen(PORT, () => {
