@@ -25,6 +25,13 @@ client.on('messageCreate', async (message) => {
   if (message.author.id !== YOUR_USER_ID) return;
 
   const content = message.content.trim().toLowerCase();
+
+  // ── !ping — check if bot is alive ──
+  if (content === '!ping') {
+    await message.reply('✅ Bot is alive and watching for cgdrop!');
+    return;
+  }
+
   if (!content.startsWith('cgdrop')) return;
 
   const channel = message.channel;
@@ -32,7 +39,6 @@ client.on('messageCreate', async (message) => {
 
   console.log(`🎯 Detected cgdrop — waiting ${BOT_WAIT_MS / 1000}s for game bot response...`);
 
-  // Wait for first bot reply
   let replyMsg = null;
   try {
     const collected = await channel.awaitMessages({
@@ -48,7 +54,6 @@ client.on('messageCreate', async (message) => {
     const allText = extractText(replyMsg).toLowerCase();
     console.log(`📨 Game bot replied: "${allText.slice(0, 200)}"`);
 
-    // Match "Claim your next player in X minutes" OR just "cooldown" in title
     const isCooldown =
       /claim your next/i.test(allText) ||
       /cooldown/i.test(allText);
@@ -71,7 +76,6 @@ client.on('messageCreate', async (message) => {
     console.log(`⚠️ No game bot response in ${BOT_WAIT_MS / 1000}s. Assuming claim succeeded.`);
   }
 
-  // Cancel existing reminder
   if (activeReminders.has(userId)) {
     clearTimeout(activeReminders.get(userId));
     console.log(`🔄 Reset existing reminder.`);
