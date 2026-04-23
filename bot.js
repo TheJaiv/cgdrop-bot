@@ -127,4 +127,11 @@ process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
 });
 
+// ── Dummy HTTP server so Render doesn't shut us down ──
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => res.end('Bot is running!')).listen(PORT, () => {
+  console.log(`🌐 HTTP server listening on port ${PORT}`);
+});
+
 client.login(process.env.DISCORD_TOKEN);
