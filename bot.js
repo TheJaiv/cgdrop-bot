@@ -8,13 +8,11 @@ const client = new Client({
   ]
 });
 
-// ─── CONFIG ────────────────────────────────────────────────
-const REMIND_AFTER_MS = 60 * 60 * 1000; // 1 hour
-const BOT_WAIT_MS     = 5000;            // wait up to 5s for game bot reply
-// ───────────────────────────────────────────────────────────
+const REMIND_AFTER_MS = 60 * 60 * 1000;
+const BOT_WAIT_MS     = 5000;
 
-const activeReminders = new Map(); // userId -> timeout
-const processingUsers = new Set(); // prevent double triggers
+const activeReminders = new Map();
+const processingUsers = new Set();
 
 client.once('ready', () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
@@ -25,7 +23,6 @@ client.on('messageCreate', async (message) => {
 
   const content = message.content.trim().toLowerCase();
 
-  // ── !ping ──
   if (content === '!ping') {
     await message.reply('✅ Bot is alive and watching for cgdrop!');
     return;
@@ -34,16 +31,12 @@ client.on('messageCreate', async (message) => {
   if (!content.startsWith('cgdrop')) return;
 
   const userId = message.author.id;
-
-  // Prevent double processing if user spams cgdrop
   if (processingUsers.has(userId)) return;
   processingUsers.add(userId);
 
   const channel = message.channel;
+  console.log(`🎯 Detected cgdrop by ${message.author.tag}`);
 
-  console.log(`🎯 Detected cgdrop by ${message.author.tag} — waiting for game bot response...`);
-
-  // Wait for the Cricket Guru bot reply specifically
   let replyMsg = null;
   try {
     const collected = await channel.awaitMessages({
@@ -63,21 +56,28 @@ client.on('messageCreate', async (message) => {
 
   if (replyMsg) {
     const allText = extractText(replyMsg).toLowerCase();
-    console.log(`📨 Game bot replied: "${allText.slice(0, 200)}"`);
+    const rawText = extractText(replyMsg); // keep original case for timestamp
+    console.log(`📨 Game bot replied: "${allText.slice(0, 300)}"`);
 
     const isCooldown =
       /claim your next/i.test(allText) ||
       /cooldown/i.test(allText);
 
     if (isCooldown) {
-      // Extract minutes from text like "in 57 minutes"
-      const minsMatch = allText.match(/in\s+(\d+)\s*min/i);
-      const minsLeft = minsMatch ? minsMatch[1] : 'some';
+      // Extract Unix timestamp from Discord <t:XXXXXXXXXX:r> format
+      const timestampMatch = rawText.match(/<t:(\d+):/);
+      let minsLeft = 'some';
+
+      if (timestampMatch) {
+        const unixSeconds = parseInt(timestampMatch[1]);
+        const nowSeconds  = Math.floor(Date.now() / 1000);
+        const diffMins    = Math.ceil((unixSeconds - nowSeconds) / 60);
+        minsLeft = diffMins > 0 ? String(diffMins) : 'a few';
+      }
 
       console.log(`⏳ Cooldown active for ${message.author.tag} — ${minsLeft} min left.`);
       await message.react('⏳').catch(() => {});
 
-      // Only DM once
       try {
         const user = await client.users.fetch(userId);
         await user.send(`⏳ Cooldown still active — **${minsLeft} minutes** left before you can claim again!`);
@@ -90,7 +90,6 @@ client.on('messageCreate', async (message) => {
     console.log(`⚠️ No game bot response. Assuming claim succeeded for ${message.author.tag}.`);
   }
 
-  // Cancel existing reminder for this user
   if (activeReminders.has(userId)) {
     clearTimeout(activeReminders.get(userId));
     console.log(`🔄 Reset existing reminder for ${message.author.tag}.`);
@@ -100,7 +99,6 @@ client.on('messageCreate', async (message) => {
 
   const timeout = setTimeout(async () => {
     activeReminders.delete(userId);
-    console.log(`🔔 1 hour up! Pinging ${message.author.tag}`);
     try {
       await channel.send(`<@${userId}> ⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁`);
     } catch (_) {
@@ -114,11 +112,9 @@ client.on('messageCreate', async (message) => {
   }, REMIND_AFTER_MS);
 
   activeReminders.set(userId, timeout);
-  const pingAt = new Date(Date.now() + REMIND_AFTER_MS);
-  console.log(`✅ Reminder set for ${message.author.tag}. Will ping at ${pingAt.toLocaleTimeString()}`);
+  console.log(`✅ Reminder set for ${message.author.tag}.`);
 });
 
-// Extract all text from message including embeds
 function extractText(msg) {
   let text = msg.content || '';
   for (const embed of msg.embeds) {
