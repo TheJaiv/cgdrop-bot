@@ -9,12 +9,11 @@ const client = new Client({
 });
 
 // ─── CONFIG ────────────────────────────────────────────────
-const YOUR_USER_ID    = '1087369198801526836'; // your Discord user ID
-const REMIND_AFTER_MS = 60 * 60 * 1000;              // 1 hour in ms
-const BOT_WAIT_MS     = 8000;                         // wait up to 8s for game bot reply
+const REMIND_AFTER_MS = 60 * 60 * 1000; // 1 hour
+const BOT_WAIT_MS     = 8000;            // wait up to 8s for game bot reply
 // ───────────────────────────────────────────────────────────
 
-const activeReminders = new Map();
+const activeReminders = new Map(); // userId -> timeout
 
 client.once('ready', () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
@@ -22,11 +21,10 @@ client.once('ready', () => {
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  if (message.author.id !== YOUR_USER_ID) return;
 
   const content = message.content.trim().toLowerCase();
 
-  // ── !ping — check if bot is alive ──
+  // ── !ping — anyone can check if bot is alive ──
   if (content === '!ping') {
     await message.reply('✅ Bot is alive and watching for cgdrop!');
     return;
@@ -37,8 +35,9 @@ client.on('messageCreate', async (message) => {
   const channel = message.channel;
   const userId  = message.author.id;
 
-  console.log(`🎯 Detected cgdrop — waiting ${BOT_WAIT_MS / 1000}s for game bot response...`);
+  console.log(`🎯 Detected cgdrop by ${message.author.tag} — waiting for game bot response...`);
 
+  // Wait for game bot reply
   let replyMsg = null;
   try {
     const collected = await channel.awaitMessages({
@@ -62,7 +61,7 @@ client.on('messageCreate', async (message) => {
     const minsLeft = minsMatch ? minsMatch[1] : '?';
 
     if (isCooldown) {
-      console.log(`⏳ Cooldown active — ${minsLeft} min left. Skipping reminder.`);
+      console.log(`⏳ Cooldown active for ${message.author.tag} — ${minsLeft} min left.`);
       await message.react('⏳').catch(() => {});
       try {
         const user = await client.users.fetch(userId);
@@ -71,14 +70,15 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    console.log(`✅ No cooldown detected. Claim succeeded!`);
+    console.log(`✅ Claim succeeded for ${message.author.tag}!`);
   } else {
-    console.log(`⚠️ No game bot response in ${BOT_WAIT_MS / 1000}s. Assuming claim succeeded.`);
+    console.log(`⚠️ No game bot response in ${BOT_WAIT_MS / 1000}s for ${message.author.tag}. Assuming claim succeeded.`);
   }
 
+  // Cancel existing reminder for this user
   if (activeReminders.has(userId)) {
     clearTimeout(activeReminders.get(userId));
-    console.log(`🔄 Reset existing reminder.`);
+    console.log(`🔄 Reset existing reminder for ${message.author.tag}.`);
   }
 
   await message.react('⏰').catch(() => {});
@@ -100,7 +100,7 @@ client.on('messageCreate', async (message) => {
 
   activeReminders.set(userId, timeout);
   const pingAt = new Date(Date.now() + REMIND_AFTER_MS);
-  console.log(`✅ Reminder set. Will ping at ${pingAt.toLocaleTimeString()}`);
+  console.log(`✅ Reminder set for ${message.author.tag}. Will ping at ${pingAt.toLocaleTimeString()}`);
 });
 
 function extractText(msg) {
