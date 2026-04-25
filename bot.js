@@ -8,11 +8,11 @@ const client = new Client({
   ]
 });
 
-const REMIND_AFTER_MS = 60 * 60 * 1000;
-const BOT_WAIT_MS     = 5000;
+const REMIND_AFTER_MS  = 60 * 60 * 1000;
+const BOT_WAIT_MS      = 5000;
 
-const activeReminders = new Map();
-const processingUsers = new Set();
+const activeReminders  = new Map(); // userId -> timeout
+const processedMsgIds  = new Set(); // message IDs already handled
 
 client.once('ready', () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
@@ -30,11 +30,16 @@ client.on('messageCreate', async (message) => {
 
   if (!content.startsWith('cgdrop')) return;
 
-  const userId = message.author.id;
-  if (processingUsers.has(userId)) return;
-  processingUsers.add(userId);
+  // Ignore if this exact message was already processed
+  if (processedMsgIds.has(message.id)) return;
+  processedMsgIds.add(message.id);
+
+  // Clean up old message IDs after 10 mins to avoid memory leak
+  setTimeout(() => processedMsgIds.delete(message.id), 10 * 60 * 1000);
 
   const channel = message.channel;
+  const userId  = message.author.id;
+
   console.log(`🎯 Detected cgdrop by ${message.author.tag}`);
 
   let replyMsg = null;
@@ -52,11 +57,9 @@ client.on('messageCreate', async (message) => {
     if (collected.size > 0) replyMsg = collected.first();
   } catch (_) {}
 
-  processingUsers.delete(userId);
-
   if (replyMsg) {
-    const allText = extractText(replyMsg).toLowerCase();
-    const rawText = extractText(replyMsg); // keep original case for timestamp
+    const allText  = extractText(replyMsg).toLowerCase();
+    const rawText  = extractText(replyMsg);
     console.log(`📨 Game bot replied: "${allText.slice(0, 300)}"`);
 
     const isCooldown =
@@ -64,20 +67,16 @@ client.on('messageCreate', async (message) => {
       /cooldown/i.test(allText);
 
     if (isCooldown) {
-      // Extract Unix timestamp from Discord <t:XXXXXXXXXX:r> format
       const timestampMatch = rawText.match(/<t:(\d+):/);
       let minsLeft = 'some';
-
       if (timestampMatch) {
         const unixSeconds = parseInt(timestampMatch[1]);
-        const nowSeconds  = Math.floor(Date.now() / 1000);
-        const diffMins    = Math.ceil((unixSeconds - nowSeconds) / 60);
+        const diffMins    = Math.ceil((unixSeconds - Math.floor(Date.now() / 1000)) / 60);
         minsLeft = diffMins > 0 ? String(diffMins) : 'a few';
       }
 
-      console.log(`⏳ Cooldown active for ${message.author.tag} — ${minsLeft} min left.`);
+      console.log(`⏳ Cooldown for ${message.author.tag} — ${minsLeft} min left.`);
       await message.react('⏳').catch(() => {});
-
       try {
         const user = await client.users.fetch(userId);
         await user.send(`⏳ Cooldown still active — **${minsLeft} minutes** left before you can claim again!`);
@@ -92,7 +91,6 @@ client.on('messageCreate', async (message) => {
 
   if (activeReminders.has(userId)) {
     clearTimeout(activeReminders.get(userId));
-    console.log(`🔄 Reset existing reminder for ${message.author.tag}.`);
   }
 
   await message.react('⏰').catch(() => {});
