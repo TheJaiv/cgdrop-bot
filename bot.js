@@ -101,7 +101,7 @@ client.on('messageCreate', async (message) => {
 
   // ── !ping ──
   if (content === '!ping') {
-    await message.reply('✅ Bot is alive and watching for cgdrop!');
+    await message.reply('✅ Bot is alive and watching for cgdrop!').catch(e => console.error('Reply error:', e.message));
     return;
   }
 
@@ -193,7 +193,7 @@ client.on('messageCreate', async (message) => {
         minsLeft = diffMins > 0 ? String(diffMins) : 'a few';
       }
       console.log(`⏳ Cooldown for ${message.author.tag} — ${minsLeft} min left.`);
-      await message.react('⏳').catch(() => {});
+      await message.react('⏳').catch(e => console.error('React error:', e.message));
       try {
         const user = await client.users.fetch(userId);
         await user.send(`⏳ Cooldown still active — **${minsLeft} minutes** left before you can claim again!`);
@@ -231,7 +231,7 @@ client.on('messageCreate', async (message) => {
 
   if (activeReminders.has(userId)) clearTimeout(activeReminders.get(userId));
 
-  await message.react('⏰').catch(() => {});
+  await message.react('⏰').catch(e => console.error('React error:', e.message));
 
   const remindAt = Date.now() + REMIND_AFTER_MS;
   data.reminders[userId] = { remindAt, channelId: message.channel.id };
