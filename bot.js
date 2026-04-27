@@ -131,14 +131,13 @@ client.once('ready', async () => {
 });
 
 client.on('messageCreate', async (message) => {
-  console.log(`📩 Message from ${message.author.tag}: ${message.content.slice(0,50)}`);
   if (message.author.bot) return;
 
   const content = message.content.trim().toLowerCase();
 
   // ── !ping ──
   if (content === '!ping') {
-    await message.reply('✅ Bot is alive and watching for cgdrop!').catch(e => console.error('Reply error:', e.message));
+    console.log(`✅ !ping by ${message.author.tag}`); await message.reply('✅ Bot is alive and watching for cgdrop!').catch(e => console.error('Reply error:', e.message));
     return;
   }
 
@@ -146,10 +145,10 @@ client.on('messageCreate', async (message) => {
   if (content === '!stats') {
     const s = data.stats;
     if (s.total === 0) {
-      await message.reply('📊 No drops registered yet!');
+      console.log(`📊 !stats by ${message.author.tag}`); await message.reply('📊 No drops registered yet!');
       return;
     }
-    const OVR_ORDER = ['77-','78','79','80','81','82','83','84','85','86','87','88','89','90+'];
+    console.log(`📊 !stats by ${message.author.tag}`); const OVR_ORDER = ['77-','78','79','80','81','82','83','84','85','86','87','88','89','90+'];
     let msg = `📊 **Drop Stats — ${s.total} total drops**\n\`\`\`\n`;
     msg += `${'OVR'.padEnd(6)} ${'Count'.padEnd(8)} Percentage\n`;
     msg += `${'─'.repeat(30)}\n`;
