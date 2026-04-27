@@ -95,6 +95,7 @@ client.once('ready', () => {
 });
 
 client.on('messageCreate', async (message) => {
+  console.log(`📩 Message received from ${message.author.tag}: ${message.content.slice(0,50)}`);
   if (message.author.bot) return;
 
   const content = message.content.trim().toLowerCase();
