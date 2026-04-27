@@ -1,5 +1,4 @@
 const { Client, GatewayIntentBits } = require('discord.js');
-const fs   = require('fs');
 const http = require('http');
 
 const client = new Client({
@@ -12,7 +11,8 @@ const client = new Client({
 
 const REMIND_AFTER_MS = 60 * 60 * 1000;
 const BOT_WAIT_MS     = 5000;
-const DATA_FILE       = './data.json';
+const JSONBIN_KEY     = process.env.JSONBIN_KEY;
+const JSONBIN_BIN_ID  = process.env.JSONBIN_BIN_ID || null;
 
 // ─── OVR MAP (exact card values) ───────────────────────────
 function getOVR(cardValue) {
@@ -33,48 +33,61 @@ function getOVR(cardValue) {
   return null;
 }
 
-// ─── PERSISTENT DATA ───────────────────────────────────────
-function loadData() {
+// ─── JSONBIN STORAGE ───────────────────────────────────────
+let binId = JSONBIN_BIN_ID;
+
+async function loadData() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (binId) {
+      const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
+        headers: { 'X-Master-Key': JSONBIN_KEY }
+      });
+      const json = await res.json();
+      console.log('✅ Data loaded from JSONBin');
+      return json.record;
     }
-  } catch (e) { console.error('Error loading data:', e); }
-  return { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
+  } catch (e) { console.error('Error loading from JSONBin:', e.message); }
+  return { binId: null, reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
 }
 
-function saveData() {
+async function saveData(data) {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (e) { console.error('Error saving data:', e); }
+    if (!binId) {
+      // Create a new bin
+      const res = await fetch('https://api.jsonbin.io/v3/b', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Master-Key': JSONBIN_KEY,
+          'X-Bin-Name': 'cgdrop-bot-data',
+          'X-Bin-Private': 'true'
+        },
+        body: JSON.stringify(data)
+      });
+      const json = await res.json();
+      binId = json.metadata.id;
+      console.log(`✅ Created new JSONBin with ID: ${binId}`);
+      console.log(`⚠️ ADD THIS TO RENDER ENV: JSONBIN_BIN_ID=${binId}`);
+    } else {
+      await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Master-Key': JSONBIN_KEY
+        },
+        body: JSON.stringify(data)
+      });
+    }
+  } catch (e) { console.error('Error saving to JSONBin:', e.message); }
 }
 
-const data = loadData();
+// ─── GLOBAL DATA ───────────────────────────────────────────
+let data = { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
+
 const processedMsgIds = new Set();
 const activeReminders = new Map();
 
-// ─── RESTORE REMINDERS ON STARTUP ──────────────────────────
-async function restoreReminders() {
-  const now = Date.now();
-  for (const [userId, rem] of Object.entries(data.reminders)) {
-    const timeLeft = rem.remindAt - now;
-    if (timeLeft <= 0) {
-      sendReminder(userId, rem.channelId);
-      delete data.reminders[userId];
-      saveData();
-    } else {
-      const timeout = setTimeout(() => {
-        sendReminder(userId, rem.channelId);
-        delete data.reminders[userId];
-        saveData();
-        activeReminders.delete(userId);
-      }, timeLeft);
-      activeReminders.set(userId, timeout);
-      console.log(`⏰ Restored reminder for ${userId} — ${Math.ceil(timeLeft/60000)} min left`);
-    }
-  }
-}
-
+// ─── SEND REMINDER ─────────────────────────────────────────
 async function sendReminder(userId, channelId) {
   try {
     const channel = await client.channels.fetch(channelId);
@@ -89,13 +102,36 @@ async function sendReminder(userId, channelId) {
   }
 }
 
-client.once('ready', () => {
+// ─── RESTORE REMINDERS ─────────────────────────────────────
+async function restoreReminders() {
+  const now = Date.now();
+  for (const [userId, rem] of Object.entries(data.reminders || {})) {
+    const timeLeft = rem.remindAt - now;
+    if (timeLeft <= 0) {
+      sendReminder(userId, rem.channelId);
+      delete data.reminders[userId];
+      await saveData(data);
+    } else {
+      const timeout = setTimeout(async () => {
+        sendReminder(userId, rem.channelId);
+        delete data.reminders[userId];
+        await saveData(data);
+        activeReminders.delete(userId);
+      }, timeLeft);
+      activeReminders.set(userId, timeout);
+      console.log(`⏰ Restored reminder for ${userId} — ${Math.ceil(timeLeft/60000)} min left`);
+    }
+  }
+}
+
+client.once('ready', async () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
-  restoreReminders();
+  data = await loadData();
+  await restoreReminders();
 });
 
 client.on('messageCreate', async (message) => {
-  console.log(`📩 Message received from ${message.author.tag}: ${message.content.slice(0,50)}`);
+  console.log(`📩 Message from ${message.author.tag}: ${message.content.slice(0,50)}`);
   if (message.author.bot) return;
 
   const content = message.content.trim().toLowerCase();
@@ -125,7 +161,7 @@ client.on('messageCreate', async (message) => {
       msg += `${ovr.padEnd(6)} ${String(count).padEnd(8)} ${pct}% ${bar}\n`;
     }
     msg += `\`\`\``;
-    if (s.unknown.length > 0) {
+    if (s.unknown && s.unknown.length > 0) {
       msg += `\n⚠️ **${s.unknown.length} unknown card value(s)** — use \`!unknown\` to see them`;
     }
     await message.reply(msg);
@@ -134,7 +170,7 @@ client.on('messageCreate', async (message) => {
 
   // ── !unknown ──
   if (content === '!unknown') {
-    const unknowns = data.stats.unknown;
+    const unknowns = data.stats.unknown || [];
     if (unknowns.length === 0) {
       await message.reply('✅ No unknown card values logged!');
       return;
@@ -147,7 +183,7 @@ client.on('messageCreate', async (message) => {
   // ── !resetstats ──
   if (content === '!resetstats') {
     data.stats = { total: 0, ovr: {}, unknown: [] };
-    saveData();
+    await saveData(data);
     await message.reply('🗑️ Stats reset!');
     return;
   }
@@ -184,7 +220,6 @@ client.on('messageCreate', async (message) => {
     const rawText = extractText(replyMsg);
     console.log(`📨 Game bot replied: "${rawText.slice(0, 300)}"`);
 
-    // ── Cooldown check ──
     const isCooldown = /claim your next/i.test(allText) || /cooldown/i.test(allText);
     if (isCooldown) {
       const timestampMatch = rawText.match(/<t:(\d+):/);
@@ -202,7 +237,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // ── Extract card value ──
     const cardMatch = rawText.match(/card value\s*`?([\d,]+)`?/i);
     if (cardMatch) {
       const cardValue = parseInt(cardMatch[1].replace(/,/g, ''));
@@ -213,6 +247,7 @@ client.on('messageCreate', async (message) => {
       if (ovr) {
         data.stats.ovr[ovr] = (data.stats.ovr[ovr] || 0) + 1;
       } else {
+        data.stats.unknown = data.stats.unknown || [];
         data.stats.unknown.push({
           value: cardValue,
           user: message.author.tag,
@@ -220,9 +255,7 @@ client.on('messageCreate', async (message) => {
         });
         await channel.send(`⚠️ <@${userId}> Unknown card value **${cardValue}** — not in OVR map! Use \`!unknown\` to review.`);
       }
-      saveData();
-    } else {
-      console.log(`⚠️ Could not extract card value from reply.`);
+      await saveData(data);
     }
 
     console.log(`✅ Claim succeeded for ${message.author.tag}!`);
@@ -236,12 +269,12 @@ client.on('messageCreate', async (message) => {
 
   const remindAt = Date.now() + REMIND_AFTER_MS;
   data.reminders[userId] = { remindAt, channelId: message.channel.id };
-  saveData();
+  await saveData(data);
 
-  const timeout = setTimeout(() => {
+  const timeout = setTimeout(async () => {
     sendReminder(userId, message.channel.id);
     delete data.reminders[userId];
-    saveData();
+    await saveData(data);
     activeReminders.delete(userId);
   }, REMIND_AFTER_MS);
 
