@@ -187,7 +187,7 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  if (!content.startsWith('cgdrop')) return;
+  if (!content.startsWith('cgdrop') && !content.startsWith('cg drop')) return;
 
   if (processedMsgIds.has(message.id)) return;
   processedMsgIds.add(message.id);
