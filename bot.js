@@ -148,16 +148,28 @@ client.on('messageCreate', async (message) => {
       console.log(`📊 !stats by ${message.author.tag}`); await message.reply('📊 No drops registered yet!');
       return;
     }
-    console.log(`📊 !stats by ${message.author.tag}`); const OVR_ORDER = ['77-','78','79','80','81','82','83','84','85','86','87','88','89','90+'];
-    let msg = `📊 **Drop Stats — ${s.total} total drops**\n\`\`\`\n`;
-    msg += `${'OVR'.padEnd(6)} ${'Count'.padEnd(8)} Percentage\n`;
-    msg += `${'─'.repeat(30)}\n`;
+    console.log(`📊 !stats by ${message.author.tag}`);
+    const OVR_ORDER = ['90+','89','88','87','86','85','84','83','82','81','80','79','78','77-'];
+    const EMOJI = {
+      '90+':'💎','89':'🔴','88':'🔴','87':'🔴',
+      '86':'🟠','85':'🟠','84':'🟠',
+      '83':'🟡','82':'🟡','81':'🟡',
+      '80':'🔵','79':'🔵','78':'🔵',
+      '77-':'⚪'
+    };
+    const maxPct = Math.max(...OVR_ORDER.map(o => s.ovr[o] ? (s.ovr[o] / s.total) * 100 : 0));
+    let msg = `📊 **Drop Stats — ${s.total} total drops**
+\`\`\`
+`;
     for (const ovr of OVR_ORDER) {
       const count = s.ovr[ovr] || 0;
       if (count === 0) continue;
-      const pct = ((count / s.total) * 100).toFixed(1);
-      const bar = '█'.repeat(Math.round(pct / 5));
-      msg += `${ovr.padEnd(6)} ${String(count).padEnd(8)} ${pct}% ${bar}\n`;
+      const pct = (count / s.total) * 100;
+      const pctStr = pct.toFixed(1) + '%';
+      const boxes = Math.round((pct / maxPct) * 20);
+      const bar = boxes >= 1 ? '█'.repeat(boxes) : '▪';
+      msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${bar.padEnd(22)} ${pctStr.padEnd(7)} (${count})
+`;
     }
     msg += `\`\`\``;
     if (s.unknown && s.unknown.length > 0) {
