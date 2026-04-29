@@ -128,13 +128,18 @@ function buildStatsMsg(s) {
   const countToBar = {};
   const usedLengths = new Set();
 
-  uniqueCounts.forEach(count => {
+  // uniqueCounts is sorted descending (highest count first)
+  // highest count → most bars, assign descending bar lengths
+  uniqueCounts.forEach((count, idx) => {
     const pct = (count / s.total) * 100;
     let len = Math.max(1, Math.round((pct / maxPct) * 20));
-    // Nudge UP if taken (higher counts always get more bars)
+    // Nudge DOWN if taken (lower ranked get fewer bars)
+    while (usedLengths.has(len) && len > 1) len--;
+    // If somehow still taken at bottom, go up
     while (usedLengths.has(len)) len++;
     usedLengths.add(len);
     countToBar[count] = len;
+    console.log(`Bar mapping: count=${count} pct=${pct.toFixed(1)}% len=${len}`);
   });
 
   let msg = `📊 **Drop Stats — ${s.total} total drops**\n\`\`\`\n`;
