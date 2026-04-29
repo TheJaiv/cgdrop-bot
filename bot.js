@@ -128,17 +128,13 @@ function buildStatsMsg(s) {
   const countToBar = {};
   const usedLengths = new Set();
 
-  // uniqueCounts is sorted descending (highest count first)
-  // highest count → most bars, assign descending bar lengths
-  uniqueCounts.forEach((count, idx) => {
-    const pct = (count / s.total) * 100;
-    let len = Math.max(1, Math.round((pct / maxPct) * 20));
-    // Nudge DOWN if taken (lower ranked get fewer bars)
-    while (usedLengths.has(len) && len > 1) len--;
-    // If somehow still taken at bottom, go up
-    while (usedLengths.has(len)) len++;
-    usedLengths.add(len);
+  // Sort ascending, assign bars 1,2,3... then scale to max 20
+  const sortedAsc = [...uniqueCounts].sort((a,b) => a - b);
+  sortedAsc.forEach((count, idx) => {
+    // rank 0 (lowest) gets 1 bar, rank n-1 (highest) gets 20 bars
+    const len = Math.max(1, Math.round(((idx + 1) / sortedAsc.length) * 20));
     countToBar[count] = len;
+    const pct = (count / s.total) * 100;
     console.log(`Bar mapping: count=${count} pct=${pct.toFixed(1)}% len=${len}`);
   });
 
