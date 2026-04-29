@@ -131,7 +131,7 @@ function buildStatsMsg(s) {
   uniqueCounts.forEach(count => {
     const pct = (count / s.total) * 100;
     let len = Math.max(1, Math.round((pct / maxPct) * 20));
-    while (usedLengths.has(len) && len > 1) len--;
+    // Nudge UP if taken (higher counts always get more bars)
     while (usedLengths.has(len)) len++;
     usedLengths.add(len);
     countToBar[count] = len;
