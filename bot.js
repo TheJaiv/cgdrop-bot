@@ -128,15 +128,36 @@ function buildStatsMsg(s) {
   const countToBar = {};
   const usedLengths = new Set();
 
-  // Sort ascending, assign bars 1,2,3... then scale to max 20
-  const sortedAsc = [...uniqueCounts].sort((a,b) => a - b);
-  sortedAsc.forEach((count, idx) => {
-    // rank 0 (lowest) gets 1 bar, rank n-1 (highest) gets 20 bars
-    const len = Math.max(1, Math.round(((idx + 1) / sortedAsc.length) * 20));
-    countToBar[count] = len;
-    const pct = (count / s.total) * 100;
-    console.log(`Bar mapping: count=${count} pct=${pct.toFixed(1)}% len=${len}`);
+  // 77- always gets 20 bars
+  countToBar['__77-__'] = 20;
+
+  // Get unique pcts from non-77- OVRs that have drops
+  const nonBase = activeOVRs.filter(o => o !== '77-');
+  const uniquePcts = [...new Set(nonBase.map(o => parseFloat(((s.ovr[o] / s.total) * 100).toFixed(1))))].sort((a,b) => a - b);
+
+  // Assign bars starting from 1, +1 each step, +2 if gap > 5%
+  let currentBar = 1;
+  const pctToBar = {};
+  uniquePcts.forEach((pct, idx) => {
+    if (idx === 0) {
+      pctToBar[pct] = currentBar;
+    } else {
+      const gap = pct - uniquePcts[idx - 1];
+      currentBar += gap > 5 ? 2 : 1;
+      pctToBar[pct] = currentBar;
+    }
+    console.log(`Bar mapping: pct=${pct}% len=${pctToBar[pct]}`);
   });
+
+  // Map each OVR to its bar length
+  for (const ovr of activeOVRs) {
+    if (ovr === '77-') {
+      countToBar[ovr] = 20;
+    } else {
+      const pct = parseFloat(((s.ovr[ovr] / s.total) * 100).toFixed(1));
+      countToBar[ovr] = pctToBar[pct] || 1;
+    }
+  }
 
   let msg = `📊 **Drop Stats — ${s.total} total drops**\n\`\`\`\n`;
   msg += `OVR    Ct   Pct     Bar\n`;
@@ -147,7 +168,7 @@ function buildStatsMsg(s) {
     if (count === 0) continue;
     const pct = (count / s.total) * 100;
     const pctStr = pct.toFixed(1) + '%';
-    const bar = '█'.repeat(countToBar[count]);
+    const bar = '█'.repeat(countToBar[ovr] || 1);
     msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${String(count).padEnd(5)}${pctStr.padEnd(8)}${bar}\n`;
   }
   msg += `\`\`\``;
