@@ -12,9 +12,8 @@ const client = new Client({
 const REMIND_AFTER_MS = 60 * 60 * 1000;
 const BOT_WAIT_MS     = 5000;
 const JSONBIN_KEY     = process.env.JSONBIN_KEY;
-const JSONBIN_BIN_ID  = process.env.JSONBIN_BIN_ID || null;
+let   binId           = process.env.JSONBIN_BIN_ID || null;
 
-// ─── OVR MAP (exact card values) ───────────────────────────
 function getOVR(cardValue) {
   if (cardValue <= 6755)    return '77-';
   if (cardValue === 10250)  return '78';
@@ -33,9 +32,6 @@ function getOVR(cardValue) {
   return null;
 }
 
-// ─── JSONBIN STORAGE ───────────────────────────────────────
-let binId = JSONBIN_BIN_ID;
-
 async function loadData() {
   try {
     if (binId) {
@@ -47,13 +43,12 @@ async function loadData() {
       return json.record;
     }
   } catch (e) { console.error('Error loading from JSONBin:', e.message); }
-  return { binId: null, reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
+  return { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
 }
 
 async function saveData(data) {
   try {
     if (!binId) {
-      // Create a new bin
       const res = await fetch('https://api.jsonbin.io/v3/b', {
         method: 'POST',
         headers: {
@@ -66,28 +61,22 @@ async function saveData(data) {
       });
       const json = await res.json();
       binId = json.metadata.id;
-      console.log(`✅ Created new JSONBin with ID: ${binId}`);
-      console.log(`⚠️ ADD THIS TO RENDER ENV: JSONBIN_BIN_ID=${binId}`);
+      console.log(`✅ Created new JSONBin: ${binId}`);
+      console.log(`⚠️ ADD TO RENDER ENV: JSONBIN_BIN_ID=${binId}`);
     } else {
       await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
         method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Master-Key': JSONBIN_KEY
-        },
+        headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY },
         body: JSON.stringify(data)
       });
     }
   } catch (e) { console.error('Error saving to JSONBin:', e.message); }
 }
 
-// ─── GLOBAL DATA ───────────────────────────────────────────
 let data = { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
-
 const processedMsgIds = new Set();
 const activeReminders = new Map();
 
-// ─── SEND REMINDER ─────────────────────────────────────────
 async function sendReminder(userId, channelId) {
   try {
     const channel = await client.channels.fetch(channelId);
@@ -96,13 +85,10 @@ async function sendReminder(userId, channelId) {
     try {
       const user = await client.users.fetch(userId);
       await user.send(`⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁`);
-    } catch (err) {
-      console.error('Could not send reminder:', err);
-    }
+    } catch (err) { console.error('Could not send reminder:', err); }
   }
 }
 
-// ─── RESTORE REMINDERS ─────────────────────────────────────
 async function restoreReminders() {
   const now = Date.now();
   for (const [userId, rem] of Object.entries(data.reminders || {})) {
@@ -124,6 +110,63 @@ async function restoreReminders() {
   }
 }
 
+function buildStatsMsg(s) {
+  const OVR_ORDER = ['90+','89','88','87','86','85','84','83','82','81','80','79','78','77-'];
+  const EMOJI = {
+    '90+':'💎','89':'🔴','88':'🔴','87':'🔴',
+    '86':'🟠','85':'🟠','84':'🟠',
+    '83':'🟡','82':'🟡','81':'🟡',
+    '80':'🔵','79':'🔵','78':'🔵',
+    '77-':'⚪'
+  };
+
+  const activeOVRs = OVR_ORDER.filter(o => s.ovr[o] > 0);
+  const maxPct = Math.max(...activeOVRs.map(o => (s.ovr[o] / s.total) * 100));
+
+  // Unique counts sorted descending — assign unique bar lengths
+  const uniqueCounts = [...new Set(activeOVRs.map(o => s.ovr[o]))].sort((a, b) => b - a);
+  const countToBar = {};
+  const usedLengths = new Set();
+
+  uniqueCounts.forEach(count => {
+    const pct = (count / s.total) * 100;
+    let len = Math.max(1, Math.round((pct / maxPct) * 20));
+    while (usedLengths.has(len) && len > 1) len--;
+    while (usedLengths.has(len)) len++;
+    usedLengths.add(len);
+    countToBar[count] = len;
+  });
+
+  let msg = `📊 **Drop Stats — ${s.total} total drops**\n\`\`\`\n`;
+  msg += `OVR    Ct   Pct     Bar\n`;
+  msg += `${'─'.repeat(42)}\n`;
+
+  for (const ovr of OVR_ORDER) {
+    const count = s.ovr[ovr] || 0;
+    if (count === 0) continue;
+    const pct = (count / s.total) * 100;
+    const pctStr = pct.toFixed(1) + '%';
+    const bar = '█'.repeat(countToBar[count]);
+    msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${String(count).padEnd(5)}${pctStr.padEnd(8)}${bar}\n`;
+  }
+  msg += `\`\`\``;
+  if (s.unknown && s.unknown.length > 0) {
+    msg += `\n⚠️ **${s.unknown.length} unknown card value(s)** — use \`!unknown\` to see them`;
+  }
+  return msg;
+}
+
+function extractText(msg) {
+  let text = msg.content || '';
+  for (const embed of msg.embeds) {
+    if (embed.title)       text += ' ' + embed.title;
+    if (embed.description) text += ' ' + embed.description;
+    for (const field of (embed.fields || [])) text += ' ' + field.name + ' ' + field.value;
+    if (embed.footer?.text) text += ' ' + embed.footer.text;
+  }
+  return text;
+}
+
 client.once('ready', async () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
   data = await loadData();
@@ -132,70 +175,24 @@ client.once('ready', async () => {
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-
   const content = message.content.trim().toLowerCase();
 
-  // ── !ping ──
   if (content === '!ping') {
-    console.log(`✅ !ping by ${message.author.tag}`); await message.reply('✅ Bot is alive and watching for cgdrop!').catch(e => console.error('Reply error:', e.message));
+    console.log(`✅ !ping by ${message.author.tag}`);
+    await message.reply('✅ Bot is alive and watching for cgdrop!').catch(e => console.error('Reply error:', e.message));
     return;
   }
 
-  // ── !stats ──
   if (content === '!stats') {
-    const s = data.stats;
-    if (s.total === 0) {
-      console.log(`📊 !stats by ${message.author.tag}`);
-    const OVR_ORDER = ['90+','89','88','87','86','85','84','83','82','81','80','79','78','77-'];
-    const EMOJI = {
-      '90+':'💎','89':'🔴','88':'🔴','87':'🔴',
-      '86':'🟠','85':'🟠','84':'🟠',
-      '83':'🟡','82':'🟡','81':'🟡',
-      '80':'🔵','79':'🔵','78':'🔵',
-      '77-':'⚪'
-    };
-    const activeOVRs = OVR_ORDER.filter(o => s.ovr[o] > 0);
-    const maxPct = Math.max(...activeOVRs.map(o => (s.ovr[o] / s.total) * 100));
-    // Get unique pct values sorted descending
-    const uniqueCounts = [...new Set(activeOVRs.map(o => s.ovr[o]))].sort((a,b) => b - a);
-    // Assign a unique bar length to each unique count value, proportionally
-    const countToBar = {};
-    const usedLengths = new Set();
-    uniqueCounts.forEach(count => {
-      const pct = (count / s.total) * 100;
-      let len = Math.max(1, Math.round((pct / maxPct) * 20));
-      // Nudge down if taken
-      while (usedLengths.has(len) && len > 1) len--;
-      // Nudge up if still taken
-      while (usedLengths.has(len)) len++;
-      usedLengths.add(len);
-      countToBar[count] = len;
-    });
-    let msg = `📊 **Drop Stats — ${s.total} total drops**
-\`\`\`
-`;
-    msg += `OVR    Ct   Pct     Bar
-`;
-    msg += `${'─'.repeat(42)}
-`;
-    for (const ovr of OVR_ORDER) {
-      const count = s.ovr[ovr] || 0;
-      if (count === 0) continue;
-      const pct = (count / s.total) * 100;
-      const pctStr = pct.toFixed(1) + '%';
-      const bar = '█'.repeat(countToBar[count]);
-      msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${String(count).padEnd(5)}${pctStr.padEnd(8)}${bar}
-`;
+    console.log(`📊 !stats by ${message.author.tag}`);
+    if (data.stats.total === 0) {
+      await message.reply('📊 No drops registered yet!');
+      return;
     }
-    msg += `\`\`\``;
-    if (s.unknown && s.unknown.length > 0) {
-      msg += `\n⚠️ **${s.unknown.length} unknown card value(s)** — use \`!unknown\` to see them`;
-    }
-    await message.reply(msg);
+    await message.reply(buildStatsMsg(data.stats));
     return;
   }
 
-  // ── !unknown ──
   if (content === '!unknown') {
     const unknowns = data.stats.unknown || [];
     if (unknowns.length === 0) {
@@ -207,7 +204,6 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // ── !resetstats ──
   if (content === '!resetstats') {
     data.stats = { total: 0, ovr: {}, unknown: [] };
     await saveData(data);
@@ -223,7 +219,6 @@ client.on('messageCreate', async (message) => {
 
   const channel = message.channel;
   const userId  = message.author.id;
-
   console.log(`🎯 Detected cgdrop by ${message.author.tag}`);
 
   let replyMsg = null;
@@ -245,7 +240,7 @@ client.on('messageCreate', async (message) => {
   if (replyMsg) {
     const allText = extractText(replyMsg).toLowerCase();
     const rawText = extractText(replyMsg);
-    console.log(`📨 Game bot replied: "${rawText.slice(0, 300)}"`);
+    console.log(`📨 Game bot replied: "${rawText.slice(0, 200)}"`);
 
     const isCooldown = /claim your next/i.test(allText) || /cooldown/i.test(allText);
     if (isCooldown) {
@@ -269,29 +264,22 @@ client.on('messageCreate', async (message) => {
       const cardValue = parseInt(cardMatch[1].replace(/,/g, ''));
       const ovr = getOVR(cardValue);
       console.log(`🃏 Card value: ${cardValue} → OVR: ${ovr || 'UNKNOWN'}`);
-
       data.stats.total += 1;
       if (ovr) {
         data.stats.ovr[ovr] = (data.stats.ovr[ovr] || 0) + 1;
       } else {
         data.stats.unknown = data.stats.unknown || [];
-        data.stats.unknown.push({
-          value: cardValue,
-          user: message.author.tag,
-          time: new Date().toLocaleString()
-        });
+        data.stats.unknown.push({ value: cardValue, user: message.author.tag, time: new Date().toLocaleString() });
         await channel.send(`⚠️ <@${userId}> Unknown card value **${cardValue}** — not in OVR map! Use \`!unknown\` to review.`);
       }
       await saveData(data);
     }
-
     console.log(`✅ Claim succeeded for ${message.author.tag}!`);
   } else {
     console.log(`⚠️ No game bot response. Assuming claim succeeded for ${message.author.tag}.`);
   }
 
   if (activeReminders.has(userId)) clearTimeout(activeReminders.get(userId));
-
   await message.react('⏰').catch(e => console.error('React error:', e.message));
 
   const remindAt = Date.now() + REMIND_AFTER_MS;
@@ -309,22 +297,7 @@ client.on('messageCreate', async (message) => {
   console.log(`✅ Reminder set for ${message.author.tag}.`);
 });
 
-function extractText(msg) {
-  let text = msg.content || '';
-  for (const embed of msg.embeds) {
-    if (embed.title)       text += ' ' + embed.title;
-    if (embed.description) text += ' ' + embed.description;
-    for (const field of (embed.fields || [])) {
-      text += ' ' + field.name + ' ' + field.value;
-    }
-    if (embed.footer?.text) text += ' ' + embed.footer.text;
-  }
-  return text;
-}
-
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err);
-});
+process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => res.end('Bot is running!')).listen(PORT, () => {
