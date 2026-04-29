@@ -13,6 +13,7 @@ const REMIND_AFTER_MS = 60 * 60 * 1000;
 const BOT_WAIT_MS     = 5000;
 const JSONBIN_KEY     = process.env.JSONBIN_KEY;
 let   binId           = process.env.JSONBIN_BIN_ID || null;
+const OWNER_ID        = process.env.OWNER_ID;
 
 function getOVR(cardValue) {
   if (cardValue <= 6755)    return '77-';
@@ -226,6 +227,49 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  if (content === '!myavg') {
+    if (message.author.id !== OWNER_ID) {
+      await message.reply('❌ This command is only for the server owner!');
+      return;
+    }
+    const o = data.owner;
+    if (!o || o.totalDrops === 0) {
+      await message.reply('📊 No sale data yet!');
+      return;
+    }
+    const avg = Math.round(o.totalSale / o.totalDrops);
+    await message.reply(`💰 **Your Drop Averages**\n\`\`\`\nTotal drops : ${o.totalDrops}\nTotal earned: ${o.totalSale.toLocaleString()} coins\nAvg per drop: ${avg.toLocaleString()} coins\`\`\``);
+    return;
+  }
+
+  if (content === '!myearnings') {
+    if (message.author.id !== OWNER_ID) {
+      await message.reply('❌ This command is only for the server owner!');
+      return;
+    }
+    const o = data.owner;
+    if (!o || !o.days || Object.keys(o.days).length === 0) {
+      await message.reply('📊 No earnings data yet!');
+      return;
+    }
+    const days = Object.entries(o.days).sort((a,b) => a[0].localeCompare(b[0]));
+    const totalDays = days.length;
+    const totalEarned = days.reduce((sum, [,d]) => sum + d.totalSale, 0);
+    const avgPerDay = Math.round(totalEarned / totalDays);
+    let msg = `💰 **Your Daily Earnings**\n\`\`\`\n`;
+    msg += `${'Date'.padEnd(12)} ${'Drops'.padEnd(7)} Earned\n`;
+    msg += '─'.repeat(30) + '\n';
+    for (const [date, d] of days.slice(-14)) { // last 14 days
+      msg += `${date.padEnd(12)} ${String(d.drops).padEnd(7)} ${d.totalSale.toLocaleString()} coins\n`;
+    }
+    msg += `${'─'.repeat(30)}\n`;
+    msg += `Avg per day : ${avgPerDay.toLocaleString()} coins\n`;
+    msg += `Total earned: ${totalEarned.toLocaleString()} coins\n`;
+    msg += `\`\`\``;
+    await message.reply(msg);
+    return;
+  }
+
   if (content === '!resetstats') {
     data.stats = { total: 0, ovr: {}, unknown: [] };
     await saveData(data);
@@ -282,6 +326,7 @@ client.on('messageCreate', async (message) => {
     }
 
     const cardMatch = rawText.match(/card value\s*`?([\d,]+)`?/i);
+    const saleMatch  = rawText.match(/sale value\s*`?([\d,]+)`?/i);
     if (cardMatch) {
       const cardValue = parseInt(cardMatch[1].replace(/,/g, ''));
       const ovr = getOVR(cardValue);
@@ -294,8 +339,20 @@ client.on('messageCreate', async (message) => {
         data.stats.unknown.push({ value: cardValue, user: message.author.tag, time: new Date().toLocaleString() });
         await channel.send(`⚠️ <@${userId}> Unknown card value **${cardValue}** — not in OVR map! Use \`!unknown\` to review.`);
       }
-      await saveData(data);
     }
+    // Track sale value for owner
+    if (saleMatch && userId === OWNER_ID) {
+      const saleValue = parseInt(saleMatch[1].replace(/,/g, ''));
+      const today = new Date().toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' }).slice(0, 10);
+      data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
+      data.owner.totalSale  += saleValue;
+      data.owner.totalDrops += 1;
+      data.owner.days[today] = data.owner.days[today] || { totalSale: 0, drops: 0 };
+      data.owner.days[today].totalSale += saleValue;
+      data.owner.days[today].drops     += 1;
+      console.log(`💰 Sale value: ${saleValue} for owner on ${today}`);
+    }
+    if (cardMatch || saleMatch) await saveData(data);
     console.log(`✅ Claim succeeded for ${message.author.tag}!`);
   } else {
     console.log(`⚠️ No game bot response. Assuming claim succeeded for ${message.author.tag}.`);
