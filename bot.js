@@ -145,10 +145,7 @@ client.on('messageCreate', async (message) => {
   if (content === '!stats') {
     const s = data.stats;
     if (s.total === 0) {
-      console.log(`📊 !stats by ${message.author.tag}`); await message.reply('📊 No drops registered yet!');
-      return;
-    }
-    console.log(`📊 !stats by ${message.author.tag}`);
+      console.log(`📊 !stats by ${message.author.tag}`);
     const OVR_ORDER = ['90+','89','88','87','86','85','84','83','82','81','80','79','78','77-'];
     const EMOJI = {
       '90+':'💎','89':'🔴','88':'🔴','87':'🔴',
@@ -157,18 +154,37 @@ client.on('messageCreate', async (message) => {
       '80':'🔵','79':'🔵','78':'🔵',
       '77-':'⚪'
     };
-    const maxPct = Math.max(...OVR_ORDER.map(o => s.ovr[o] ? (s.ovr[o] / s.total) * 100 : 0));
+    const activeOVRs = OVR_ORDER.filter(o => s.ovr[o] > 0);
+    const maxPct = Math.max(...activeOVRs.map(o => (s.ovr[o] / s.total) * 100));
+    // Get unique pct values sorted descending
+    const uniqueCounts = [...new Set(activeOVRs.map(o => s.ovr[o]))].sort((a,b) => b - a);
+    // Assign a unique bar length to each unique count value, proportionally
+    const countToBar = {};
+    const usedLengths = new Set();
+    uniqueCounts.forEach(count => {
+      const pct = (count / s.total) * 100;
+      let len = Math.max(1, Math.round((pct / maxPct) * 20));
+      // Nudge down if taken
+      while (usedLengths.has(len) && len > 1) len--;
+      // Nudge up if still taken
+      while (usedLengths.has(len)) len++;
+      usedLengths.add(len);
+      countToBar[count] = len;
+    });
     let msg = `📊 **Drop Stats — ${s.total} total drops**
 \`\`\`
+`;
+    msg += `OVR    Ct   Pct     Bar
+`;
+    msg += `${'─'.repeat(42)}
 `;
     for (const ovr of OVR_ORDER) {
       const count = s.ovr[ovr] || 0;
       if (count === 0) continue;
       const pct = (count / s.total) * 100;
       const pctStr = pct.toFixed(1) + '%';
-      const boxes = Math.round((pct / maxPct) * 20);
-      const bar = boxes >= 1 ? '█'.repeat(boxes) : '▪';
-      msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${bar.padEnd(22)} ${pctStr.padEnd(7)} (${count})
+      const bar = '█'.repeat(countToBar[count]);
+      msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${String(count).padEnd(5)}${pctStr.padEnd(8)}${bar}
 `;
     }
     msg += `\`\`\``;
