@@ -242,6 +242,30 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  if (content.startsWith('!addvote')) {
+    if (message.author.id !== OWNER_ID) {
+      await message.reply('❌ This command is only for the server owner!');
+      return;
+    }
+    const parts = message.content.trim().split(' ');
+    const amount = parseInt((parts[1] || '').replace(/,/g, ''));
+    if (isNaN(amount) || amount <= 0) {
+      await message.reply('❌ Usage: `!addvote 4500` or `!addvote 4500 yesterday`');
+      return;
+    }
+    // Determine date — today or yesterday IST
+    const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    if (parts[2] === 'yesterday') nowIST.setDate(nowIST.getDate() - 1);
+    const targetDate = nowIST.toISOString().slice(0, 10);
+    data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
+    data.owner.days[targetDate] = data.owner.days[targetDate] || { totalSale: 0, drops: 0, vote: 0 };
+    data.owner.days[targetDate].vote = (data.owner.days[targetDate].vote || 0) + amount;
+    await saveData(data);
+    console.log(`🗳️ Vote earnings added: ${amount} for ${targetDate}`);
+    await message.reply(`✅ Added **${amount.toLocaleString()} coins** from vote to **${targetDate}**!`);
+    return;
+  }
+
   if (content === '!myearnings') {
     if (message.author.id !== OWNER_ID) {
       await message.reply('❌ This command is only for the server owner!');
@@ -252,19 +276,26 @@ client.on('messageCreate', async (message) => {
       await message.reply('📊 No earnings data yet!');
       return;
     }
-    const days = Object.entries(o.days).sort((a,b) => a[0].localeCompare(b[0]));
+    const days = Object.entries(o.days).sort((a,b) => a[0].localeCompare(b[0])).slice(-14);
     const totalDays = days.length;
-    const totalEarned = days.reduce((sum, [,d]) => sum + d.totalSale, 0);
-    const avgPerDay = Math.round(totalEarned / totalDays);
-    let msg = `💰 **Your Daily Earnings**\n\`\`\`\n`;
-    msg += `${'Date'.padEnd(12)} ${'Drops'.padEnd(7)} Earned\n`;
-    msg += '─'.repeat(30) + '\n';
-    for (const [date, d] of days.slice(-14)) { // last 14 days
-      msg += `${date.padEnd(12)} ${String(d.drops).padEnd(7)} ${d.totalSale.toLocaleString()} coins\n`;
+    const totalDropIncome = days.reduce((sum, [,d]) => sum + (d.totalSale || 0), 0);
+    const totalVote       = days.reduce((sum, [,d]) => sum + (d.vote || 0), 0);
+    const totalEarned     = totalDropIncome + totalVote;
+    const avgDropPerDay   = Math.round(totalDropIncome / totalDays);
+    const avgVotePerDay   = Math.round(totalVote / totalDays);
+    const avgTotalPerDay  = Math.round(totalEarned / totalDays);
+    let msg = `💰 **Your Daily Earnings (last ${totalDays} days)**\n\`\`\`\n`;
+    msg += `Date        Dr  Drop        Vote        Total\n`;
+    msg += '─'.repeat(50) + '\n';
+    for (const [date, d] of days) {
+      const drop  = (d.totalSale || 0).toLocaleString().padEnd(12);
+      const vote  = (d.vote || 0).toLocaleString().padEnd(12);
+      const total = ((d.totalSale || 0) + (d.vote || 0)).toLocaleString();
+      msg += `${date} ${String(d.drops||0).padEnd(4)}${drop}${vote}${total}\n`;
     }
-    msg += `${'─'.repeat(30)}\n`;
-    msg += `Avg per day : ${avgPerDay.toLocaleString()} coins\n`;
-    msg += `Total earned: ${totalEarned.toLocaleString()} coins\n`;
+    msg += '─'.repeat(50) + '\n';
+    msg += `${'Avg/day'.padEnd(13)}${' '.padEnd(4)}${avgDropPerDay.toLocaleString().padEnd(12)}${avgVotePerDay.toLocaleString().padEnd(12)}${avgTotalPerDay.toLocaleString()}\n`;
+    msg += `${'Total'.padEnd(13)}${' '.padEnd(4)}${totalDropIncome.toLocaleString().padEnd(12)}${totalVote.toLocaleString().padEnd(12)}${totalEarned.toLocaleString()}\n`;
     msg += `\`\`\``;
     await message.reply(msg);
     return;
