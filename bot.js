@@ -198,8 +198,8 @@ async function addIncome(message, type, label) {
     return;
   }
   const parts  = message.content.trim().split(' ');
-  const amount = parseInt((parts[1] || '').replace(/,/g, ''));
-  if (isNaN(amount) || amount <= 0) {
+  const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
+  if (isNaN(amount)) {
     await message.reply(`❌ Usage: \`!add${type} 4500\` or \`!add${type} 4500 yesterday\``);
     return;
   }
