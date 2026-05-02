@@ -345,10 +345,6 @@ client.on('messageCreate', async (message) => {
       }
       console.log(`⏳ Cooldown for ${message.author.tag} — ${minsLeft} min left.`);
       await message.react('⏳').catch(e => console.error('React error:', e.message));
-      try {
-        const user = await client.users.fetch(userId);
-        await user.send(`⏳ Cooldown still active — **${minsLeft} minutes** left before you can claim again!`);
-      } catch (_) {}
       return;
     }
 
