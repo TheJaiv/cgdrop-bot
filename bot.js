@@ -46,7 +46,7 @@ async function loadData() {
       return json.record;
     }
   } catch (e) { console.error('Error loading from JSONBin:', e.message); }
-  return { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] }, reminderDisabled: {} };
+  return { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
 }
 
 async function saveData(data) {
@@ -103,14 +103,14 @@ function extractText(msg) {
 }
 
 // ─── REMINDERS ─────────────────────────────────────────────
-let data = { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] }, reminderDisabled: {} };
+let data = { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
 const processedMsgIds = new Set();
 const activeReminders = new Map();
 
 async function sendReminder(userId, channelId) {
   try {
     const channel = await client.channels.fetch(channelId);
-    await channel.send(`<@${userId}> ⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁`);
+    await channel.send(`<@${userId}> ⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁\nTo disable reminders type \`!remind off\``);
   } catch (_) {
     try {
       const user = await client.users.fetch(userId);
@@ -175,7 +175,7 @@ function buildStatsMsg(s) {
   }
 
   let msg = `📊 **Drop Stats — ${s.total} total drops**\n\`\`\`\n`;
-  msg += `OVR   Ct   Pct      Bar\n`;
+  msg += `OVR    Ct   Pct     Bar\n`;
   msg += '─'.repeat(42) + '\n';
   for (const ovr of OVR_ORDER) {
     const count = s.ovr[ovr] || 0;
@@ -323,6 +323,23 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // !remind toggle
+  if (content === '!remind off') {
+    data.remindDisabled = data.remindDisabled || {};
+    data.remindDisabled[message.author.id] = true;
+    await saveData(data);
+    await message.reply('🔕 Reminders disabled! Type `!remind on` to enable again.');
+    return;
+  }
+
+  if (content === '!remind on') {
+    data.remindDisabled = data.remindDisabled || {};
+    delete data.remindDisabled[message.author.id];
+    await saveData(data);
+    await message.reply('🔔 Reminders enabled!');
+    return;
+  }
+
   // cgdrop detection
   if (!content.startsWith('cgdrop') && !content.startsWith('cg drop')) return;
   if (processedMsgIds.has(message.id)) return;
@@ -410,6 +427,12 @@ client.on('messageCreate', async (message) => {
   if (activeReminders.has(userId)) clearTimeout(activeReminders.get(userId));
   await message.react('⏰').catch(e => console.error('React error:', e.message));
 
+  // Check if user has disabled reminders
+  if (data.remindDisabled && data.remindDisabled[userId]) {
+    console.log(`🔕 Reminders disabled for ${message.author.tag}, skipping.`);
+    return;
+  }
+
   const remindAt = Date.now() + REMIND_AFTER_MS;
   data.reminders[userId] = { remindAt, channelId: message.channel.id };
   await saveData(data);
@@ -423,6 +446,8 @@ client.on('messageCreate', async (message) => {
 
   activeReminders.set(userId, timeout);
   console.log(`✅ Reminder set for ${message.author.tag}.`);
+
+
 
   // Short tip message in channel
   try {
