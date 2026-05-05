@@ -449,10 +449,6 @@ client.on('messageCreate', async (message) => {
 
 
 
-  // Short tip message in channel
-  try {
-    await message.channel.send(`<@${userId}> ⏰ Reminder set! Type \`!remind off\` to disable reminders.`);
-  } catch (_) {}
 });
 
 process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
