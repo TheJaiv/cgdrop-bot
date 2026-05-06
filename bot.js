@@ -269,8 +269,6 @@ client.on('messageCreate', async (message) => {
 
   // !addvote, !addmatch, !addmisc
   if (content.startsWith('!addvote'))  { await addIncome(message, 'vote',  'Vote');  return; }
-  if (content.startsWith('!addmatch')) { await addIncome(message, 'match', 'Match'); return; }
-  if (content.startsWith('!addmisc'))  { await addIncome(message, 'misc',  'Misc');  return; }
 
   // !myearnings
   if (content === '!myearnings') {
@@ -283,24 +281,24 @@ client.on('messageCreate', async (message) => {
 
     const totDrop  = days.reduce((s,[,d]) => s + (d.totalSale||0), 0);
     const totVote  = days.reduce((s,[,d]) => s + (d.vote||0), 0);
-    const totMatch = days.reduce((s,[,d]) => s + (d.match||0), 0);
-    const totMisc  = days.reduce((s,[,d]) => s + (d.misc||0), 0);
-    const totAll   = totDrop + totVote + totMatch + totMisc;
+    
+    
+    const totAll = totDrop + totVote;
 
-    const C = { date:11, dr:4, drop:9, vote:9, match:9, misc:9, total:9 };
+    const C = { date:11, dr:4, drop:9, vote:9, total:9 };
 
     let msg = `💰 **Your Daily Earnings (last ${n} days)**\n\`\`\`\n`;
-    msg += pad('Date',C.date) + pad('Dr',C.dr) + pad('Drop',C.drop) + pad('Vote',C.vote) + pad('Match',C.match) + pad('Misc',C.misc) + 'Total\n';
-    msg += '─'.repeat(C.date+C.dr+C.drop+C.vote+C.match+C.misc+C.total) + '\n';
+    msg += pad('Date',C.date) + pad('Dr',C.dr) + pad('Drop',C.drop) + pad('Vote',C.vote) + 'Total\n';
+    msg += '─'.repeat(C.date+C.dr+C.drop+C.vote+C.total) + '\n';
 
     for (const [date, d] of days) {
-      const total = (d.totalSale||0)+(d.vote||0)+(d.match||0)+(d.misc||0);
-      msg += pad(date,C.date) + pad(d.drops||0,C.dr) + pad(fmt(d.totalSale||0),C.drop) + pad(fmt(d.vote||0),C.vote) + pad(fmt(d.match||0),C.match) + pad(fmt(d.misc||0),C.misc) + fmt(total) + '\n';
+      const total = (d.totalSale||0)+(d.vote||0);
+      msg += pad(date,C.date) + pad(d.drops||0,C.dr) + pad(fmt(d.totalSale||0),C.drop) + pad(fmt(d.vote||0),C.vote) + fmt(total) + '\n';
     }
 
-    msg += '─'.repeat(C.date+C.dr+C.drop+C.vote+C.match+C.misc+C.total) + '\n';
-    msg += pad('Avg/day',C.date) + pad('',C.dr) + pad(fmt(Math.round(totDrop/n)),C.drop) + pad(fmt(Math.round(totVote/n)),C.vote) + pad(fmt(Math.round(totMatch/n)),C.match) + pad(fmt(Math.round(totMisc/n)),C.misc) + fmt(Math.round(totAll/n)) + '\n';
-    msg += pad('Total',C.date)   + pad('',C.dr) + pad(fmt(totDrop),C.drop) + pad(fmt(totVote),C.vote) + pad(fmt(totMatch),C.match) + pad(fmt(totMisc),C.misc) + fmt(totAll) + '\n';
+    msg += '─'.repeat(C.date+C.dr+C.drop+C.vote+C.total) + '\n';
+    msg += pad('Avg/day',C.date) + pad('',C.dr) + pad(fmt(Math.round(totDrop/n)),C.drop) + pad(fmt(Math.round(totVote/n)),C.vote) + fmt(Math.round(totAll/n)) + '\n';
+    msg += pad('Total',C.date)   + pad('',C.dr) + pad(fmt(totDrop),C.drop) + pad(fmt(totVote),C.vote) + fmt(totAll) + '\n';
     msg += '`\`\`';
     await message.reply(msg);
     return;
