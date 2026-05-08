@@ -72,8 +72,21 @@ async function saveData(data) {
         headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY },
         body: JSON.stringify(data)
       });
+      console.log('💾 Data saved to JSONBin');
     }
   } catch (e) { console.error('Error saving to JSONBin:', e.message); }
+}
+
+// ─── DEBOUNCED SAVE (5s) ───────────────────────────────────
+// All writes go through scheduleSave(). Multiple calls within
+// 5 seconds collapse into a single JSONBin PUT — minimising API pulls.
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    await saveData(data);
+  }, 5000);
 }
 
 // ─── HELPERS ───────────────────────────────────────────────
@@ -126,12 +139,12 @@ async function restoreReminders() {
     if (timeLeft <= 0) {
       sendReminder(userId, rem.channelId);
       delete data.reminders[userId];
-      await saveData(data);
+      scheduleSave();
     } else {
       const timeout = setTimeout(async () => {
         sendReminder(userId, rem.channelId);
         delete data.reminders[userId];
-        await saveData(data);
+        scheduleSave();
         activeReminders.delete(userId);
       }, timeLeft);
       activeReminders.set(userId, timeout);
@@ -140,8 +153,8 @@ async function restoreReminders() {
   }
 }
 
-// ─── STATS MSG ─────────────────────────────────────────────
-function buildStatsMsg(s) {
+// ─── STATS MSG BUILDER (shared by !stats and !mystats) ─────
+function buildStatsMsg(s, title) {
   const OVR_ORDER = ['90+','89','88','87','86','85','84','83','82','81','80','79','78','77-'];
   const EMOJI = {
     '90+':'💎','89':'🔴','88':'🔴','87':'🔴',
@@ -174,15 +187,15 @@ function buildStatsMsg(s) {
     }
   }
 
-  let msg = `📊 **Drop Stats — ${s.total} total drops**\n\`\`\`\n`;
+  let msg = `📊 **${title} — ${s.total} total drops**\n\`\`\`\n`;
   msg += `OVR    Ct   Pct     Bar\n`;
   msg += '─'.repeat(42) + '\n';
   for (const ovr of OVR_ORDER) {
     const count = s.ovr[ovr] || 0;
     if (count === 0) continue;
-    const pct  = (count / s.total) * 100;
+    const pct    = (count / s.total) * 100;
     const pctStr = pct.toFixed(1) + '%';
-    const bar  = '█'.repeat(ovrToBar[ovr] || 1);
+    const bar    = '█'.repeat(ovrToBar[ovr] || 1);
     msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${String(count).padEnd(5)}${pctStr.padEnd(8)}${bar}\n`;
   }
   msg += `\`\`\``;
@@ -208,7 +221,7 @@ async function addIncome(message, type, label) {
   data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
   data.owner.days[date] = data.owner.days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
   data.owner.days[date][type] = (data.owner.days[date][type] || 0) + amount;
-  await saveData(data);
+  scheduleSave();
   console.log(`💰 ${label} earnings added: ${amount} for ${date}`);
   await message.reply(`✅ Added **${fmt(amount)} coins** from ${label} to **${date}**!`);
 }
@@ -216,7 +229,7 @@ async function addIncome(message, type, label) {
 // ─── READY ─────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
-  data = await loadData();
+  data = await loadData();  // only pull — ever
   await restoreReminders();
 });
 
@@ -232,11 +245,41 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // !stats
+  // !stats — reads from memory, no pull
   if (content === '!stats') {
     console.log(`📊 !stats by ${message.author.tag}`);
     if (data.stats.total === 0) { await message.reply('📊 No drops registered yet!'); return; }
-    await message.reply(buildStatsMsg(data.stats));
+    await message.reply(buildStatsMsg(data.stats, 'Drop Stats'));
+    return;
+  }
+
+  // !mystats — reads from memory, no pull
+  if (content === '!mystats') {
+    const userId   = message.author.id;
+    const userStat = data.userStats && data.userStats[userId];
+    if (!userStat || userStat.total === 0) {
+      await message.reply(`📊 No personal drop stats recorded for you yet${data.recordingEnabled === false ? ' (recording is currently off)' : ''}!`);
+      return;
+    }
+    console.log(`📊 !mystats by ${message.author.tag}`);
+    await message.reply(buildStatsMsg(userStat, `${message.author.username}'s Stats`));
+    return;
+  }
+
+  // !recording on/off — owner only
+  if (content === '!recording on') {
+    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+    data.recordingEnabled = true;
+    scheduleSave();
+    await message.reply('✅ **Recording ON** — drops will now log to everyone\'s `!mystats`.');
+    return;
+  }
+
+  if (content === '!recording off') {
+    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+    data.recordingEnabled = false;
+    scheduleSave();
+    await message.reply('🔕 **Recording OFF** — drops will still count in `!stats` but not in personal `!mystats`.');
     return;
   }
 
@@ -251,9 +294,21 @@ client.on('messageCreate', async (message) => {
 
   // !resetstats
   if (content === '!resetstats') {
+    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
     data.stats = { total: 0, ovr: {}, unknown: [] };
-    await saveData(data);
-    await message.reply('🗑️ Stats reset!');
+    scheduleSave();
+    await message.reply('🗑️ Global stats reset!');
+    return;
+  }
+
+  // !resetmystats
+  if (content === '!resetmystats') {
+    const userId = message.author.id;
+    if (data.userStats && data.userStats[userId]) {
+      data.userStats[userId] = { total: 0, ovr: {}, unknown: [] };
+      scheduleSave();
+    }
+    await message.reply('🗑️ Your personal stats have been reset!');
     return;
   }
 
@@ -268,7 +323,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // !addvote
-  if (content.startsWith('!addvote'))  { await addIncome(message, 'vote',  'Vote');  return; }
+  if (content.startsWith('!addvote')) { await addIncome(message, 'vote', 'Vote'); return; }
 
   // !myearnings
   if (content === '!myearnings') {
@@ -276,28 +331,23 @@ client.on('messageCreate', async (message) => {
     const o = data.owner;
     if (!o || !o.days || Object.keys(o.days).length === 0) { await message.reply('📊 No earnings data yet!'); return; }
 
-    // All days sorted ascending
     const allDays   = Object.entries(o.days).sort((a,b) => a[0].localeCompare(b[0]));
     const last7     = allDays.slice(-7);
     const n         = last7.length;
     const totalDays = allDays.length;
 
-    // ── 7-day totals ──
-    const tot7Drop = last7.reduce((s,[,d]) => s + (d.totalSale||0), 0);
-    const tot7Vote = last7.reduce((s,[,d]) => s + (d.vote||0), 0);
-    const tot7All  = tot7Drop + tot7Vote;
+    const tot7Drop   = last7.reduce((s,[,d]) => s + (d.totalSale||0), 0);
+    const tot7Vote   = last7.reduce((s,[,d]) => s + (d.vote||0), 0);
+    const tot7All    = tot7Drop + tot7Vote;
 
-    // ── All-time totals ──
     const totAllDrop = allDays.reduce((s,[,d]) => s + (d.totalSale||0), 0);
     const totAllVote = allDays.reduce((s,[,d]) => s + (d.vote||0), 0);
     const totAllAll  = totAllDrop + totAllVote;
 
-    // ── All-time avg per day ──
-    const avgDrop = Math.round(totAllDrop / totalDays);
-    const avgVote = Math.round(totAllVote / totalDays);
-    const avgAll  = Math.round(totAllAll  / totalDays);
+    const avgDrop    = Math.round(totAllDrop / totalDays);
+    const avgVote    = Math.round(totAllVote / totalDays);
+    const avgAll     = Math.round(totAllAll  / totalDays);
 
-    // ── Best day (all-time) ──
     let bestDate = '', bestTotal = 0;
     for (const [date, d] of allDays) {
       const dayTotal = (d.totalSale||0) + (d.vote||0);
@@ -307,23 +357,21 @@ client.on('messageCreate', async (message) => {
     const bestDrop = bestDay.totalSale || 0;
     const bestVote = bestDay.vote || 0;
 
-    const C = { date:11, dr:4, drop:9, vote:9, total:9 };
+    const C       = { date:11, dr:4, drop:9, vote:9, total:9 };
     const divider = '─'.repeat(C.date + C.dr + C.drop + C.vote + C.total);
 
     let msg = `💰 **Your Daily Earnings (last ${n} days)**\n\`\`\`\n`;
     msg += pad('Date',C.date) + pad('Dr',C.dr) + pad('Drop',C.drop) + pad('Vote',C.vote) + 'Total\n';
     msg += divider + '\n';
-
     for (const [date, d] of last7) {
       const total = (d.totalSale||0) + (d.vote||0);
       msg += pad(date,C.date) + pad(d.drops||0,C.dr) + pad(fmt(d.totalSale||0),C.drop) + pad(fmt(d.vote||0),C.vote) + fmt(total) + '\n';
     }
-
     msg += divider + '\n';
-    msg += pad('7d Total',C.date)  + pad('',C.dr) + pad(fmt(tot7Drop),C.drop)   + pad(fmt(tot7Vote),C.vote)   + fmt(tot7All)  + '\n';
+    msg += pad('7d Total',C.date)  + pad('',C.dr) + pad(fmt(tot7Drop),C.drop)   + pad(fmt(tot7Vote),C.vote)   + fmt(tot7All)   + '\n';
     msg += pad('All Total',C.date) + pad('',C.dr) + pad(fmt(totAllDrop),C.drop) + pad(fmt(totAllVote),C.vote) + fmt(totAllAll) + '\n';
     msg += divider + '\n';
-    msg += pad('Avg/day',C.date)   + pad('',C.dr) + pad(fmt(avgDrop),C.drop)    + pad(fmt(avgVote),C.vote)    + fmt(avgAll)   + '\n';
+    msg += pad('Avg/day',C.date)   + pad('',C.dr) + pad(fmt(avgDrop),C.drop)    + pad(fmt(avgVote),C.vote)    + fmt(avgAll)    + '\n';
     msg += divider + '\n';
     msg += pad(`🏆 ${bestDate}`,C.date + C.dr) + pad(fmt(bestDrop),C.drop) + pad(fmt(bestVote),C.vote) + fmt(bestTotal) + '\n';
     msg += '`\`\`';
@@ -335,7 +383,7 @@ client.on('messageCreate', async (message) => {
   if (content === '!remind off') {
     data.reminderDisabled = data.reminderDisabled || {};
     data.reminderDisabled[message.author.id] = true;
-    await saveData(data);
+    scheduleSave();
     await message.reply('🔕 Reminders disabled! Type `!remind on` to enable again.');
     return;
   }
@@ -344,12 +392,12 @@ client.on('messageCreate', async (message) => {
   if (content === '!remind on') {
     data.reminderDisabled = data.reminderDisabled || {};
     delete data.reminderDisabled[message.author.id];
-    await saveData(data);
+    scheduleSave();
     await message.reply('🔔 Reminders enabled!');
     return;
   }
 
-  // cgdrop detection
+  // ─── cgdrop detection ──────────────────────────────────────
   if (!content.startsWith('cgdrop') && !content.startsWith('cg drop')) return;
   if (processedMsgIds.has(message.id)) return;
   processedMsgIds.add(message.id);
@@ -398,6 +446,8 @@ client.on('messageCreate', async (message) => {
       const cardValue = parseInt(cardMatch[1].replace(/,/g, ''));
       const ovr = getOVR(cardValue);
       console.log(`🃏 Card value: ${cardValue} → OVR: ${ovr || 'UNKNOWN'}`);
+
+      // ── Always log to global !stats ──
       data.stats.total += 1;
       if (ovr) {
         data.stats.ovr[ovr] = (data.stats.ovr[ovr] || 0) + 1;
@@ -405,6 +455,21 @@ client.on('messageCreate', async (message) => {
         data.stats.unknown = data.stats.unknown || [];
         data.stats.unknown.push({ value: cardValue, user: message.author.tag, time: new Date().toLocaleString() });
         await channel.send(`⚠️ <@${userId}> Unknown card value **${cardValue}** — not in OVR map! Use \`!unknown\` to review.`);
+      }
+
+      // ── Log to !mystats only if recording is on OR user is owner ──
+      const recordingOn = data.recordingEnabled !== false; // default true
+      if (recordingOn || userId === OWNER_ID) {
+        data.userStats = data.userStats || {};
+        data.userStats[userId] = data.userStats[userId] || { total: 0, ovr: {}, unknown: [] };
+        const us = data.userStats[userId];
+        us.total += 1;
+        if (ovr) {
+          us.ovr[ovr] = (us.ovr[ovr] || 0) + 1;
+        } else {
+          us.unknown = us.unknown || [];
+          us.unknown.push({ value: cardValue, time: new Date().toLocaleString() });
+        }
       }
     }
 
@@ -420,13 +485,13 @@ client.on('messageCreate', async (message) => {
       console.log(`💰 Sale value: ${saleValue} for owner on ${today}`);
     }
 
-    if (cardMatch || saleMatch) await saveData(data);
+    if (cardMatch || saleMatch) scheduleSave();
     console.log(`✅ Claim succeeded for ${message.author.tag}!`);
   } else {
     console.log(`⚠️ No game bot response. Assuming claim succeeded for ${message.author.tag}.`);
   }
 
-  // Check if reminders disabled
+  // ── Reminder logic ──
   const isDisabled = (data.reminderDisabled && data.reminderDisabled[userId]);
   if (isDisabled) {
     console.log(`🔕 Reminders disabled for ${message.author.tag}, skipping.`);
@@ -438,12 +503,12 @@ client.on('messageCreate', async (message) => {
 
   const remindAt = Date.now() + REMIND_AFTER_MS;
   data.reminders[userId] = { remindAt, channelId: message.channel.id };
-  await saveData(data);
+  scheduleSave();
 
   const timeout = setTimeout(async () => {
     sendReminder(userId, message.channel.id);
     delete data.reminders[userId];
-    await saveData(data);
+    scheduleSave();
     activeReminders.delete(userId);
   }, REMIND_AFTER_MS);
 
