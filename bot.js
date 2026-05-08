@@ -267,7 +267,7 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // !addvote, !addmatch, !addmisc
+  // !addvote
   if (content.startsWith('!addvote'))  { await addIncome(message, 'vote',  'Vote');  return; }
 
   // !myearnings
@@ -276,35 +276,62 @@ client.on('messageCreate', async (message) => {
     const o = data.owner;
     if (!o || !o.days || Object.keys(o.days).length === 0) { await message.reply('📊 No earnings data yet!'); return; }
 
-    const days = Object.entries(o.days).sort((a,b) => a[0].localeCompare(b[0])).slice(-7);
-    const n    = days.length;
+    // All days sorted ascending
+    const allDays   = Object.entries(o.days).sort((a,b) => a[0].localeCompare(b[0]));
+    const last7     = allDays.slice(-7);
+    const n         = last7.length;
+    const totalDays = allDays.length;
 
-    const totDrop  = days.reduce((s,[,d]) => s + (d.totalSale||0), 0);
-    const totVote  = days.reduce((s,[,d]) => s + (d.vote||0), 0);
-    
-    
-    const totAll = totDrop + totVote;
+    // ── 7-day totals ──
+    const tot7Drop = last7.reduce((s,[,d]) => s + (d.totalSale||0), 0);
+    const tot7Vote = last7.reduce((s,[,d]) => s + (d.vote||0), 0);
+    const tot7All  = tot7Drop + tot7Vote;
+
+    // ── All-time totals ──
+    const totAllDrop = allDays.reduce((s,[,d]) => s + (d.totalSale||0), 0);
+    const totAllVote = allDays.reduce((s,[,d]) => s + (d.vote||0), 0);
+    const totAllAll  = totAllDrop + totAllVote;
+
+    // ── All-time avg per day ──
+    const avgDrop = Math.round(totAllDrop / totalDays);
+    const avgVote = Math.round(totAllVote / totalDays);
+    const avgAll  = Math.round(totAllAll  / totalDays);
+
+    // ── Best day (all-time) ──
+    let bestDate = '', bestTotal = 0;
+    for (const [date, d] of allDays) {
+      const dayTotal = (d.totalSale||0) + (d.vote||0);
+      if (dayTotal > bestTotal) { bestTotal = dayTotal; bestDate = date; }
+    }
+    const bestDay  = o.days[bestDate] || {};
+    const bestDrop = bestDay.totalSale || 0;
+    const bestVote = bestDay.vote || 0;
 
     const C = { date:11, dr:4, drop:9, vote:9, total:9 };
+    const divider = '─'.repeat(C.date + C.dr + C.drop + C.vote + C.total);
 
     let msg = `💰 **Your Daily Earnings (last ${n} days)**\n\`\`\`\n`;
     msg += pad('Date',C.date) + pad('Dr',C.dr) + pad('Drop',C.drop) + pad('Vote',C.vote) + 'Total\n';
-    msg += '─'.repeat(C.date+C.dr+C.drop+C.vote+C.total) + '\n';
+    msg += divider + '\n';
 
-    for (const [date, d] of days) {
-      const total = (d.totalSale||0)+(d.vote||0);
+    for (const [date, d] of last7) {
+      const total = (d.totalSale||0) + (d.vote||0);
       msg += pad(date,C.date) + pad(d.drops||0,C.dr) + pad(fmt(d.totalSale||0),C.drop) + pad(fmt(d.vote||0),C.vote) + fmt(total) + '\n';
     }
 
-    msg += '─'.repeat(C.date+C.dr+C.drop+C.vote+C.total) + '\n';
-    msg += pad('Avg/day',C.date) + pad('',C.dr) + pad(fmt(Math.round(totDrop/n)),C.drop) + pad(fmt(Math.round(totVote/n)),C.vote) + fmt(Math.round(totAll/n)) + '\n';
-    msg += pad('Total',C.date)   + pad('',C.dr) + pad(fmt(totDrop),C.drop) + pad(fmt(totVote),C.vote) + fmt(totAll) + '\n';
+    msg += divider + '\n';
+    msg += pad('7d Total',C.date)  + pad('',C.dr) + pad(fmt(tot7Drop),C.drop)   + pad(fmt(tot7Vote),C.vote)   + fmt(tot7All)  + '\n';
+    msg += pad('All Total',C.date) + pad('',C.dr) + pad(fmt(totAllDrop),C.drop) + pad(fmt(totAllVote),C.vote) + fmt(totAllAll) + '\n';
+    msg += divider + '\n';
+    msg += pad('Avg/day',C.date)   + pad('',C.dr) + pad(fmt(avgDrop),C.drop)    + pad(fmt(avgVote),C.vote)    + fmt(avgAll)   + '\n';
+    msg += divider + '\n';
+    msg += pad(`🏆 ${bestDate}`,C.date + C.dr) + pad(fmt(bestDrop),C.drop) + pad(fmt(bestVote),C.vote) + fmt(bestTotal) + '\n';
     msg += '`\`\`';
     await message.reply(msg);
     return;
   }
 
-  // !remind toggle
+  // !remind off
   if (content === '!remind off') {
     data.reminderDisabled = data.reminderDisabled || {};
     data.reminderDisabled[message.author.id] = true;
@@ -313,26 +340,10 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // !remind on
   if (content === '!remind on') {
     data.reminderDisabled = data.reminderDisabled || {};
     delete data.reminderDisabled[message.author.id];
-    await saveData(data);
-    await message.reply('🔔 Reminders enabled!');
-    return;
-  }
-
-  // !remind toggle
-  if (content === '!remind off') {
-    data.remindDisabled = data.remindDisabled || {};
-    data.remindDisabled[message.author.id] = true;
-    await saveData(data);
-    await message.reply('🔕 Reminders disabled! Type `!remind on` to enable again.');
-    return;
-  }
-
-  if (content === '!remind on') {
-    data.remindDisabled = data.remindDisabled || {};
-    delete data.remindDisabled[message.author.id];
     await saveData(data);
     await message.reply('🔔 Reminders enabled!');
     return;
@@ -415,8 +426,8 @@ client.on('messageCreate', async (message) => {
     console.log(`⚠️ No game bot response. Assuming claim succeeded for ${message.author.tag}.`);
   }
 
-  // Check if user has reminders disabled
-  const isDisabled = data.reminderDisabled && data.reminderDisabled[userId];
+  // Check if reminders disabled
+  const isDisabled = (data.reminderDisabled && data.reminderDisabled[userId]);
   if (isDisabled) {
     console.log(`🔕 Reminders disabled for ${message.author.tag}, skipping.`);
     return;
@@ -424,12 +435,6 @@ client.on('messageCreate', async (message) => {
 
   if (activeReminders.has(userId)) clearTimeout(activeReminders.get(userId));
   await message.react('⏰').catch(e => console.error('React error:', e.message));
-
-  // Check if user has disabled reminders
-  if (data.remindDisabled && data.remindDisabled[userId]) {
-    console.log(`🔕 Reminders disabled for ${message.author.tag}, skipping.`);
-    return;
-  }
 
   const remindAt = Date.now() + REMIND_AFTER_MS;
   data.reminders[userId] = { remindAt, channelId: message.channel.id };
@@ -444,9 +449,6 @@ client.on('messageCreate', async (message) => {
 
   activeReminders.set(userId, timeout);
   console.log(`✅ Reminder set for ${message.author.tag}.`);
-
-
-
 });
 
 process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
