@@ -211,6 +211,57 @@ function buildStatsMsg(s, title) {
   return msg;
 }
 
+// ─── EARNINGS MSG BUILDER ──────────────────────────────────
+function buildEarningsMsg(earningsData, username) {
+  if (!earningsData || !earningsData.days || Object.keys(earningsData.days).length === 0) return null;
+
+  const allDays   = Object.entries(earningsData.days).sort((a,b) => a[0].localeCompare(b[0]));
+  const last7     = allDays.slice(-7);
+  const n         = last7.length;
+  const totalDays = allDays.length;
+
+  const tot7Drop   = last7.reduce((s,[,d]) => s + (d.totalSale||0), 0);
+  const tot7Vote   = last7.reduce((s,[,d]) => s + (d.vote||0), 0);
+  const tot7All    = tot7Drop + tot7Vote;
+
+  const totAllDrop = allDays.reduce((s,[,d]) => s + (d.totalSale||0), 0);
+  const totAllVote = allDays.reduce((s,[,d]) => s + (d.vote||0), 0);
+  const totAllAll  = totAllDrop + totAllVote;
+
+  const avgDrop    = Math.round(totAllDrop / totalDays);
+  const avgVote    = Math.round(totAllVote / totalDays);
+  const avgAll     = Math.round(totAllAll  / totalDays);
+
+  let bestDate = '', bestTotal = 0;
+  for (const [date, d] of allDays) {
+    const dayTotal = (d.totalSale||0) + (d.vote||0);
+    if (dayTotal > bestTotal) { bestTotal = dayTotal; bestDate = date; }
+  }
+  const bestDay  = earningsData.days[bestDate] || {};
+  const bestDrop = bestDay.totalSale || 0;
+  const bestVote = bestDay.vote || 0;
+
+  const C       = { date:11, dr:4, drop:9, vote:9, total:9 };
+  const divider = '─'.repeat(C.date + C.dr + C.drop + C.vote + C.total);
+
+  let msg = `💰 **${username}'s Daily Earnings (last ${n} days)**\n\`\`\`\n`;
+  msg += pad('Date',C.date) + pad('Dr',C.dr) + pad('Drop',C.drop) + pad('Vote',C.vote) + 'Total\n';
+  msg += divider + '\n';
+  for (const [date, d] of last7) {
+    const total = (d.totalSale||0) + (d.vote||0);
+    msg += pad(date,C.date) + pad(d.drops||0,C.dr) + pad(fmt(d.totalSale||0),C.drop) + pad(fmt(d.vote||0),C.vote) + fmt(total) + '\n';
+  }
+  msg += divider + '\n';
+  msg += pad('7d Total',C.date)  + pad('',C.dr) + pad(fmt(tot7Drop),C.drop)   + pad(fmt(tot7Vote),C.vote)   + fmt(tot7All)   + '\n';
+  msg += pad('All Total',C.date) + pad('',C.dr) + pad(fmt(totAllDrop),C.drop) + pad(fmt(totAllVote),C.vote) + fmt(totAllAll) + '\n';
+  msg += divider + '\n';
+  msg += pad('Avg/day',C.date)   + pad('',C.dr) + pad(fmt(avgDrop),C.drop)    + pad(fmt(avgVote),C.vote)    + fmt(avgAll)    + '\n';
+  msg += divider + '\n';
+  msg += pad(`🏆 ${bestDate}`,C.date + C.dr) + pad(fmt(bestDrop),C.drop) + pad(fmt(bestVote),C.vote) + fmt(bestTotal) + '\n';
+  msg += '`\`\`';
+  return msg;
+}
+
 // ─── ADD INCOME HELPER ─────────────────────────────────────
 async function addIncome(message, type, label) {
   if (message.author.id !== OWNER_ID) {
@@ -322,10 +373,12 @@ client.on('messageCreate', async (message) => {
   // !myavg
   if (content === '!myavg') {
     if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have access to this command!'); return; }
-    const o = data.owner;
+    const userId  = message.author.id;
+    const isOwner = userId === OWNER_ID;
+    const o       = isOwner ? data.owner : (data.userEarnings && data.userEarnings[userId]);
     if (!o || o.totalDrops === 0) { await message.reply('📊 No sale data yet!'); return; }
     const avg = Math.round(o.totalSale / o.totalDrops);
-    await message.reply(`💰 **Your Drop Averages**\n\`\`\`\nTotal drops : ${o.totalDrops}\nTotal earned: ${fmt(o.totalSale)} coins\nAvg per drop: ${fmt(avg)} coins\`\`\``);
+    await message.reply(`💰 **${isOwner ? 'Your' : message.author.username + "'s"} Drop Averages**\n\`\`\`\nTotal drops : ${o.totalDrops}\nTotal earned: ${fmt(o.totalSale)} coins\nAvg per drop: ${fmt(avg)} coins\`\`\``);
     return;
   }
 
@@ -373,53 +426,12 @@ client.on('messageCreate', async (message) => {
   // !myearnings
   if (content === '!myearnings') {
     if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have access to this command!'); return; }
-    const o = data.owner;
-    if (!o || !o.days || Object.keys(o.days).length === 0) { await message.reply('📊 No earnings data yet!'); return; }
-
-    const allDays   = Object.entries(o.days).sort((a,b) => a[0].localeCompare(b[0]));
-    const last7     = allDays.slice(-7);
-    const n         = last7.length;
-    const totalDays = allDays.length;
-
-    const tot7Drop   = last7.reduce((s,[,d]) => s + (d.totalSale||0), 0);
-    const tot7Vote   = last7.reduce((s,[,d]) => s + (d.vote||0), 0);
-    const tot7All    = tot7Drop + tot7Vote;
-
-    const totAllDrop = allDays.reduce((s,[,d]) => s + (d.totalSale||0), 0);
-    const totAllVote = allDays.reduce((s,[,d]) => s + (d.vote||0), 0);
-    const totAllAll  = totAllDrop + totAllVote;
-
-    const avgDrop    = Math.round(totAllDrop / totalDays);
-    const avgVote    = Math.round(totAllVote / totalDays);
-    const avgAll     = Math.round(totAllAll  / totalDays);
-
-    let bestDate = '', bestTotal = 0;
-    for (const [date, d] of allDays) {
-      const dayTotal = (d.totalSale||0) + (d.vote||0);
-      if (dayTotal > bestTotal) { bestTotal = dayTotal; bestDate = date; }
-    }
-    const bestDay  = o.days[bestDate] || {};
-    const bestDrop = bestDay.totalSale || 0;
-    const bestVote = bestDay.vote || 0;
-
-    const C       = { date:11, dr:4, drop:9, vote:9, total:9 };
-    const divider = '─'.repeat(C.date + C.dr + C.drop + C.vote + C.total);
-
-    let msg = `💰 **Your Daily Earnings (last ${n} days)**\n\`\`\`\n`;
-    msg += pad('Date',C.date) + pad('Dr',C.dr) + pad('Drop',C.drop) + pad('Vote',C.vote) + 'Total\n';
-    msg += divider + '\n';
-    for (const [date, d] of last7) {
-      const total = (d.totalSale||0) + (d.vote||0);
-      msg += pad(date,C.date) + pad(d.drops||0,C.dr) + pad(fmt(d.totalSale||0),C.drop) + pad(fmt(d.vote||0),C.vote) + fmt(total) + '\n';
-    }
-    msg += divider + '\n';
-    msg += pad('7d Total',C.date)  + pad('',C.dr) + pad(fmt(tot7Drop),C.drop)   + pad(fmt(tot7Vote),C.vote)   + fmt(tot7All)   + '\n';
-    msg += pad('All Total',C.date) + pad('',C.dr) + pad(fmt(totAllDrop),C.drop) + pad(fmt(totAllVote),C.vote) + fmt(totAllAll) + '\n';
-    msg += divider + '\n';
-    msg += pad('Avg/day',C.date)   + pad('',C.dr) + pad(fmt(avgDrop),C.drop)    + pad(fmt(avgVote),C.vote)    + fmt(avgAll)    + '\n';
-    msg += divider + '\n';
-    msg += pad(`🏆 ${bestDate}`,C.date + C.dr) + pad(fmt(bestDrop),C.drop) + pad(fmt(bestVote),C.vote) + fmt(bestTotal) + '\n';
-    msg += '`\`\`';
+    const userId   = message.author.id;
+    const isOwner  = userId === OWNER_ID;
+    // Owner uses data.owner; whitelisted users use data.userEarnings[userId]
+    const earningsData = isOwner ? data.owner : (data.userEarnings && data.userEarnings[userId]);
+    const msg = buildEarningsMsg(earningsData, isOwner ? 'Your' : message.author.username);
+    if (!msg) { await message.reply('📊 No earnings data yet!'); return; }
     await message.reply(msg);
     return;
   }
@@ -518,16 +530,31 @@ client.on('messageCreate', async (message) => {
       }
     }
 
-    if (saleMatch && userId === OWNER_ID) {
+    if (saleMatch && (userId === OWNER_ID || isWhitelisted(userId))) {
       const saleValue = parseInt(saleMatch[1].replace(/,/g, ''));
       const today = getISTDate();
-      data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
-      data.owner.totalSale  = (data.owner.totalSale  || 0) + saleValue;
-      data.owner.totalDrops = (data.owner.totalDrops || 0) + 1;
-      data.owner.days[today] = data.owner.days[today] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
-      data.owner.days[today].totalSale += saleValue;
-      data.owner.days[today].drops     += 1;
-      console.log(`💰 Sale value: ${saleValue} for owner on ${today}`);
+
+      if (userId === OWNER_ID) {
+        // Owner uses data.owner
+        data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
+        data.owner.totalSale  = (data.owner.totalSale  || 0) + saleValue;
+        data.owner.totalDrops = (data.owner.totalDrops || 0) + 1;
+        data.owner.days[today] = data.owner.days[today] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+        data.owner.days[today].totalSale += saleValue;
+        data.owner.days[today].drops     += 1;
+        console.log(`💰 Sale value: ${saleValue} for owner on ${today}`);
+      } else {
+        // Whitelisted user uses data.userEarnings[userId]
+        data.userEarnings = data.userEarnings || {};
+        data.userEarnings[userId] = data.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
+        const ue = data.userEarnings[userId];
+        ue.totalSale  = (ue.totalSale  || 0) + saleValue;
+        ue.totalDrops = (ue.totalDrops || 0) + 1;
+        ue.days[today] = ue.days[today] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+        ue.days[today].totalSale += saleValue;
+        ue.days[today].drops     += 1;
+        console.log(`💰 Sale value: ${saleValue} for whitelisted user ${message.author.tag} on ${today}`);
+      }
     }
 
     if (cardMatch || saleMatch) scheduleSave();
