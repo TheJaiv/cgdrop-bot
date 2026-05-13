@@ -15,6 +15,13 @@ const JSONBIN_KEY     = process.env.JSONBIN_KEY;
 let   binId           = process.env.JSONBIN_BIN_ID || null;
 const OWNER_ID        = process.env.OWNER_ID;
 
+// ─── WHITELIST CHECK ───────────────────────────────────────
+// Owner always passes. Whitelisted users pass for !myearnings / !myavg.
+function isWhitelisted(userId) {
+  if (userId === OWNER_ID) return true;
+  return !!(data.whitelist && data.whitelist[userId]);
+}
+
 // ─── OVR MAP ───────────────────────────────────────────────
 function getOVR(cardValue) {
   if (cardValue <= 6755)    return '77-';
@@ -314,11 +321,49 @@ client.on('messageCreate', async (message) => {
 
   // !myavg
   if (content === '!myavg') {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have access to this command!'); return; }
     const o = data.owner;
     if (!o || o.totalDrops === 0) { await message.reply('📊 No sale data yet!'); return; }
     const avg = Math.round(o.totalSale / o.totalDrops);
     await message.reply(`💰 **Your Drop Averages**\n\`\`\`\nTotal drops : ${o.totalDrops}\nTotal earned: ${fmt(o.totalSale)} coins\nAvg per drop: ${fmt(avg)} coins\`\`\``);
+    return;
+  }
+
+  // !adduser — owner only, grants whitelist access
+  if (content.startsWith('!adduser')) {
+    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+    const mentioned = message.mentions.users.first();
+    if (!mentioned) { await message.reply('❌ Usage: `!adduser @user`'); return; }
+    if (mentioned.id === OWNER_ID) { await message.reply('❌ You are already the owner!'); return; }
+    data.whitelist = data.whitelist || {};
+    data.whitelist[mentioned.id] = mentioned.tag;
+    scheduleSave();
+    await message.reply(`✅ **${mentioned.tag}** has been granted access to \`!myearnings\` and \`!myavg\`!`);
+    return;
+  }
+
+  // !removeuser — owner only, revokes whitelist access
+  if (content.startsWith('!removeuser')) {
+    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+    const mentioned = message.mentions.users.first();
+    if (!mentioned) { await message.reply('❌ Usage: `!removeuser @user`'); return; }
+    if (!data.whitelist || !data.whitelist[mentioned.id]) {
+      await message.reply(`❌ **${mentioned.tag}** is not in the whitelist.`);
+      return;
+    }
+    delete data.whitelist[mentioned.id];
+    scheduleSave();
+    await message.reply(`✅ **${mentioned.tag}** has been removed from the whitelist.`);
+    return;
+  }
+
+  // !listusers — owner only, shows current whitelist
+  if (content === '!listusers') {
+    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+    const wl = data.whitelist || {};
+    const entries = Object.values(wl);
+    if (entries.length === 0) { await message.reply('📋 Whitelist is empty.'); return; }
+    await message.reply(`📋 **Whitelisted users:**\n${entries.map(t => `• ${t}`).join('\n')}`);
     return;
   }
 
@@ -327,7 +372,7 @@ client.on('messageCreate', async (message) => {
 
   // !myearnings
   if (content === '!myearnings') {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have access to this command!'); return; }
     const o = data.owner;
     if (!o || !o.days || Object.keys(o.days).length === 0) { await message.reply('📊 No earnings data yet!'); return; }
 
