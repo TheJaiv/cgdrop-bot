@@ -420,8 +420,32 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // !addvote
-  if (content.startsWith('!addvote')) { await addIncome(message, 'vote', 'Vote'); return; }
+  // !addvote — owner + whitelisted users, each adds to their own earnings
+  if (content.startsWith('!addvote')) {
+    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have permission to use this command!'); return; }
+    const parts  = message.content.trim().split(' ');
+    const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
+    if (isNaN(amount)) {
+      await message.reply('❌ Usage: `!addvote 4500` or `!addvote 4500 yesterday`');
+      return;
+    }
+    const offset = parts[2] === 'yesterday' ? -1 : 0;
+    const date   = getISTDate(offset);
+    const userId = message.author.id;
+    if (userId === OWNER_ID) {
+      data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
+      data.owner.days[date] = data.owner.days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+      data.owner.days[date].vote = (data.owner.days[date].vote || 0) + amount;
+    } else {
+      data.userEarnings = data.userEarnings || {};
+      data.userEarnings[userId] = data.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
+      data.userEarnings[userId].days[date] = data.userEarnings[userId].days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+      data.userEarnings[userId].days[date].vote = (data.userEarnings[userId].days[date].vote || 0) + amount;
+    }
+    scheduleSave();
+    await message.reply(`✅ Added **${fmt(amount)} coins** from Vote to **${date}**!`);
+    return;
+  }
 
   // !myearnings
   if (content === '!myearnings') {
