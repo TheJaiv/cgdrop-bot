@@ -155,7 +155,8 @@ async function restoreReminders() {
         activeReminders.delete(userId);
       }, timeLeft);
       activeReminders.set(userId, timeout);
-      console.log(`⏰ Restored reminder for ${userId} — ${Math.ceil(timeLeft/60000)} min left`);
+      const userMins = (data.reminderTime && data.reminderTime[userId]) || 60;
+      console.log(`⏰ Restored reminder for ${userId} — ${Math.ceil(timeLeft/60000)} min left (custom: ${userMins} min)`);
     }
   }
 }
@@ -522,6 +523,61 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // !setreminder — whitelisted + owner only
+  if (content.startsWith('!setreminder')) {
+    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have permission to use this command!'); return; }
+    const parts = content.split(' ');
+    const mins  = parseInt(parts[1]);
+    if (isNaN(mins) || mins < 1 || mins > 120) {
+      await message.reply('❌ Usage: `!setreminder 40` (1–120 minutes)');
+      return;
+    }
+    data.reminderTime = data.reminderTime || {};
+    data.reminderTime[message.author.id] = mins;
+    scheduleSave();
+    await message.reply(`✅ Your drop reminder is now set to **${mins} minutes**!`);
+    return;
+  }
+
+  // !reminderstatus — whitelisted + owner only
+  if (content === '!reminderstatus') {
+    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have permission to use this command!'); return; }
+    const userId  = message.author.id;
+    const mins    = (data.reminderTime && data.reminderTime[userId]) || 60;
+    const status  = (data.reminderDisabled && data.reminderDisabled[userId]) ? '🔕 Disabled' : '🔔 Enabled';
+    await message.reply(`⏰ Your reminder is **${status}** and set to **${mins} minutes**.`);
+    return;
+  }
+
+  // !help
+  if (content === '!help') {
+    const isWL = isWhitelisted(message.author.id);
+    let msg = `📖 **CGDrop Bot — Commands**\n\n`;
+    msg += `**Everyone**\n`;
+    msg += `\`!ping\` — Check if bot is alive\n`;
+    msg += `\`!stats\` — Global drop OVR stats\n`;
+    msg += `\`!mystats\` — Your personal drop OVR stats\n`;
+    msg += `\`!resetmystats\` — Reset your personal stats\n`;
+    msg += `\`!unknown\` — View unrecognised card values\n`;
+    msg += `\`!remind on/off\` — Toggle your drop reminder\n`;
+    msg += `\n`;
+    if (isWL) {
+      msg += `**Whitelisted** ✅\n`;
+      msg += `\`!myearnings\` — Your daily earnings breakdown\n`;
+      msg += `\`!myavg\` — Your all-time daily averages\n`;
+      msg += `\`!addvote <amount>\` — Log vote coins (add \`yesterday\` for previous day)\n`;
+      msg += `\`!addmatch <amount>\` — Log match coins\n`;
+      msg += `\`!setreminder <mins>\` — Set custom reminder time (e.g. 40 for Gold, 50 for Silver)\n`;
+      msg += `\`!reminderstatus\` — Check your current reminder time & status\n`;
+    } else {
+      msg += `**Whitelisted only** 🔒\n`;
+      msg += `\`!myearnings\` \`!myavg\` \`!addvote\` \`!addmatch\` \`!setreminder\` \`!reminderstatus\`\n`;
+      msg += `\n> To get whitelisted, contact **frenzy_guy** 👑\n`;
+    }
+    await message.reply(msg);
+    return;
+  }
+
   // ─── cgdrop detection ──────────────────────────────────────
   if (!content.startsWith('cgdrop') && !content.startsWith('cg drop')) return;
   if (processedMsgIds.has(message.id)) return;
@@ -641,7 +697,9 @@ client.on('messageCreate', async (message) => {
   if (activeReminders.has(userId)) clearTimeout(activeReminders.get(userId));
   await message.react('⏰').catch(e => console.error('React error:', e.message));
 
-  const remindAt = Date.now() + REMIND_AFTER_MS;
+  const userMins  = (data.reminderTime && data.reminderTime[userId]) || 60;
+  const remindMs  = userMins * 60 * 1000;
+  const remindAt  = Date.now() + remindMs;
   data.reminders[userId] = { remindAt, channelId: message.channel.id };
   scheduleSave();
 
@@ -650,10 +708,10 @@ client.on('messageCreate', async (message) => {
     delete data.reminders[userId];
     scheduleSave();
     activeReminders.delete(userId);
-  }, REMIND_AFTER_MS);
+  }, remindMs);
 
   activeReminders.set(userId, timeout);
-  console.log(`✅ Reminder set for ${message.author.tag}.`);
+  console.log(`✅ Reminder set for ${message.author.tag} — ${userMins} min.`);
 });
 
 process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
