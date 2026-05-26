@@ -1,28 +1,185 @@
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const http = require('http');
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ]
-});
+// ══════════════════════════════════════════════════════════════════════════════
+//  CONFIG  (all secrets via environment variables)
+// ══════════════════════════════════════════════════════════════════════════════
+const JSONBIN_KEY         = process.env.JSONBIN_KEY;
+const CGDROP_BIN_ID_ENV   = process.env.CGDROP_BIN_ID   || null;
+const AUCTION_BIN_ID_ENV  = process.env.AUCTION_BIN_ID  || null;
+const OWNER_ID            = process.env.OWNER_ID;
+const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
 
-const REMIND_AFTER_MS = 60 * 60 * 1000;
-const BOT_WAIT_MS     = 5000;
-const JSONBIN_KEY     = process.env.JSONBIN_KEY;
-let   binId           = process.env.JSONBIN_BIN_ID || null;
-const OWNER_ID        = process.env.OWNER_ID;
+// Default prefixes — configurable per guild
+const DEFAULT_CGDROP_PREFIX  = '!';
+const DEFAULT_AUCTION_PREFIX = '.';
 
-// ─── WHITELIST CHECK ───────────────────────────────────────
-// Owner always passes. Whitelisted users pass for !myearnings / !myavg.
-function isWhitelisted(userId) {
-  if (userId === OWNER_ID) return true;
-  return !!(data.whitelist && data.whitelist[userId]);
+// cgdrop timing
+const BOT_WAIT_MS    = 5000;
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  IN-MEMORY STATE
+// ══════════════════════════════════════════════════════════════════════════════
+let cgdropBinId  = CGDROP_BIN_ID_ENV;
+let auctionBinId = AUCTION_BIN_ID_ENV;
+
+// cgdrop data
+let cgData = {
+  reminders: {}, reminderDisabled: {}, reminderTime: {},
+  stats: { total: 0, ovr: {}, unknown: [] },
+  userStats: {}, userEarnings: {}, owner: null,
+  whitelist: {}, recordingEnabled: true,
+  guildPrefixes: {}   // cgdrop prefix per guild
+};
+
+// auction data
+let auctionData = {
+  guilds: {},          // keyed by guild id
+  guildPrefixes: {}    // auction prefix per guild
+};
+
+const processedMsgIds = new Set();
+const activeReminders = new Map();
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  JSONBIN HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+async function loadBin(binId, label) {
+  try {
+    const res  = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
+      headers: { 'X-Master-Key': JSONBIN_KEY }
+    });
+    const json = await res.json();
+    console.log(`✅ ${label} data loaded from JSONBin`);
+    return json.record;
+  } catch (e) {
+    console.error(`Error loading ${label} from JSONBin:`, e.message);
+    return null;
+  }
 }
 
-// ─── OVR MAP ───────────────────────────────────────────────
+async function saveBin(data, binIdRef, setFn, label, binName) {
+  try {
+    if (!binIdRef) {
+      const res  = await fetch('https://api.jsonbin.io/v3/b', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Master-Key': JSONBIN_KEY,
+          'X-Bin-Name': binName,
+          'X-Bin-Private': 'true'
+        },
+        body: JSON.stringify(data)
+      });
+      const json = await res.json();
+      setFn(json.metadata.id);
+      console.log(`✅ Created new JSONBin for ${label}: ${json.metadata.id}`);
+      console.log(`⚠️  ADD TO ENV: ${binName.toUpperCase().replace(/-/g,'_')}_BIN_ID=${json.metadata.id}`);
+    } else {
+      await fetch(`https://api.jsonbin.io/v3/b/${binIdRef}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY },
+        body: JSON.stringify(data)
+      });
+      console.log(`💾 ${label} saved to JSONBin`);
+    }
+  } catch (e) {
+    console.error(`Error saving ${label} to JSONBin:`, e.message);
+  }
+}
+
+// Debounced saves (5 s) — collapses rapid writes
+let cgSaveTimer = null, auctionSaveTimer = null;
+
+function scheduleCgSave() {
+  if (cgSaveTimer) clearTimeout(cgSaveTimer);
+  cgSaveTimer = setTimeout(async () => {
+    cgSaveTimer = null;
+    await saveBin(cgData, cgdropBinId, id => { cgdropBinId = id; }, 'cgdrop', 'cgdrop-bot-data');
+  }, 5000);
+}
+
+function scheduleAuctionSave() {
+  if (auctionSaveTimer) clearTimeout(auctionSaveTimer);
+  auctionSaveTimer = setTimeout(async () => {
+    auctionSaveTimer = null;
+    await saveBin(auctionData, auctionBinId, id => { auctionBinId = id; }, 'auction', 'auction-bot-data');
+  }, 5000);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PREFIX HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+function getCgPrefix(guildId)      { return (cgData.guildPrefixes     && cgData.guildPrefixes[guildId])      || DEFAULT_CGDROP_PREFIX; }
+function getAuctionPrefix(guildId) { return (auctionData.guildPrefixes && auctionData.guildPrefixes[guildId]) || DEFAULT_AUCTION_PREFIX; }
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  AUCTION DATA HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+function getGuildData(guildId) {
+  const gid = String(guildId);
+  if (!auctionData.guilds[gid]) {
+    auctionData.guilds[gid] = {
+      logChannel: null,
+      purses: {},
+      squads: {},
+      auction: null,
+      queue: [],
+      difference: 500000,
+    };
+  }
+  return auctionData.guilds[gid];
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  AMOUNT HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+function parseAmount(value) {
+  if (!value) return null;
+  const s = String(value).trim().toLowerCase();
+  try {
+    if (s.endsWith('b')) return Math.round(parseFloat(s) * 1_000_000_000);
+    if (s.endsWith('m')) return Math.round(parseFloat(s) * 1_000_000);
+    if (s.endsWith('k')) return Math.round(parseFloat(s) * 1_000);
+    const n = parseInt(s.replace(/,/g, ''));
+    return isNaN(n) ? null : n;
+  } catch { return null; }
+}
+
+function formatAmount(amount) {
+  if (amount >= 1_000_000_000) {
+    const v = amount / 1_000_000_000;
+    return (v % 1 === 0 ? v : v.toFixed(2).replace(/\.?0+$/, '')) + 'B';
+  }
+  if (amount >= 1_000_000) {
+    const v = amount / 1_000_000;
+    return (v % 1 === 0 ? v : v.toFixed(2).replace(/\.?0+$/, '')) + 'M';
+  }
+  if (amount >= 1_000) {
+    const v = amount / 1_000;
+    return (v % 1 === 0 ? v : v.toFixed(1).replace(/\.?0+$/, '')) + 'K';
+  }
+  return String(amount);
+}
+
+function fmt(n) { return Number(n || 0).toLocaleString(); }
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PERMISSION HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+function isWhitelisted(userId) {
+  if (userId === OWNER_ID) return true;
+  return !!(cgData.whitelist && cgData.whitelist[userId]);
+}
+
+function hasAuctionPermission(member) {
+  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
+  return member.roles.cache.some(r => r.name === 'Auctioneer');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CGDROP HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
 function getOVR(cardValue) {
   if (cardValue <= 6755)    return '77-';
   if (cardValue === 10250)  return '78';
@@ -41,127 +198,25 @@ function getOVR(cardValue) {
   return null;
 }
 
-// ─── JSONBIN ───────────────────────────────────────────────
-async function loadData() {
-  try {
-    if (binId) {
-      const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
-        headers: { 'X-Master-Key': JSONBIN_KEY }
-      });
-      const json = await res.json();
-      console.log('✅ Data loaded from JSONBin');
-      return json.record;
-    }
-  } catch (e) { console.error('Error loading from JSONBin:', e.message); }
-  return { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
-}
-
-async function saveData(data) {
-  try {
-    if (!binId) {
-      const res = await fetch('https://api.jsonbin.io/v3/b', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Master-Key': JSONBIN_KEY,
-          'X-Bin-Name': 'cgdrop-bot-data',
-          'X-Bin-Private': 'true'
-        },
-        body: JSON.stringify(data)
-      });
-      const json = await res.json();
-      binId = json.metadata.id;
-      console.log(`✅ Created new JSONBin: ${binId}`);
-      console.log(`⚠️ ADD TO RENDER ENV: JSONBIN_BIN_ID=${binId}`);
-    } else {
-      await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY },
-        body: JSON.stringify(data)
-      });
-      console.log('💾 Data saved to JSONBin');
-    }
-  } catch (e) { console.error('Error saving to JSONBin:', e.message); }
-}
-
-// ─── DEBOUNCED SAVE (5s) ───────────────────────────────────
-// All writes go through scheduleSave(). Multiple calls within
-// 5 seconds collapse into a single JSONBin PUT — minimising API pulls.
-let saveTimer = null;
-function scheduleSave() {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    saveTimer = null;
-    await saveData(data);
-  }, 5000);
-}
-
-// ─── HELPERS ───────────────────────────────────────────────
 function getISTDate(offset = 0) {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
   d.setDate(d.getDate() + offset);
   return d.toISOString().slice(0, 10);
 }
 
-function pad(str, len) {
-  return String(str).padEnd(len);
-}
-
-function fmt(n) {
-  return Number(n || 0).toLocaleString();
-}
+function pad(str, len) { return String(str).padEnd(len); }
 
 function extractText(msg) {
   let text = msg.content || '';
   for (const embed of msg.embeds) {
-    if (embed.title)       text += ' ' + embed.title;
-    if (embed.description) text += ' ' + embed.description;
+    if (embed.title)        text += ' ' + embed.title;
+    if (embed.description)  text += ' ' + embed.description;
     for (const f of (embed.fields || [])) text += ' ' + f.name + ' ' + f.value;
     if (embed.footer?.text) text += ' ' + embed.footer.text;
   }
   return text;
 }
 
-// ─── REMINDERS ─────────────────────────────────────────────
-let data = { reminders: {}, stats: { total: 0, ovr: {}, unknown: [] } };
-const processedMsgIds = new Set();
-const activeReminders = new Map();
-
-async function sendReminder(userId, channelId) {
-  try {
-    const channel = await client.channels.fetch(channelId);
-    await channel.send(`<@${userId}> ⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁\nTo disable reminders type \`!remind off\``);
-  } catch (_) {
-    try {
-      const user = await client.users.fetch(userId);
-      await user.send(`⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁`);
-    } catch (err) { console.error('Could not send reminder:', err); }
-  }
-}
-
-async function restoreReminders() {
-  const now = Date.now();
-  for (const [userId, rem] of Object.entries(data.reminders || {})) {
-    const timeLeft = rem.remindAt - now;
-    if (timeLeft <= 0) {
-      sendReminder(userId, rem.channelId);
-      delete data.reminders[userId];
-      scheduleSave();
-    } else {
-      const timeout = setTimeout(async () => {
-        sendReminder(userId, rem.channelId);
-        delete data.reminders[userId];
-        scheduleSave();
-        activeReminders.delete(userId);
-      }, timeLeft);
-      activeReminders.set(userId, timeout);
-      const userMins = (data.reminderTime && data.reminderTime[userId]) || 60;
-      console.log(`⏰ Restored reminder for ${userId} — ${Math.ceil(timeLeft/60000)} min left (custom: ${userMins} min)`);
-    }
-  }
-}
-
-// ─── STATS MSG BUILDER (shared by !stats and !mystats) ─────
 function buildStatsMsg(s, title) {
   const OVR_ORDER = ['90+','89','88','87','86','85','84','83','82','81','80','79','78','77-'];
   const EMOJI = {
@@ -170,11 +225,9 @@ function buildStatsMsg(s, title) {
     '83':'🟡','82':'🟡','81':'🟡',
     '80':'🔵','79':'🔵','78':'🔵','77-':'⚪'
   };
-
   const activeOVRs = OVR_ORDER.filter(o => s.ovr[o] > 0);
   const nonBase    = activeOVRs.filter(o => o !== '77-');
   const uniquePcts = [...new Set(nonBase.map(o => parseFloat(((s.ovr[o] / s.total) * 100).toFixed(1))))].sort((a,b) => a-b);
-
   let currentBar = 1;
   const pctToBar = {};
   uniquePcts.forEach((pct, idx) => {
@@ -185,7 +238,6 @@ function buildStatsMsg(s, title) {
       pctToBar[pct] = currentBar;
     }
   });
-
   const ovrToBar = {};
   for (const ovr of activeOVRs) {
     if (ovr === '77-') { ovrToBar[ovr] = 20; }
@@ -194,7 +246,6 @@ function buildStatsMsg(s, title) {
       ovrToBar[ovr] = pctToBar[pct] || 1;
     }
   }
-
   let msg = `📊 **${title} — ${s.total} total drops**\n\`\`\`\n`;
   msg += `OVR    Ct   Pct     Bar\n`;
   msg += '─'.repeat(42) + '\n';
@@ -206,36 +257,30 @@ function buildStatsMsg(s, title) {
     const bar    = '█'.repeat(ovrToBar[ovr] || 1);
     msg += `${EMOJI[ovr]} ${ovr.padEnd(4)} ${String(count).padEnd(5)}${pctStr.padEnd(8)}${bar}\n`;
   }
-  msg += `\`\`\``;
+  msg += '```';
   if (s.unknown && s.unknown.length > 0)
     msg += `\n⚠️ **${s.unknown.length} unknown card value(s)** — use \`!unknown\` to see them`;
   return msg;
 }
 
-// ─── EARNINGS MSG BUILDER ──────────────────────────────────
 function buildEarningsMsg(earningsData, username) {
   if (!earningsData || !earningsData.days || Object.keys(earningsData.days).length === 0) return null;
-
   const allDays   = Object.entries(earningsData.days).sort((a,b) => a[0].localeCompare(b[0]));
   const last7     = allDays.slice(-7);
   const n         = last7.length;
   const totalDays = allDays.length;
-
   const tot7Drop   = last7.reduce((s,[,d]) => s + (d.totalSale||0), 0);
   const tot7Vote   = last7.reduce((s,[,d]) => s + (d.vote||0), 0);
   const tot7Match  = last7.reduce((s,[,d]) => s + (d.match||0), 0);
   const tot7All    = tot7Drop + tot7Vote + tot7Match;
-
   const totAllDrop  = allDays.reduce((s,[,d]) => s + (d.totalSale||0), 0);
   const totAllVote  = allDays.reduce((s,[,d]) => s + (d.vote||0), 0);
   const totAllMatch = allDays.reduce((s,[,d]) => s + (d.match||0), 0);
   const totAllAll   = totAllDrop + totAllVote + totAllMatch;
-
   const avgDrop    = Math.round(totAllDrop  / totalDays);
   const avgVote    = Math.round(totAllVote  / totalDays);
   const avgMatch   = Math.round(totAllMatch / totalDays);
-  const avgAll     = Math.round(totAllAll   / totalDays);
-
+  const avgAll     = avgDrop + avgVote + avgMatch;
   let bestDate = '', bestTotal = 0;
   for (const [date, d] of allDays) {
     const dayTotal = (d.totalSale||0) + (d.vote||0) + (d.match||0);
@@ -245,10 +290,8 @@ function buildEarningsMsg(earningsData, username) {
   const bestDrop  = bestDay.totalSale || 0;
   const bestVote  = bestDay.vote || 0;
   const bestMatch = bestDay.match || 0;
-
   const C       = { date:11, dr:4, drop:9, vote:9, match:9, total:9 };
   const divider = '─'.repeat(C.date + C.dr + C.drop + C.vote + C.match + C.total);
-
   let msg = `💰 **${username}'s Daily Earnings (last ${n} days)**\n\`\`\`\n`;
   msg += pad('Date',C.date) + pad('Dr',C.dr) + pad('Drop',C.drop) + pad('Vote',C.vote) + pad('Match',C.match) + 'Total\n';
   msg += divider + '\n';
@@ -263,329 +306,770 @@ function buildEarningsMsg(earningsData, username) {
   msg += pad('Avg/day',C.date)   + pad('',C.dr) + pad(fmt(avgDrop),C.drop)    + pad(fmt(avgVote),C.vote)    + pad(fmt(avgMatch),C.match)    + fmt(avgAll)    + '\n';
   msg += divider + '\n';
   msg += pad(`🏆 ${bestDate}`,C.date + C.dr) + pad(fmt(bestDrop),C.drop) + pad(fmt(bestVote),C.vote) + pad(fmt(bestMatch),C.match) + fmt(bestTotal) + '\n';
-  msg += '`\`\`';
+  msg += '```';
   return msg;
 }
 
-// ─── ADD INCOME HELPER ─────────────────────────────────────
-async function addIncome(message, type, label) {
-  if (message.author.id !== OWNER_ID) {
-    await message.reply(`❌ This command is only for the server owner!`);
-    return;
+// ══════════════════════════════════════════════════════════════════════════════
+//  REMINDER HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+async function sendReminder(userId, channelId) {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    await channel.send(`<@${userId}> ⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁\nTo disable reminders type \`!remind off\``);
+  } catch {
+    try {
+      const user = await client.users.fetch(userId);
+      await user.send(`⏰ **cgdrop reminder!** 1 hour's up — go claim your drop! 🎁`);
+    } catch (err) { console.error('Could not send reminder:', err); }
   }
-  const parts  = message.content.trim().split(' ');
-  const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
-  if (isNaN(amount)) {
-    await message.reply(`❌ Usage: \`!add${type} 4500\` or \`!add${type} 4500 yesterday\``);
-    return;
-  }
-  const offset = parts[2] === 'yesterday' ? -1 : 0;
-  const date   = getISTDate(offset);
-  data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
-  data.owner.days[date] = data.owner.days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
-  data.owner.days[date][type] = (data.owner.days[date][type] || 0) + amount;
-  scheduleSave();
-  console.log(`💰 ${label} earnings added: ${amount} for ${date}`);
-  await message.reply(`✅ Added **${fmt(amount)} coins** from ${label} to **${date}**!`);
 }
 
-// ─── READY ─────────────────────────────────────────────────
-client.once('ready', async () => {
-  console.log(`✅ Bot is online as ${client.user.tag}`);
-  data = await loadData();  // only pull — ever
-  await restoreReminders();
+async function restoreReminders() {
+  const now = Date.now();
+  for (const [userId, rem] of Object.entries(cgData.reminders || {})) {
+    const timeLeft = rem.remindAt - now;
+    if (timeLeft <= 0) {
+      sendReminder(userId, rem.channelId);
+      delete cgData.reminders[userId];
+      scheduleCgSave();
+    } else {
+      const timeout = setTimeout(async () => {
+        sendReminder(userId, rem.channelId);
+        delete cgData.reminders[userId];
+        scheduleCgSave();
+        activeReminders.delete(userId);
+      }, timeLeft);
+      activeReminders.set(userId, timeout);
+      console.log(`⏰ Restored reminder for ${userId} — ${Math.ceil(timeLeft/60000)} min left`);
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  AUCTION HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+async function sendLog(guild, embed) {
+  const gd = getGuildData(guild.id);
+  if (gd.logChannel) {
+    const ch = guild.channels.cache.get(gd.logChannel);
+    if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
+  }
+}
+
+async function doSold(message, gd) {
+  const auction = gd.auction;
+  if (!auction) {
+    return message.channel.send('❌ No auction is currently running.');
+  }
+
+  const { player, current_bid: bid, highest_bidder: bidderName, highest_bidder_id: bidderId } = auction;
+  let embed;
+
+  if (bidderId) {
+    const curPurse = gd.purses[bidderId] || 0;
+    gd.purses[bidderId] = Math.max(0, curPurse - bid);
+    if (!gd.squads[bidderId]) gd.squads[bidderId] = [];
+    gd.squads[bidderId].push({ player, price: bid });
+
+    embed = new EmbedBuilder()
+      .setTitle('🔨 SOLD!')
+      .setDescription(`**${player}** has been sold to **${bidderName}** for **${formatAmount(bid)}**!`)
+      .setColor(0xFFD700)
+      .addFields({ name: 'Remaining Balance', value: formatAmount(gd.purses[bidderId]), inline: true })
+      .setTimestamp();
+  } else {
+    embed = new EmbedBuilder()
+      .setTitle('🔨 UNSOLD')
+      .setDescription(`**${player}** received no bids and is unsold.`)
+      .setColor(0xAAAAAA)
+      .setTimestamp();
+  }
+
+  gd.auction = null;
+  scheduleAuctionSave();
+
+  const ch = message.guild.channels.cache.get(auction.channel_id) || message.channel;
+  await ch.send({ embeds: [embed] });
+  await sendLog(message.guild, embed);
+
+  // Auto-start next from queue
+  if (gd.queue && gd.queue.length > 0) {
+    const next = gd.queue.shift();
+    gd.auction = {
+      player: next.player,
+      base: next.base,
+      current_bid: next.base,
+      difference: next.difference,
+      highest_bidder: null,
+      highest_bidder_id: null,
+      channel_id: String(ch.id)
+    };
+    scheduleAuctionSave();
+
+    const nextEmbed = new EmbedBuilder()
+      .setTitle('🏏 NEXT AUCTION STARTED!')
+      .setDescription(`*Auto-started from queue — ${gd.queue.length} player(s) remaining.*`)
+      .setColor(0xFF0000)
+      .addFields(
+        { name: 'Player',        value: `**${next.player}**`,           inline: true },
+        { name: 'Base Price',    value: formatAmount(next.base),        inline: true },
+        { name: 'Min Increment', value: formatAmount(next.difference),  inline: true }
+      )
+      .setTimestamp();
+    await ch.send({ embeds: [nextEmbed] });
+    await sendLog(message.guild, nextEmbed);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CLIENT
+// ══════════════════════════════════════════════════════════════════════════════
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+  ]
 });
 
-// ─── MESSAGES ──────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  READY
+// ══════════════════════════════════════════════════════════════════════════════
+client.once('ready', async () => {
+  console.log(`✅ Bot is online as ${client.user.tag}`);
+
+  // Load both bins
+  if (cgdropBinId) {
+    const loaded = await loadBin(cgdropBinId, 'cgdrop');
+    if (loaded) cgData = { ...cgData, ...loaded };
+  }
+  if (auctionBinId) {
+    const loaded = await loadBin(auctionBinId, 'auction');
+    if (loaded) auctionData = { ...auctionData, ...loaded };
+  }
+
+  await restoreReminders();
+
+  // Register slash commands
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('sell')
+      .setDescription('Start an auction for a player')
+      .addStringOption(o => o.setName('player').setDescription('Player name').setRequired(true))
+      .addStringOption(o => o.setName('base').setDescription('Base price (e.g. 2m, 500k)').setRequired(true))
+      .addStringOption(o => o.setName('increment').setDescription('Min increment (optional)')),
+    new SlashCommandBuilder()
+      .setName('setauctionprefix')
+      .setDescription('Change the auction command prefix for this server')
+      .addStringOption(o => o.setName('prefix').setDescription('New prefix (e.g. .)').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('setcgprefix')
+      .setDescription('Change the cgdrop command prefix for this server')
+      .addStringOption(o => o.setName('prefix').setDescription('New prefix (e.g. !)').setRequired(true)),
+  ].map(c => c.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log('✅ Slash commands registered globally');
+  } catch (e) { console.error('Slash command registration failed:', e.message); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SLASH COMMANDS
+// ══════════════════════════════════════════════════════════════════════════════
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  const guildId = interaction.guildId;
+
+  if (interaction.commandName === 'sell') {
+    if (!hasAuctionPermission(interaction.member)) {
+      return interaction.reply({ content: '❌ You need **Administrator** or **Auctioneer** role.', ephemeral: true });
+    }
+    const gd = getGuildData(guildId);
+    if (gd.auction) return interaction.reply({ content: '❌ An auction is already running!', ephemeral: true });
+
+    const playerName = interaction.options.getString('player');
+    const base       = parseAmount(interaction.options.getString('base'));
+    const incRaw     = interaction.options.getString('increment');
+    if (!base) return interaction.reply({ content: '❌ Invalid base price.', ephemeral: true });
+    const diff = incRaw ? parseAmount(incRaw) : (gd.difference || 500000);
+
+    gd.auction = { player: playerName, base, current_bid: base, difference: diff,
+      highest_bidder: null, highest_bidder_id: null, channel_id: String(interaction.channelId) };
+    scheduleAuctionSave();
+
+    const embed = new EmbedBuilder()
+      .setTitle('🏏 AUCTION STARTED!')
+      .setColor(0xFF0000)
+      .addFields(
+        { name: 'Player',        value: `**${playerName}**`,  inline: true },
+        { name: 'Base Price',    value: formatAmount(base),   inline: true },
+        { name: 'Min Increment', value: formatAmount(diff),   inline: true },
+        { name: 'How to bid',    value: `Use \`${getAuctionPrefix(guildId)}bid <amount>\` to place a bid!`, inline: false }
+      )
+      .setFooter({ text: `Started by ${interaction.user.tag}` })
+      .setTimestamp();
+    await interaction.reply({ embeds: [embed] });
+    await sendLog(interaction.guild, embed);
+    return;
+  }
+
+  if (interaction.commandName === 'setauctionprefix') {
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
+      return interaction.reply({ content: '❌ Admin only!', ephemeral: true });
+    const np = interaction.options.getString('prefix');
+    auctionData.guildPrefixes = auctionData.guildPrefixes || {};
+    auctionData.guildPrefixes[guildId] = np;
+    scheduleAuctionSave();
+    return interaction.reply({ content: `✅ Auction prefix changed to \`${np}\``, ephemeral: true });
+  }
+
+  if (interaction.commandName === 'setcgprefix') {
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
+      return interaction.reply({ content: '❌ Admin only!', ephemeral: true });
+    const np = interaction.options.getString('prefix');
+    cgData.guildPrefixes = cgData.guildPrefixes || {};
+    cgData.guildPrefixes[guildId] = np;
+    scheduleCgSave();
+    return interaction.reply({ content: `✅ CGDrop prefix changed to \`${np}\``, ephemeral: true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  MESSAGE HANDLER
+// ══════════════════════════════════════════════════════════════════════════════
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  const content = message.content.trim().toLowerCase();
+  const content    = message.content.trim();
+  const lower      = content.toLowerCase();
+  const guildId    = message.guild?.id;
+  const cgPfx      = guildId ? getCgPrefix(guildId)      : DEFAULT_CGDROP_PREFIX;
+  const aucPfx     = guildId ? getAuctionPrefix(guildId) : DEFAULT_AUCTION_PREFIX;
+  const userId     = message.author.id;
 
-  // !ping
-  if (content === '!ping') {
-    console.log(`✅ !ping by ${message.author.tag}`);
-    await message.reply('✅ Bot is alive and watching for cgdrop!').catch(e => console.error('Reply error:', e.message));
-    return;
-  }
+  // ── Determine which prefix was used ──────────────────────────────────────
+  const usesCg  = content.startsWith(cgPfx);
+  const usesAuc = content.startsWith(aucPfx);
 
-  // !stats — reads from memory, no pull
-  if (content === '!stats') {
-    console.log(`📊 !stats by ${message.author.tag}`);
-    if (data.stats.total === 0) { await message.reply('📊 No drops registered yet!'); return; }
-    await message.reply(buildStatsMsg(data.stats, 'Drop Stats'));
-    return;
-  }
+  // Strip prefix and get command + args
+  const cgCmd  = usesCg  ? lower.slice(cgPfx.length).trim()      : null;
+  const aucCmd = usesAuc ? lower.slice(aucPfx.length).trim()      : null;
+  const cgArgs  = usesCg  ? content.slice(cgPfx.length).trim().split(/\s+/).slice(1)  : [];
+  const aucArgs = usesAuc ? content.slice(aucPfx.length).trim().split(/\s+/).slice(1) : [];
+  const aucRaw  = usesAuc ? content.slice(aucPfx.length).trim()   : null;
 
-  // !mystats — reads from memory, no pull
-  if (content === '!mystats') {
-    const userId   = message.author.id;
-    const userStat = data.userStats && data.userStats[userId];
-    if (!userStat || userStat.total === 0) {
-      await message.reply(`📊 No personal drop stats recorded for you yet${data.recordingEnabled === false ? ' (recording is currently off)' : ''}!`);
+  // ════════════════════════════════════════════════════════════════════════
+  //  CGDROP COMMANDS  (! prefix)
+  // ════════════════════════════════════════════════════════════════════════
+
+  if (usesCg) {
+
+    // !ping
+    if (cgCmd === 'ping') {
+      await message.reply('✅ Bot is alive and watching for cgdrop!');
       return;
     }
-    console.log(`📊 !mystats by ${message.author.tag}`);
-    await message.reply(buildStatsMsg(userStat, `${message.author.username}'s Stats`));
-    return;
-  }
 
-  // !recording on/off — owner only
-  if (content === '!recording on') {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
-    data.recordingEnabled = true;
-    scheduleSave();
-    await message.reply('✅ **Recording ON** — drops will now log to everyone\'s `!mystats`.');
-    return;
-  }
-
-  if (content === '!recording off') {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
-    data.recordingEnabled = false;
-    scheduleSave();
-    await message.reply('🔕 **Recording OFF** — drops will still count in `!stats` but not in personal `!mystats`.');
-    return;
-  }
-
-  // !unknown
-  if (content === '!unknown') {
-    const unknowns = data.stats.unknown || [];
-    if (unknowns.length === 0) { await message.reply('✅ No unknown card values logged!'); return; }
-    const list = unknowns.slice(-20).map(u => `• Value: **${u.value}** by ${u.user} at ${u.time}`).join('\n');
-    await message.reply(`⚠️ **Unknown card values (last 20):**\n${list}`);
-    return;
-  }
-
-  // !resetstats
-  if (content === '!resetstats') {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
-    data.stats = { total: 0, ovr: {}, unknown: [] };
-    scheduleSave();
-    await message.reply('🗑️ Global stats reset!');
-    return;
-  }
-
-  // !resetmystats
-  if (content === '!resetmystats') {
-    const userId = message.author.id;
-    if (data.userStats && data.userStats[userId]) {
-      data.userStats[userId] = { total: 0, ovr: {}, unknown: [] };
-      scheduleSave();
-    }
-    await message.reply('🗑️ Your personal stats have been reset!');
-    return;
-  }
-
-  // !myavg
-  if (content === '!myavg') {
-    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have access to this command!'); return; }
-    const userId       = message.author.id;
-    const isOwner      = userId === OWNER_ID;
-    const earningsData = isOwner ? data.owner : (data.userEarnings && data.userEarnings[userId]);
-    if (!earningsData || !earningsData.days || Object.keys(earningsData.days).length === 0) {
-      await message.reply('📊 No earnings data yet!'); return;
-    }
-    const allDays   = Object.entries(earningsData.days);
-    const totalDays = allDays.length;
-    const avgDrop  = Math.round(allDays.reduce((s,[,d]) => s + (d.totalSale||0), 0) / totalDays);
-    const avgVote  = Math.round(allDays.reduce((s,[,d]) => s + (d.vote||0),      0) / totalDays);
-    const avgMatch = Math.round(allDays.reduce((s,[,d]) => s + (d.match||0),     0) / totalDays);
-    const avgAll   = avgDrop + avgVote + avgMatch;
-    const name     = isOwner ? 'Your' : message.author.username + "'s";
-    const C        = { label:10, drop:9, vote:9, match:9, total:9 };
-    const divider  = '─'.repeat(C.label + C.drop + C.vote + C.match + C.total);
-    let msg = `📊 **${name} Daily Averages** (all-time, ${totalDays} days)\n\`\`\`\n`;
-    msg += pad('',C.label) + pad('Drop',C.drop) + pad('Vote',C.vote) + pad('Match',C.match) + 'Total\n';
-    msg += divider + '\n';
-    msg += pad('Avg/day',C.label) + pad(fmt(avgDrop),C.drop) + pad(fmt(avgVote),C.vote) + pad(fmt(avgMatch),C.match) + fmt(avgAll) + '\n';
-    msg += '`\`\`';
-    await message.reply(msg);
-    return;
-  }
-
-  // !adduser — owner only, grants whitelist access
-  if (content.startsWith('!adduser')) {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
-    const mentioned = message.mentions.users.first();
-    if (!mentioned) { await message.reply('❌ Usage: `!adduser @user`'); return; }
-    if (mentioned.id === OWNER_ID) { await message.reply('❌ You are already the owner!'); return; }
-    data.whitelist = data.whitelist || {};
-    data.whitelist[mentioned.id] = mentioned.tag;
-    scheduleSave();
-    await message.reply(`✅ **${mentioned.tag}** has been granted access to \`!myearnings\` and \`!myavg\`!`);
-    return;
-  }
-
-  // !removeuser — owner only, revokes whitelist access
-  if (content.startsWith('!removeuser')) {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
-    const mentioned = message.mentions.users.first();
-    if (!mentioned) { await message.reply('❌ Usage: `!removeuser @user`'); return; }
-    if (!data.whitelist || !data.whitelist[mentioned.id]) {
-      await message.reply(`❌ **${mentioned.tag}** is not in the whitelist.`);
+    // !stats
+    if (cgCmd === 'stats') {
+      if (cgData.stats.total === 0) { await message.reply('📊 No drops registered yet!'); return; }
+      await message.reply(buildStatsMsg(cgData.stats, 'Drop Stats'));
       return;
     }
-    delete data.whitelist[mentioned.id];
-    scheduleSave();
-    await message.reply(`✅ **${mentioned.tag}** has been removed from the whitelist.`);
-    return;
-  }
 
-  // !listusers — owner only, shows current whitelist
-  if (content === '!listusers') {
-    if (message.author.id !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
-    const wl = data.whitelist || {};
-    const entries = Object.values(wl);
-    if (entries.length === 0) { await message.reply('📋 Whitelist is empty.'); return; }
-    await message.reply(`📋 **Whitelisted users:**\n${entries.map(t => `• ${t}`).join('\n')}`);
-    return;
-  }
-
-  // !addvote — owner + whitelisted users, each adds to their own earnings
-  if (content.startsWith('!addvote')) {
-    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have permission to use this command!'); return; }
-    const parts  = message.content.trim().split(' ');
-    const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
-    if (isNaN(amount)) {
-      await message.reply('❌ Usage: `!addvote 4500` or `!addvote 4500 yesterday`');
+    // !mystats
+    if (cgCmd === 'mystats') {
+      const us = cgData.userStats && cgData.userStats[userId];
+      if (!us || us.total === 0) {
+        await message.reply(`📊 No personal drop stats recorded for you yet${cgData.recordingEnabled === false ? ' (recording is currently off)' : ''}!`);
+        return;
+      }
+      await message.reply(buildStatsMsg(us, `${message.author.username}'s Stats`));
       return;
     }
-    const offset = parts[2] === 'yesterday' ? -1 : 0;
-    const date   = getISTDate(offset);
-    const userId = message.author.id;
-    if (userId === OWNER_ID) {
-      data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
-      data.owner.days[date] = data.owner.days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
-      data.owner.days[date].vote = (data.owner.days[date].vote || 0) + amount;
-    } else {
-      data.userEarnings = data.userEarnings || {};
-      data.userEarnings[userId] = data.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
-      data.userEarnings[userId].days[date] = data.userEarnings[userId].days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
-      data.userEarnings[userId].days[date].vote = (data.userEarnings[userId].days[date].vote || 0) + amount;
-    }
-    scheduleSave();
-    await message.reply(`✅ Added **${fmt(amount)} coins** from Vote to **${date}**!`);
-    return;
-  }
 
-  // !addmatch — owner + whitelisted, each adds to their own earnings
-  if (content.startsWith('!addmatch')) {
-    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have permission to use this command!'); return; }
-    const parts  = message.content.trim().split(' ');
-    const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
-    if (isNaN(amount)) {
-      await message.reply('❌ Usage: `!addmatch 4500` or `!addmatch 4500 yesterday`');
+    // !recording on/off
+    if (cgCmd === 'recording on') {
+      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      cgData.recordingEnabled = true; scheduleCgSave();
+      await message.reply('✅ **Recording ON**'); return;
+    }
+    if (cgCmd === 'recording off') {
+      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      cgData.recordingEnabled = false; scheduleCgSave();
+      await message.reply('🔕 **Recording OFF**'); return;
+    }
+
+    // !unknown
+    if (cgCmd === 'unknown') {
+      const unknowns = cgData.stats.unknown || [];
+      if (unknowns.length === 0) { await message.reply('✅ No unknown card values logged!'); return; }
+      const list = unknowns.slice(-20).map(u => `• Value: **${u.value}** by ${u.user} at ${u.time}`).join('\n');
+      await message.reply(`⚠️ **Unknown card values (last 20):**\n${list}`);
       return;
     }
-    const offset = parts[2] === 'yesterday' ? -1 : 0;
-    const date   = getISTDate(offset);
-    const userId = message.author.id;
-    if (userId === OWNER_ID) {
-      data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
-      data.owner.days[date] = data.owner.days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
-      data.owner.days[date].match = (data.owner.days[date].match || 0) + amount;
-    } else {
-      data.userEarnings = data.userEarnings || {};
-      data.userEarnings[userId] = data.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
-      data.userEarnings[userId].days[date] = data.userEarnings[userId].days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
-      data.userEarnings[userId].days[date].match = (data.userEarnings[userId].days[date].match || 0) + amount;
+
+    // !resetstats
+    if (cgCmd === 'resetstats') {
+      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      cgData.stats = { total: 0, ovr: {}, unknown: [] }; scheduleCgSave();
+      await message.reply('🗑️ Global stats reset!'); return;
     }
-    scheduleSave();
-    await message.reply(`✅ Added **${fmt(amount)} coins** from Match to **${date}**!`);
-    return;
-  }
-  if (content === '!myearnings') {
-    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have access to this command!'); return; }
-    const userId   = message.author.id;
-    const isOwner  = userId === OWNER_ID;
-    // Owner uses data.owner; whitelisted users use data.userEarnings[userId]
-    const earningsData = isOwner ? data.owner : (data.userEarnings && data.userEarnings[userId]);
-    const msg = buildEarningsMsg(earningsData, isOwner ? 'Your' : message.author.username);
-    if (!msg) { await message.reply('📊 No earnings data yet!'); return; }
-    await message.reply(msg);
-    return;
-  }
 
-  // !remind off
-  if (content === '!remind off') {
-    data.reminderDisabled = data.reminderDisabled || {};
-    data.reminderDisabled[message.author.id] = true;
-    scheduleSave();
-    await message.reply('🔕 Reminders disabled! Type `!remind on` to enable again.');
-    return;
-  }
-
-  // !remind on
-  if (content === '!remind on') {
-    data.reminderDisabled = data.reminderDisabled || {};
-    delete data.reminderDisabled[message.author.id];
-    scheduleSave();
-    await message.reply('🔔 Reminders enabled!');
-    return;
-  }
-
-  // !setreminder — whitelisted + owner only
-  if (content.startsWith('!setreminder')) {
-    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have permission to use this command!'); return; }
-    const parts = content.split(' ');
-    const mins  = parseInt(parts[1]);
-    if (isNaN(mins) || mins < 1 || mins > 120) {
-      await message.reply('❌ Usage: `!setreminder 40` (1–120 minutes)');
-      return;
+    // !resetmystats
+    if (cgCmd === 'resetmystats') {
+      if (cgData.userStats && cgData.userStats[userId])
+        cgData.userStats[userId] = { total: 0, ovr: {}, unknown: [] };
+      scheduleCgSave();
+      await message.reply('🗑️ Your personal stats have been reset!'); return;
     }
-    data.reminderTime = data.reminderTime || {};
-    data.reminderTime[message.author.id] = mins;
-    scheduleSave();
-    await message.reply(`✅ Your drop reminder is now set to **${mins} minutes**!`);
-    return;
-  }
 
-  // !reminderstatus — whitelisted + owner only
-  if (content === '!reminderstatus') {
-    if (!isWhitelisted(message.author.id)) { await message.reply('❌ You do not have permission to use this command!'); return; }
-    const userId  = message.author.id;
-    const mins    = (data.reminderTime && data.reminderTime[userId]) || 60;
-    const status  = (data.reminderDisabled && data.reminderDisabled[userId]) ? '🔕 Disabled' : '🔔 Enabled';
-    await message.reply(`⏰ Your reminder is **${status}** and set to **${mins} minutes**.`);
-    return;
-  }
-
-  // !help
-  if (content === '!help') {
-    const isWL = isWhitelisted(message.author.id);
-    let msg = `📖 **CGDrop Bot — Commands**\n\n`;
-    msg += `**Everyone**\n`;
-    msg += `\`!ping\` — Check if bot is alive\n`;
-    msg += `\`!stats\` — Global drop OVR stats\n`;
-    msg += `\`!mystats\` — Your personal drop OVR stats\n`;
-    msg += `\`!resetmystats\` — Reset your personal stats\n`;
-    msg += `\`!unknown\` — View unrecognised card values\n`;
-    msg += `\`!remind on/off\` — Toggle your drop reminder\n`;
-    msg += `\n`;
-    if (isWL) {
-      msg += `**Whitelisted** ✅\n`;
-      msg += `\`!myearnings\` — Your daily earnings breakdown\n`;
-      msg += `\`!myavg\` — Your all-time daily averages\n`;
-      msg += `\`!addvote <amount>\` — Log vote coins (add \`yesterday\` for previous day)\n`;
-      msg += `\`!addmatch <amount>\` — Log match coins\n`;
-      msg += `\`!setreminder <mins>\` — Set custom reminder time (e.g. 40 for Gold, 50 for Silver)\n`;
-      msg += `\`!reminderstatus\` — Check your current reminder time & status\n`;
-    } else {
-      msg += `**Whitelisted only** 🔒\n`;
-      msg += `\`!myearnings\` \`!myavg\` \`!addvote\` \`!addmatch\` \`!setreminder\` \`!reminderstatus\`\n`;
-      msg += `\n> To get whitelisted, contact **frenzy_guy** 👑\n`;
+    // !myavg
+    if (cgCmd === 'myavg') {
+      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have access to this command!'); return; }
+      const isOwner      = userId === OWNER_ID;
+      const earningsData = isOwner ? cgData.owner : (cgData.userEarnings && cgData.userEarnings[userId]);
+      if (!earningsData || !earningsData.days || Object.keys(earningsData.days).length === 0) {
+        await message.reply('📊 No earnings data yet!'); return;
+      }
+      const allDays   = Object.entries(earningsData.days);
+      const totalDays = allDays.length;
+      const avgDrop   = Math.round(allDays.reduce((s,[,d]) => s + (d.totalSale||0), 0) / totalDays);
+      const avgVote   = Math.round(allDays.reduce((s,[,d]) => s + (d.vote||0),      0) / totalDays);
+      const avgMatch  = Math.round(allDays.reduce((s,[,d]) => s + (d.match||0),     0) / totalDays);
+      const avgAll    = avgDrop + avgVote + avgMatch;
+      const name      = isOwner ? 'Your' : message.author.username + "'s";
+      const C         = { label:10, drop:9, vote:9, match:9, total:9 };
+      const divider   = '─'.repeat(C.label + C.drop + C.vote + C.match + C.total);
+      let msg = `📊 **${name} Daily Averages** (all-time, ${totalDays} days)\n\`\`\`\n`;
+      msg += pad('',C.label) + pad('Drop',C.drop) + pad('Vote',C.vote) + pad('Match',C.match) + 'Total\n';
+      msg += divider + '\n';
+      msg += pad('Avg/day',C.label) + pad(fmt(avgDrop),C.drop) + pad(fmt(avgVote),C.vote) + pad(fmt(avgMatch),C.match) + fmt(avgAll) + '\n';
+      msg += '```';
+      await message.reply(msg); return;
     }
-    await message.reply(msg);
-    return;
+
+    // !adduser
+    if (cgCmd && cgCmd.startsWith('adduser')) {
+      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      const mentioned = message.mentions.users.first();
+      if (!mentioned) { await message.reply('❌ Usage: `!adduser @user`'); return; }
+      if (mentioned.id === OWNER_ID) { await message.reply('❌ You are already the owner!'); return; }
+      cgData.whitelist = cgData.whitelist || {};
+      cgData.whitelist[mentioned.id] = mentioned.tag;
+      scheduleCgSave();
+      await message.reply(`✅ **${mentioned.tag}** granted access to \`!myearnings\` and \`!myavg\`!`); return;
+    }
+
+    // !removeuser
+    if (cgCmd && cgCmd.startsWith('removeuser')) {
+      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      const mentioned = message.mentions.users.first();
+      if (!mentioned) { await message.reply('❌ Usage: `!removeuser @user`'); return; }
+      if (!cgData.whitelist || !cgData.whitelist[mentioned.id]) {
+        await message.reply(`❌ **${mentioned.tag}** is not in the whitelist.`); return;
+      }
+      delete cgData.whitelist[mentioned.id]; scheduleCgSave();
+      await message.reply(`✅ **${mentioned.tag}** removed from whitelist.`); return;
+    }
+
+    // !listusers
+    if (cgCmd === 'listusers') {
+      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      const entries = Object.values(cgData.whitelist || {});
+      if (entries.length === 0) { await message.reply('📋 Whitelist is empty.'); return; }
+      await message.reply(`📋 **Whitelisted users:**\n${entries.map(t => `• ${t}`).join('\n')}`); return;
+    }
+
+    // !addvote
+    if (cgCmd && cgCmd.startsWith('addvote')) {
+      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      const parts  = content.slice(cgPfx.length).trim().split(' ');
+      const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
+      if (isNaN(amount)) { await message.reply('❌ Usage: `!addvote 4500` or `!addvote 4500 yesterday`'); return; }
+      const offset = parts[2] === 'yesterday' ? -1 : 0;
+      const date   = getISTDate(offset);
+      if (userId === OWNER_ID) {
+        cgData.owner = cgData.owner || { totalSale: 0, totalDrops: 0, days: {} };
+        cgData.owner.days[date] = cgData.owner.days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+        cgData.owner.days[date].vote = (cgData.owner.days[date].vote || 0) + amount;
+      } else {
+        cgData.userEarnings = cgData.userEarnings || {};
+        cgData.userEarnings[userId] = cgData.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
+        cgData.userEarnings[userId].days[date] = cgData.userEarnings[userId].days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+        cgData.userEarnings[userId].days[date].vote = (cgData.userEarnings[userId].days[date].vote || 0) + amount;
+      }
+      scheduleCgSave();
+      await message.reply(`✅ Added **${fmt(amount)} coins** from Vote to **${date}**!`); return;
+    }
+
+    // !addmatch
+    if (cgCmd && cgCmd.startsWith('addmatch')) {
+      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      const parts  = content.slice(cgPfx.length).trim().split(' ');
+      const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
+      if (isNaN(amount)) { await message.reply('❌ Usage: `!addmatch 4500` or `!addmatch 4500 yesterday`'); return; }
+      const offset = parts[2] === 'yesterday' ? -1 : 0;
+      const date   = getISTDate(offset);
+      if (userId === OWNER_ID) {
+        cgData.owner = cgData.owner || { totalSale: 0, totalDrops: 0, days: {} };
+        cgData.owner.days[date] = cgData.owner.days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+        cgData.owner.days[date].match = (cgData.owner.days[date].match || 0) + amount;
+      } else {
+        cgData.userEarnings = cgData.userEarnings || {};
+        cgData.userEarnings[userId] = cgData.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
+        cgData.userEarnings[userId].days[date] = cgData.userEarnings[userId].days[date] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+        cgData.userEarnings[userId].days[date].match = (cgData.userEarnings[userId].days[date].match || 0) + amount;
+      }
+      scheduleCgSave();
+      await message.reply(`✅ Added **${fmt(amount)} coins** from Match to **${date}**!`); return;
+    }
+
+    // !myearnings
+    if (cgCmd === 'myearnings') {
+      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have access!'); return; }
+      const isOwner      = userId === OWNER_ID;
+      const earningsData = isOwner ? cgData.owner : (cgData.userEarnings && cgData.userEarnings[userId]);
+      const msg = buildEarningsMsg(earningsData, isOwner ? 'Your' : message.author.username);
+      if (!msg) { await message.reply('📊 No earnings data yet!'); return; }
+      await message.reply(msg); return;
+    }
+
+    // !remind off/on
+    if (cgCmd === 'remind off') {
+      cgData.reminderDisabled = cgData.reminderDisabled || {};
+      cgData.reminderDisabled[userId] = true; scheduleCgSave();
+      await message.reply('🔕 Reminders disabled! Type `!remind on` to enable.'); return;
+    }
+    if (cgCmd === 'remind on') {
+      cgData.reminderDisabled = cgData.reminderDisabled || {};
+      delete cgData.reminderDisabled[userId]; scheduleCgSave();
+      await message.reply('🔔 Reminders enabled!'); return;
+    }
+
+    // !setreminder
+    if (cgCmd && cgCmd.startsWith('setreminder')) {
+      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      const mins = parseInt(cgCmd.split(' ')[1]);
+      if (isNaN(mins) || mins < 1 || mins > 120) {
+        await message.reply('❌ Usage: `!setreminder 40` (1–120 minutes)'); return;
+      }
+      cgData.reminderTime = cgData.reminderTime || {};
+      cgData.reminderTime[userId] = mins; scheduleCgSave();
+      await message.reply(`✅ Drop reminder set to **${mins} minutes**!`); return;
+    }
+
+    // !reminderstatus
+    if (cgCmd === 'reminderstatus') {
+      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      const mins   = (cgData.reminderTime && cgData.reminderTime[userId]) || 60;
+      const status = (cgData.reminderDisabled && cgData.reminderDisabled[userId]) ? '🔕 Disabled' : '🔔 Enabled';
+      await message.reply(`⏰ Your reminder is **${status}** and set to **${mins} minutes**.`); return;
+    }
+
+    // !help
+    if (cgCmd === 'help') {
+      const isWL = isWhitelisted(userId);
+      let msg = `📖 **Bot — Commands**\n\n`;
+      msg += `**CGDrop Commands** (\`${cgPfx}\` prefix)\n`;
+      msg += `\`${cgPfx}ping\` — Check if bot is alive\n`;
+      msg += `\`${cgPfx}stats\` — Global drop OVR stats\n`;
+      msg += `\`${cgPfx}mystats\` — Your personal drop OVR stats\n`;
+      msg += `\`${cgPfx}resetmystats\` — Reset your personal stats\n`;
+      msg += `\`${cgPfx}unknown\` — View unrecognised card values\n`;
+      msg += `\`${cgPfx}remind on/off\` — Toggle your drop reminder\n\n`;
+      if (isWL) {
+        msg += `**Whitelisted** ✅\n`;
+        msg += `\`${cgPfx}myearnings\` \`${cgPfx}myavg\` \`${cgPfx}addvote\` \`${cgPfx}addmatch\`\n`;
+        msg += `\`${cgPfx}setreminder <mins>\` \`${cgPfx}reminderstatus\`\n\n`;
+      } else {
+        msg += `**Whitelisted only** 🔒 — Contact **frenzy_guy** 👑 to get access\n\n`;
+      }
+      msg += `**Auction Commands** (\`${aucPfx}\` prefix)\n`;
+      msg += `\`${aucPfx}setpurse @user <amt>\` — Set purse *(Admin/Auctioneer)*\n`;
+      msg += `\`${aucPfx}sell <player> <base>\` — Start auction *(Admin/Auctioneer)*\n`;
+      msg += `\`${aucPfx}bid <amount>\` — Place a bid\n`;
+      msg += `\`${aucPfx}sold\` — End auction *(Admin/Auctioneer)*\n`;
+      msg += `\`${aucPfx}aq <player> <base>\` — Add to queue *(Admin/Auctioneer)*\n`;
+      msg += `\`${aucPfx}sq\` — Start queue *(Admin/Auctioneer)*\n`;
+      msg += `\`${aucPfx}q\` — View queue\n`;
+      msg += `\`${aucPfx}bal [@user]\` — Check balance\n`;
+      msg += `\`${aucPfx}lb\` — Purse leaderboard\n`;
+      msg += `\`${aucPfx}squad [@user]\` — View squad\n\n`;
+      msg += `**Prefix Config** (slash commands)\n`;
+      msg += `\`/setauctionprefix\` \`/setcgprefix\``;
+      await message.reply(msg); return;
+    }
   }
 
-  // ─── cgdrop detection ──────────────────────────────────────
-  if (!content.startsWith('cgdrop') && !content.startsWith('cg drop')) return;
+  // ════════════════════════════════════════════════════════════════════════
+  //  AUCTION COMMANDS  (. prefix)
+  // ════════════════════════════════════════════════════════════════════════
+
+  if (usesAuc && guildId) {
+    const gd = getGuildData(guildId);
+    const parts = aucRaw.split(/\s+/);
+    const cmd   = parts[0].toLowerCase();
+
+    // .setpurse / .sp
+    if (cmd === 'setpurse' || cmd === 'sp') {
+      if (!hasAuctionPermission(message.member)) {
+        await message.reply('❌ You need **Administrator** or **Auctioneer** role.'); return;
+      }
+      const mentioned = message.mentions.members.first();
+      const amtRaw    = parts[2];
+      if (!mentioned || !amtRaw) { await message.reply(`❌ Usage: \`${aucPfx}setpurse @user <amount>\``); return; }
+      const parsed = parseAmount(amtRaw);
+      if (!parsed) { await message.reply('❌ Invalid amount.'); return; }
+      gd.purses[mentioned.id] = parsed;
+      scheduleAuctionSave();
+      const embed = new EmbedBuilder()
+        .setTitle('💰 Purse Set')
+        .setDescription(`${mentioned} purse set to **${formatAmount(parsed)}**`)
+        .setColor(0x00FF00).setTimestamp()
+        .setFooter({ text: `Set by ${message.author.tag}` });
+      await message.channel.send({ embeds: [embed] });
+      await sendLog(message.guild, embed); return;
+    }
+
+    // .setlogchannel / .slc
+    if (cmd === 'setlogchannel' || cmd === 'slc') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      const ch = message.mentions.channels.first();
+      if (!ch) { await message.reply(`❌ Usage: \`${aucPfx}setlogchannel #channel\``); return; }
+      gd.logChannel = ch.id; scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('📋 Log Channel Set').setDescription(`Logs → ${ch}`).setColor(0x0099FF);
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .setdifference / .sd
+    if (cmd === 'setdifference' || cmd === 'sd') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      const parsed = parseAmount(parts[1]);
+      if (!parsed) { await message.reply('❌ Invalid amount.'); return; }
+      gd.difference = parsed; scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('⚙️ Bid Increment Set')
+        .setDescription(`Min increment: **${formatAmount(parsed)}**`).setColor(0xFF8800);
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .sell
+    if (cmd === 'sell') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (gd.auction) { await message.reply('❌ Auction already running! Use `.sold` first.'); return; }
+      const playerName = parts[1];
+      const base       = parseAmount(parts[2]);
+      if (!playerName || !base) { await message.reply(`❌ Usage: \`${aucPfx}sell <player> <base> [increment]\``); return; }
+      const diff = parts[3] ? parseAmount(parts[3]) : (gd.difference || 500000);
+      gd.auction = { player: playerName, base, current_bid: base, difference: diff,
+        highest_bidder: null, highest_bidder_id: null, channel_id: String(message.channel.id) };
+      scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('🏏 AUCTION STARTED!').setColor(0xFF0000)
+        .addFields(
+          { name: 'Player',        value: `**${playerName}**`,  inline: true },
+          { name: 'Base Price',    value: formatAmount(base),   inline: true },
+          { name: 'Min Increment', value: formatAmount(diff),   inline: true },
+          { name: 'How to bid',    value: `Use \`${aucPfx}bid <amount>\``, inline: false }
+        ).setFooter({ text: `Started by ${message.author.tag}` }).setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      await sendLog(message.guild, embed); return;
+    }
+
+    // .bid / .b
+    if (cmd === 'bid' || cmd === 'b') {
+      const auction = gd.auction;
+      if (!auction) { await message.reply('❌ No auction running.'); return; }
+      const userPurse = gd.purses[userId] || 0;
+      let bidAmt;
+      if (!parts[1]) {
+        bidAmt = auction.current_bid + auction.difference;
+      } else {
+        bidAmt = parseAmount(parts[1]);
+        if (!bidAmt) { await message.reply('❌ Invalid bid amount.'); return; }
+      }
+      const minBid = auction.highest_bidder_id ? auction.current_bid + auction.difference : auction.base;
+      if (bidAmt < minBid) { await message.reply(`❌ Minimum bid is **${formatAmount(minBid)}**.`); return; }
+      if (userPurse < bidAmt) { await message.reply(`❌ Insufficient funds! Your balance: **${formatAmount(userPurse)}**`); return; }
+      auction.current_bid      = bidAmt;
+      auction.highest_bidder   = message.member.displayName;
+      auction.highest_bidder_id = userId;
+      scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('💸 New Bid Placed!').setColor(0x00CC00)
+        .addFields(
+          { name: 'Player', value: auction.player,          inline: true },
+          { name: 'Bid',    value: formatAmount(bidAmt),    inline: true },
+          { name: 'Bidder', value: `<@${userId}>`,          inline: true }
+        ).setTimestamp();
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .sold
+    if (cmd === 'sold') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      await doSold(message, gd); return;
+    }
+
+    // .addqueue / .aq
+    if (cmd === 'addqueue' || cmd === 'aq') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      const playerName = parts[1];
+      const base       = parseAmount(parts[2]);
+      if (!playerName || !base) { await message.reply(`❌ Usage: \`${aucPfx}aq <player> <base> [increment]\``); return; }
+      const diff = parts[3] ? parseAmount(parts[3]) : (gd.difference || 500000);
+      if (!Array.isArray(gd.queue)) gd.queue = [];
+      gd.queue.push({ player: playerName, base, difference: diff });
+      scheduleAuctionSave();
+      const pos = gd.queue.length;
+      const embed = new EmbedBuilder().setTitle('📋 Player Added to Queue')
+        .setDescription(`**${playerName}** added to queue.`).setColor(0x5865F2)
+        .addFields(
+          { name: 'Base Price',    value: formatAmount(base),  inline: true },
+          { name: 'Min Increment', value: formatAmount(diff),  inline: true },
+          { name: 'Position',      value: `#${pos}`,           inline: true }
+        ).setFooter({ text: `Added by ${message.author.tag}` }).setTimestamp();
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .startqueue / .sq
+    if (cmd === 'startqueue' || cmd === 'sq') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (gd.auction) { await message.reply(`❌ Auction already running! Use \`${aucPfx}sold\` first.`); return; }
+      if (!gd.queue || gd.queue.length === 0) { await message.reply(`❌ Queue is empty. Add players with \`${aucPfx}aq\` first.`); return; }
+      const next = gd.queue.shift();
+      gd.auction = { player: next.player, base: next.base, current_bid: next.base, difference: next.difference,
+        highest_bidder: null, highest_bidder_id: null, channel_id: String(message.channel.id) };
+      scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('🏏 AUCTION STARTED!')
+        .setDescription(`*From queue — ${gd.queue.length} player(s) remaining.*`).setColor(0xFF0000)
+        .addFields(
+          { name: 'Player',        value: `**${next.player}**`,   inline: true },
+          { name: 'Base Price',    value: formatAmount(next.base), inline: true },
+          { name: 'Min Increment', value: formatAmount(next.difference), inline: true },
+          { name: 'How to bid',    value: `Use \`${aucPfx}bid <amount>\``, inline: false }
+        ).setFooter({ text: `Started by ${message.author.tag}` }).setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      await sendLog(message.guild, embed); return;
+    }
+
+    // .queue / .q
+    if (cmd === 'queue' || cmd === 'q') {
+      const embed = new EmbedBuilder().setTitle('📋 Auction Queue').setColor(0x5865F2).setTimestamp();
+      if (gd.auction) {
+        embed.addFields({ name: '🔴 Currently Auctioning',
+          value: `**${gd.auction.player}** — Current Bid: ${formatAmount(gd.auction.current_bid)}`, inline: false });
+      }
+      if (!gd.queue || gd.queue.length === 0) {
+        embed.addFields({ name: 'Queue', value: 'Queue is empty.', inline: false });
+      } else {
+        const lines = gd.queue.map((item, i) =>
+          `\`${i+1}.\` **${item.player}** — Base: ${formatAmount(item.base)}, Inc: ${formatAmount(item.difference)}`
+        ).join('\n');
+        embed.addFields({ name: `Up Next (${gd.queue.length} player(s))`, value: lines, inline: false });
+      }
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .removequeue / .rq
+    if (cmd === 'removequeue' || cmd === 'rq') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      const idx = parseInt(parts[1]) - 1;
+      if (isNaN(idx) || idx < 0 || idx >= (gd.queue || []).length) {
+        await message.reply(`❌ Invalid index. Queue has ${(gd.queue || []).length} player(s).`); return;
+      }
+      const removed = gd.queue.splice(idx, 1)[0];
+      scheduleAuctionSave();
+      await message.reply(`🗑️ Removed **${removed.player}** from the queue.`); return;
+    }
+
+    // .clearqueue / .cq
+    if (cmd === 'clearqueue' || cmd === 'cq') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      const count = (gd.queue || []).length;
+      gd.queue = []; scheduleAuctionSave();
+      await message.reply(`🗑️ Cleared **${count}** player(s) from the queue.`); return;
+    }
+
+    // .bal / .b / .wallet
+    if (cmd === 'bal' || cmd === 'wallet') {
+      const target   = message.mentions.members.first() || message.member;
+      const amount   = gd.purses[target.id] || 0;
+      const embed = new EmbedBuilder().setTitle(`💼 ${target.displayName}'s Wallet`)
+        .setDescription(`**Balance:** ${formatAmount(amount)}`).setColor(0xFFD700)
+        .setThumbnail(target.user.displayAvatarURL());
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .leaderboard / .lb
+    if (cmd === 'leaderboard' || cmd === 'lb') {
+      const purses = gd.purses || {};
+      const sorted = Object.entries(purses).filter(([,v]) => v > 0).sort((a,b) => b[1]-a[1]);
+      const embed  = new EmbedBuilder().setTitle('🏆 Purse Leaderboard').setColor(0xFFD700).setTimestamp();
+      if (sorted.length === 0) {
+        embed.setDescription('No purses set yet.');
+      } else {
+        const medals = ['🥇','🥈','🥉'];
+        const lines  = sorted.slice(0, 10).map(([uid, amt], i) => {
+          const member = message.guild.members.cache.get(uid);
+          const name   = member ? member.displayName : `User ${uid}`;
+          const medal  = i < 3 ? medals[i] : `\`${i+1}.\``;
+          return `${medal} **${name}** — ${formatAmount(amt)}`;
+        });
+        embed.setDescription(lines.join('\n'));
+      }
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .squad
+    if (cmd === 'squad') {
+      const target  = message.mentions.members.first() || message.member;
+      const players = (gd.squads && gd.squads[target.id]) || [];
+      const embed   = new EmbedBuilder().setTitle(`🏏 ${target.displayName}'s Squad`).setColor(0x0099FF)
+        .setThumbnail(target.user.displayAvatarURL()).setTimestamp();
+      if (players.length === 0) {
+        embed.setDescription('No players bought yet.');
+      } else {
+        embed.setDescription(players.map((p,i) => `\`${i+1}.\` **${p.player}** — ${formatAmount(p.price)}`).join('\n'));
+      }
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .delete
+    if (cmd === 'delete') {
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        await message.reply('❌ Admin only.'); return;
+      }
+      const target = message.mentions.members.first();
+      if (!target) { await message.reply(`❌ Usage: \`${aucPfx}delete @user <index|all>\``); return; }
+      const indexArg = parts[2];
+      if (!indexArg) { await message.reply('❌ Provide index or `all`.'); return; }
+      if (!gd.squads) gd.squads = {};
+      if (['all','everyone','max'].includes(indexArg.toLowerCase())) {
+        gd.squads[target.id] = []; scheduleAuctionSave();
+        await message.reply(`🗑️ Cleared all players from **${target.displayName}**'s squad.`); return;
+      }
+      const idx = parseInt(indexArg) - 1;
+      const squad = gd.squads[target.id] || [];
+      if (isNaN(idx) || idx < 0 || idx >= squad.length) {
+        await message.reply(`❌ Invalid index. Squad has ${squad.length} player(s).`); return;
+      }
+      const removed = squad.splice(idx, 1)[0];
+      gd.squads[target.id] = squad; scheduleAuctionSave();
+      await message.reply(`🗑️ Removed **${removed.player}** from **${target.displayName}**'s squad.`); return;
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  //  CGDROP DETECTION  (no prefix needed)
+  // ════════════════════════════════════════════════════════════════════════
+  if (!lower.startsWith('cgdrop') && !lower.startsWith('cg drop')) return;
   if (processedMsgIds.has(message.id)) return;
   processedMsgIds.add(message.id);
   setTimeout(() => processedMsgIds.delete(message.id), 10 * 60 * 1000);
 
   const channel = message.channel;
-  const userId  = message.author.id;
   console.log(`🎯 Detected cgdrop by ${message.author.tag}`);
 
   let replyMsg = null;
@@ -605,7 +1089,6 @@ client.on('messageCreate', async (message) => {
   if (replyMsg) {
     const allText = extractText(replyMsg).toLowerCase();
     const rawText = extractText(replyMsg);
-    console.log(`📨 Game bot replied: "${rawText.slice(0, 200)}"`);
 
     const isCooldown = /claim your next/i.test(allText) || /cooldown/i.test(allText);
     if (isCooldown) {
@@ -615,8 +1098,7 @@ client.on('messageCreate', async (message) => {
         const diff = Math.ceil((parseInt(tsMatch[1]) - Math.floor(Date.now()/1000)) / 60);
         minsLeft = diff > 0 ? String(diff) : 'a few';
       }
-      console.log(`⏳ Cooldown for ${message.author.tag} — ${minsLeft} min left.`);
-      await message.react('⏳').catch(e => console.error('React error:', e.message));
+      await message.react('⏳').catch(() => {});
       return;
     }
 
@@ -626,99 +1108,81 @@ client.on('messageCreate', async (message) => {
     if (cardMatch) {
       const cardValue = parseInt(cardMatch[1].replace(/,/g, ''));
       const ovr = getOVR(cardValue);
-      console.log(`🃏 Card value: ${cardValue} → OVR: ${ovr || 'UNKNOWN'}`);
-
-      // ── Always log to global !stats ──
-      data.stats.total += 1;
+      cgData.stats.total += 1;
       if (ovr) {
-        data.stats.ovr[ovr] = (data.stats.ovr[ovr] || 0) + 1;
+        cgData.stats.ovr[ovr] = (cgData.stats.ovr[ovr] || 0) + 1;
       } else {
-        data.stats.unknown = data.stats.unknown || [];
-        data.stats.unknown.push({ value: cardValue, user: message.author.tag, time: new Date().toLocaleString() });
-        await channel.send(`⚠️ <@${userId}> Unknown card value **${cardValue}** — not in OVR map! Use \`!unknown\` to review.`);
+        cgData.stats.unknown = cgData.stats.unknown || [];
+        cgData.stats.unknown.push({ value: cardValue, user: message.author.tag, time: new Date().toLocaleString() });
+        await channel.send(`⚠️ <@${userId}> Unknown card value **${cardValue}** — use \`!unknown\` to review.`);
       }
-
-      // ── Log to !mystats only if recording is on OR user is owner ──
-      const recordingOn = data.recordingEnabled !== false; // default true
+      const recordingOn = cgData.recordingEnabled !== false;
       if (recordingOn || userId === OWNER_ID) {
-        data.userStats = data.userStats || {};
-        data.userStats[userId] = data.userStats[userId] || { total: 0, ovr: {}, unknown: [] };
-        const us = data.userStats[userId];
+        cgData.userStats = cgData.userStats || {};
+        cgData.userStats[userId] = cgData.userStats[userId] || { total: 0, ovr: {}, unknown: [] };
+        const us = cgData.userStats[userId];
         us.total += 1;
-        if (ovr) {
-          us.ovr[ovr] = (us.ovr[ovr] || 0) + 1;
-        } else {
-          us.unknown = us.unknown || [];
-          us.unknown.push({ value: cardValue, time: new Date().toLocaleString() });
-        }
+        if (ovr) { us.ovr[ovr] = (us.ovr[ovr] || 0) + 1; }
+        else { us.unknown = us.unknown || []; us.unknown.push({ value: cardValue, time: new Date().toLocaleString() }); }
       }
     }
 
     if (saleMatch && (userId === OWNER_ID || isWhitelisted(userId))) {
       const saleValue = parseInt(saleMatch[1].replace(/,/g, ''));
       const today = getISTDate();
-
       if (userId === OWNER_ID) {
-        // Owner uses data.owner
-        data.owner = data.owner || { totalSale: 0, totalDrops: 0, days: {} };
-        data.owner.totalSale  = (data.owner.totalSale  || 0) + saleValue;
-        data.owner.totalDrops = (data.owner.totalDrops || 0) + 1;
-        data.owner.days[today] = data.owner.days[today] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
-        data.owner.days[today].totalSale += saleValue;
-        data.owner.days[today].drops     += 1;
-        console.log(`💰 Sale value: ${saleValue} for owner on ${today}`);
+        cgData.owner = cgData.owner || { totalSale: 0, totalDrops: 0, days: {} };
+        cgData.owner.totalSale  = (cgData.owner.totalSale  || 0) + saleValue;
+        cgData.owner.totalDrops = (cgData.owner.totalDrops || 0) + 1;
+        cgData.owner.days[today] = cgData.owner.days[today] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
+        cgData.owner.days[today].totalSale += saleValue;
+        cgData.owner.days[today].drops     += 1;
       } else {
-        // Whitelisted user uses data.userEarnings[userId]
-        data.userEarnings = data.userEarnings || {};
-        data.userEarnings[userId] = data.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
-        const ue = data.userEarnings[userId];
+        cgData.userEarnings = cgData.userEarnings || {};
+        cgData.userEarnings[userId] = cgData.userEarnings[userId] || { totalSale: 0, totalDrops: 0, days: {} };
+        const ue = cgData.userEarnings[userId];
         ue.totalSale  = (ue.totalSale  || 0) + saleValue;
         ue.totalDrops = (ue.totalDrops || 0) + 1;
         ue.days[today] = ue.days[today] || { totalSale: 0, drops: 0, vote: 0, match: 0, misc: 0 };
         ue.days[today].totalSale += saleValue;
         ue.days[today].drops     += 1;
-        console.log(`💰 Sale value: ${saleValue} for whitelisted user ${message.author.tag} on ${today}`);
       }
     }
 
-    if (cardMatch || saleMatch) scheduleSave();
-    console.log(`✅ Claim succeeded for ${message.author.tag}!`);
+    if (cardMatch || saleMatch) scheduleCgSave();
+    console.log(`✅ Claim processed for ${message.author.tag}`);
   } else {
-    console.log(`⚠️ No game bot response. Assuming claim succeeded for ${message.author.tag}.`);
+    console.log(`⚠️ No game bot response for ${message.author.tag}. Assuming claimed.`);
   }
 
-  // ── Reminder logic ──
-  const isDisabled = (data.reminderDisabled && data.reminderDisabled[userId]);
-  if (isDisabled) {
-    console.log(`🔕 Reminders disabled for ${message.author.tag}, skipping.`);
-    return;
-  }
-
+  // Reminder
+  const isDisabled = cgData.reminderDisabled && cgData.reminderDisabled[userId];
+  if (isDisabled) return;
   if (activeReminders.has(userId)) clearTimeout(activeReminders.get(userId));
-  await message.react('⏰').catch(e => console.error('React error:', e.message));
-
-  const userMins  = (data.reminderTime && data.reminderTime[userId]) || 60;
-  const remindMs  = userMins * 60 * 1000;
-  const remindAt  = Date.now() + remindMs;
-  data.reminders[userId] = { remindAt, channelId: message.channel.id };
-  scheduleSave();
-
+  await message.react('⏰').catch(() => {});
+  const userMins = (cgData.reminderTime && cgData.reminderTime[userId]) || 60;
+  const remindMs = userMins * 60 * 1000;
+  const remindAt = Date.now() + remindMs;
+  cgData.reminders[userId] = { remindAt, channelId: message.channel.id };
+  scheduleCgSave();
   const timeout = setTimeout(async () => {
     sendReminder(userId, message.channel.id);
-    delete data.reminders[userId];
-    scheduleSave();
+    delete cgData.reminders[userId];
+    scheduleCgSave();
     activeReminders.delete(userId);
   }, remindMs);
-
   activeReminders.set(userId, timeout);
   console.log(`✅ Reminder set for ${message.author.tag} — ${userMins} min.`);
 });
 
 process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  HTTP KEEPALIVE  (for Render / Railway / UptimeRobot)
+// ══════════════════════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => res.end('Bot is running!')).listen(PORT, () => {
   console.log(`🌐 HTTP server listening on port ${PORT}`);
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(DISCORD_TOKEN);
