@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const http = require('http');
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -771,37 +771,110 @@ client.on('messageCreate', async (message) => {
     }
 
     // !help
-    if (cgCmd === 'help') {
+    if (cgCmd === 'help' || (cgCmd && cgCmd.startsWith('help '))) {
       const isWL = isWhitelisted(userId);
-      let msg = `📖 **Bot — Commands**\n\n`;
-      msg += `**CGDrop Commands** (\`${cgPfx}\` prefix)\n`;
-      msg += `\`${cgPfx}ping\` — Check if bot is alive\n`;
-      msg += `\`${cgPfx}stats\` — Global drop OVR stats\n`;
-      msg += `\`${cgPfx}mystats\` — Your personal drop OVR stats\n`;
-      msg += `\`${cgPfx}resetmystats\` — Reset your personal stats\n`;
-      msg += `\`${cgPfx}unknown\` — View unrecognised card values\n`;
-      msg += `\`${cgPfx}remind on/off\` — Toggle your drop reminder\n\n`;
-      if (isWL) {
-        msg += `**Whitelisted** ✅\n`;
-        msg += `\`${cgPfx}myearnings\` \`${cgPfx}myavg\` \`${cgPfx}addvote\` \`${cgPfx}addmatch\`\n`;
-        msg += `\`${cgPfx}setreminder <mins>\` \`${cgPfx}reminderstatus\`\n\n`;
-      } else {
-        msg += `**Whitelisted only** 🔒 — Contact **frenzy_guy** 👑 to get access\n\n`;
+      const sub  = cgCmd.split(' ')[1] || null; // drop / wl / auction
+
+      // ── Embed builders ──────────────────────────────────────────────────
+      function dropEmbed() {
+        return new EmbedBuilder()
+          .setTitle('🎮 Drop Commands')
+          .setColor(0x5865F2)
+          .setDescription(`Prefix: \`${cgPfx}\``)
+          .addFields(
+            { name: `\`${cgPfx}ping\``,         value: 'Check if bot is alive', inline: true },
+            { name: `\`${cgPfx}stats\``,         value: 'Global drop OVR stats', inline: true },
+            { name: `\`${cgPfx}mystats\``,       value: 'Your personal OVR stats', inline: true },
+            { name: `\`${cgPfx}resetmystats\``,  value: 'Reset your personal stats', inline: true },
+            { name: `\`${cgPfx}unknown\``,       value: 'View unrecognised card values', inline: true },
+            { name: `\`${cgPfx}remind on/off\``, value: 'Toggle your drop reminder', inline: true }
+          )
+          .setFooter({ text: `Use ${cgPfx}help wl for whitelisted cmds • ${cgPfx}help auction for auction cmds` });
       }
-      msg += `**Auction Commands** (\`${aucPfx}\` prefix)\n`;
-      msg += `\`${aucPfx}setpurse @user <amt>\` — Set purse *(Admin/Auctioneer)*\n`;
-      msg += `\`${aucPfx}sell <player> <base>\` — Start auction *(Admin/Auctioneer)*\n`;
-      msg += `\`${aucPfx}bid <amount>\` — Place a bid\n`;
-      msg += `\`${aucPfx}sold\` — End auction *(Admin/Auctioneer)*\n`;
-      msg += `\`${aucPfx}aq <player> <base>\` — Add to queue *(Admin/Auctioneer)*\n`;
-      msg += `\`${aucPfx}sq\` — Start queue *(Admin/Auctioneer)*\n`;
-      msg += `\`${aucPfx}q\` — View queue\n`;
-      msg += `\`${aucPfx}bal [@user]\` — Check balance\n`;
-      msg += `\`${aucPfx}lb\` — Purse leaderboard\n`;
-      msg += `\`${aucPfx}squad [@user]\` — View squad\n\n`;
-      msg += `**Prefix Config** (slash commands)\n`;
-      msg += `\`/setauctionprefix\` \`/setcgprefix\``;
-      await message.reply(msg); return;
+
+      function wlEmbed() {
+        return new EmbedBuilder()
+          .setTitle('🔒 Whitelisted Commands')
+          .setColor(0x57F287)
+          .setDescription(isWL ? `✅ You have access\nPrefix: \`${cgPfx}\`` : '❌ You do not have access\nContact **frenzy_guy** 👑 to get whitelisted.')
+          .addFields(
+            { name: `\`${cgPfx}myearnings\``,           value: 'Your daily earnings breakdown', inline: true },
+            { name: `\`${cgPfx}myavg\``,                value: 'Your all-time daily averages', inline: true },
+            { name: `\`${cgPfx}addvote <amt>\``,        value: 'Log vote coins\n(add `yesterday` for prev day)', inline: true },
+            { name: `\`${cgPfx}addmatch <amt>\``,       value: 'Log match coins\n(add `yesterday` for prev day)', inline: true },
+            { name: `\`${cgPfx}setreminder <mins>\``,   value: 'Set custom reminder time (1–120 min)', inline: true },
+            { name: `\`${cgPfx}reminderstatus\``,       value: 'Check your reminder time & status', inline: true }
+          )
+          .setFooter({ text: `Use ${cgPfx}help drop for drop cmds • ${cgPfx}help auction for auction cmds` });
+      }
+
+      function auctionEmbed() {
+        return new EmbedBuilder()
+          .setTitle('🏏 Auction Commands')
+          .setColor(0xFF0000)
+          .setDescription(`Prefix: \`${aucPfx}\` — Admin/Auctioneer role required for marked commands`)
+          .addFields(
+            { name: `\`${aucPfx}sell <player> <base> [inc]\``,  value: 'Start an auction *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}bid <amount>\``,                 value: 'Place a bid (omit amount to auto-bid)', inline: false },
+            { name: `\`${aucPfx}sold\``,                         value: 'End auction & auto-start next from queue *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}aq <player> <base> [inc]\``,    value: 'Add player to auction queue *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}sq\``,                           value: 'Start auction from queue *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}q\``,                            value: 'View the auction queue', inline: true },
+            { name: `\`${aucPfx}rq <index>\``,                  value: 'Remove player from queue *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}cq\``,                           value: 'Clear entire queue *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}bal [@user]\``,                  value: 'Check purse balance', inline: true },
+            { name: `\`${aucPfx}lb\``,                           value: 'Purse leaderboard', inline: true },
+            { name: `\`${aucPfx}squad [@user]\``,               value: "View someone's bought players", inline: true },
+            { name: `\`${aucPfx}setpurse @user <amt>\``,        value: 'Set a user purse *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}slc #channel\``,                value: 'Set log channel *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}sd <amount>\``,                 value: 'Set default bid increment *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}delete @user <index|all>\``,    value: 'Remove player from squad *(Admin)*', inline: false },
+            { name: '`/sell` `/setauctionprefix` `/setcgprefix`', value: 'Slash commands', inline: false }
+          )
+          .setFooter({ text: `Use ${cgPfx}help drop for drop cmds • ${cgPfx}help wl for whitelisted cmds` });
+      }
+
+      // ── Direct sub-command ───────────────────────────────────────────────
+      if (sub === 'drop')    { await message.reply({ embeds: [dropEmbed()] });    return; }
+      if (sub === 'wl')      { await message.reply({ embeds: [wlEmbed()] });      return; }
+      if (sub === 'auction') { await message.reply({ embeds: [auctionEmbed()] }); return; }
+
+      // ── Main menu with buttons ───────────────────────────────────────────
+      const menuEmbed = new EmbedBuilder()
+        .setTitle('📖 Bot Help')
+        .setColor(0x5865F2)
+        .setDescription('Choose a category below, or use a shortcut:')
+        .addFields(
+          { name: `\`${cgPfx}help drop\``,    value: '🎮 Drop commands', inline: true },
+          { name: `\`${cgPfx}help wl\``,      value: '🔒 Whitelisted commands', inline: true },
+          { name: `\`${cgPfx}help auction\``, value: '🏏 Auction commands', inline: true }
+        );
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('help_drop').setLabel('🎮 Drop').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('help_wl').setLabel('🔒 Whitelisted').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('help_auction').setLabel('🏏 Auction').setStyle(ButtonStyle.Danger)
+      );
+
+      const sent = await message.reply({ embeds: [menuEmbed], components: [row] });
+
+      // Collector — only the person who ran !help can click, expires in 60s
+      const collector = sent.createMessageComponentCollector({
+        filter: i => i.user.id === userId,
+        time: 60_000
+      });
+
+      collector.on('collect', async i => {
+        if (i.customId === 'help_drop')    await i.update({ embeds: [dropEmbed()],    components: [] });
+        if (i.customId === 'help_wl')      await i.update({ embeds: [wlEmbed()],      components: [] });
+        if (i.customId === 'help_auction') await i.update({ embeds: [auctionEmbed()], components: [] });
+      });
+
+      collector.on('end', (_, reason) => {
+        if (reason === 'time') sent.edit({ components: [] }).catch(() => {});
+      });
+
+      return;
     }
   }
 
