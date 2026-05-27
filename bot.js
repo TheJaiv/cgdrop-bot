@@ -5,7 +5,7 @@ const http = require('http');
 //  CONFIG  (all secrets via environment variables)
 // ══════════════════════════════════════════════════════════════════════════════
 const JSONBIN_KEY         = process.env.JSONBIN_KEY;
-const CGDROP_BIN_ID_ENV   = process.env.CGDROP_BIN_ID   || null;
+const CGDROP_BIN_ID_ENV   = process.env.CGDROP_BIN_ID || process.env.JSONBIN_BIN_ID || null;
 const AUCTION_BIN_ID_ENV  = process.env.AUCTION_BIN_ID  || null;
 const OWNER_ID            = process.env.OWNER_ID;
 const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
