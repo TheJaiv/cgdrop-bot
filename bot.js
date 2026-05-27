@@ -437,7 +437,6 @@ async function doSold(message, gd) {
       )
       .setTimestamp();
     await ch.send({ embeds: [nextEmbed] });
-    await sendLog(message.guild, nextEmbed);
   }
 }
 
@@ -543,7 +542,6 @@ client.on('interactionCreate', async interaction => {
       .setFooter({ text: `Started by ${interaction.user.tag}` })
       .setTimestamp();
     await interaction.reply({ embeds: [embed] });
-    await sendLog(interaction.guild, embed);
     return;
   }
 
@@ -936,8 +934,7 @@ client.on('messageCreate', async (message) => {
         .setDescription(`${mentioned} purse set to **${formatAmount(parsed)}**`)
         .setColor(0x00FF00).setTimestamp()
         .setFooter({ text: `Set by ${message.author.tag}` });
-      await message.channel.send({ embeds: [embed] });
-      await sendLog(message.guild, embed); return;
+      await message.channel.send({ embeds: [embed] }); return;
     }
 
     // .setlogchannel / .slc
@@ -979,8 +976,7 @@ client.on('messageCreate', async (message) => {
           { name: 'Min Increment', value: formatAmount(diff),   inline: true },
           { name: 'How to bid',    value: `Use \`${aucPfx}bid <amount>\``, inline: false }
         ).setFooter({ text: `Started by ${message.author.tag}` }).setTimestamp();
-      await message.channel.send({ embeds: [embed] });
-      await sendLog(message.guild, embed); return;
+      await message.channel.send({ embeds: [embed] }); return;
     }
 
     // .bid / .b
@@ -1063,8 +1059,7 @@ client.on('messageCreate', async (message) => {
           { name: 'Min Increment', value: formatAmount(next.difference), inline: true },
           { name: 'How to bid',    value: `Use \`${aucPfx}bid <amount>\``, inline: false }
         ).setFooter({ text: `Started by ${message.author.tag}` }).setTimestamp();
-      await message.channel.send({ embeds: [embed] });
-      await sendLog(message.guild, embed); return;
+      await message.channel.send({ embeds: [embed] }); return;
     }
 
     // .queue / .q
