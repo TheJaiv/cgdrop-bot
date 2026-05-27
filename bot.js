@@ -1,3 +1,4 @@
+const fs   = require('fs');
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const http = require('http');
 
@@ -7,6 +8,7 @@ const http = require('http');
 const JSONBIN_KEY         = process.env.JSONBIN_KEY;
 const CGDROP_BIN_ID_ENV   = process.env.CGDROP_BIN_ID || process.env.JSONBIN_BIN_ID || null;
 const AUCTION_BIN_ID_ENV  = process.env.AUCTION_BIN_ID  || null;
+const AUCTION_LOCAL_FILE  = './auction_data.json';
 const OWNER_ID            = process.env.OWNER_ID;
 const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
 
@@ -88,23 +90,55 @@ async function saveBin(data, binIdRef, setFn, label, binName) {
   }
 }
 
-// Debounced saves (5 s) — collapses rapid writes
-let cgSaveTimer = null, auctionSaveTimer = null;
-
-function scheduleCgSave() {
-  if (cgSaveTimer) clearTimeout(cgSaveTimer);
-  cgSaveTimer = setTimeout(async () => {
-    cgSaveTimer = null;
-    await saveBin(cgData, cgdropBinId, id => { cgdropBinId = id; }, 'cgdrop', 'cgdrop-bot-data');
-  }, 5000);
+// ── Local file helpers ────────────────────────────────────────────────────
+function loadLocalAuction() {
+  try {
+    if (fs.existsSync(AUCTION_LOCAL_FILE)) {
+      const raw = fs.readFileSync(AUCTION_LOCAL_FILE, 'utf8');
+      console.log('✅ Auction data loaded from local file');
+      return JSON.parse(raw);
+    }
+  } catch (e) { console.error('Error reading local auction file:', e.message); }
+  return null;
 }
 
+function saveLocalAuction() {
+  try {
+    fs.writeFileSync(AUCTION_LOCAL_FILE, JSON.stringify(auctionData), 'utf8');
+  } catch (e) { console.error('Error writing local auction file:', e.message); }
+}
+
+// ── Dirty flags — mark data as changed, actual upload happens on interval ──
+let cgDirty = false, auctionDirty = false;
+
+function scheduleCgSave()      { cgDirty = true; }
 function scheduleAuctionSave() {
-  if (auctionSaveTimer) clearTimeout(auctionSaveTimer);
-  auctionSaveTimer = setTimeout(async () => {
-    auctionSaveTimer = null;
-    await saveBin(auctionData, auctionBinId, id => { auctionBinId = id; }, 'auction', 'auction-bot-data');
-  }, 5000);
+  saveLocalAuction();   // instant local write
+  auctionDirty = true;  // mark for next 30-min JSONBin sync
+}
+
+// ── Flush: only uploads if dirty, resets flag after ────────────────────────
+async function flushCg() {
+  if (!cgDirty) return;
+  cgDirty = false;
+  await saveBin(cgData, cgdropBinId, id => { cgdropBinId = id; }, 'cgdrop', 'cgdrop-bot-data');
+}
+
+async function flushAuction() {
+  if (!auctionDirty) return;
+  auctionDirty = false;
+  saveLocalAuction(); // ensure local is up to date
+  await saveBin(auctionData, auctionBinId, id => { auctionBinId = id; }, 'auction', 'auction-bot-data');
+}
+
+// ── Periodic upload every 30 minutes ───────────────────────────────────────
+const FLUSH_INTERVAL_MS = 30 * 60 * 1000;
+function startFlushInterval() {
+  setInterval(async () => {
+    await flushCg();
+    await flushAuction();
+  }, FLUSH_INTERVAL_MS);
+  console.log('⏱️  Auto-flush every 30 min started');
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -430,12 +464,23 @@ client.once('ready', async () => {
     const loaded = await loadBin(cgdropBinId, 'cgdrop');
     if (loaded) cgData = { ...cgData, ...loaded };
   }
-  if (auctionBinId) {
+
+  // Auction: prefer local file, only pull JSONBin as fallback on first boot
+  const localAuction = loadLocalAuction();
+  if (localAuction) {
+    auctionData = { ...auctionData, ...localAuction };
+    console.log('📂 Auction loaded from local file (no JSONBin pull needed)');
+  } else if (auctionBinId) {
     const loaded = await loadBin(auctionBinId, 'auction');
-    if (loaded) auctionData = { ...auctionData, ...loaded };
+    if (loaded) {
+      auctionData = { ...auctionData, ...loaded };
+      saveLocalAuction(); // seed local file from JSONBin
+      console.log('☁️  Auction seeded from JSONBin → saved locally');
+    }
   }
 
   await restoreReminders();
+  startFlushInterval();
 
   // Register slash commands
   const commands = [
@@ -970,7 +1015,8 @@ client.on('messageCreate', async (message) => {
           { name: 'Bid',    value: formatAmount(bidAmt),    inline: true },
           { name: 'Bidder', value: `<@${userId}>`,          inline: true }
         ).setTimestamp();
-      await message.channel.send({ embeds: [embed] }); return;
+      await message.channel.send({ embeds: [embed] });
+      return;
     }
 
     // .sold
