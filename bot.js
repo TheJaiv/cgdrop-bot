@@ -828,6 +828,8 @@ client.on('messageCreate', async (message) => {
             { name: `\`${aucPfx}setpurse @user <amt>\``,        value: 'Set a user purse *(Admin/Auctioneer)*', inline: true },
             { name: `\`${aucPfx}slc #channel\``,                value: 'Set log channel *(Admin/Auctioneer)*', inline: true },
             { name: `\`${aucPfx}sd <amount>\``,                 value: 'Set default bid increment *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}addsquad @user <player> [price]\``, value: 'Manually add player to squad *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}setauctioneer @user\``,         value: 'Grant/revoke Auctioneer role *(Admin)*', inline: false },
             { name: `\`${aucPfx}delete @user <index|all>\``,    value: 'Remove player from squad *(Admin)*', inline: false },
             { name: '`/sell` `/setauctionprefix` `/setcgprefix`', value: 'Slash commands', inline: false }
           )
@@ -1131,6 +1133,88 @@ client.on('messageCreate', async (message) => {
       const removed = squad.splice(idx, 1)[0];
       gd.squads[target.id] = squad; scheduleAuctionSave();
       await message.reply(`🗑️ Removed **${removed.player}** from **${target.displayName}**'s squad.`); return;
+    }
+
+    // .setauctioneer / .sa  — grant/revoke Auctioneer role
+    if (cmd === 'setauctioneer' || cmd === 'sa') {
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        await message.reply('❌ Admin only.'); return;
+      }
+      const target = message.mentions.members.first();
+      if (!target) { await message.reply(`❌ Usage: \`${aucPfx}setauctioneer @user\``); return; }
+
+      // Find or create the Auctioneer role
+      let role = message.guild.roles.cache.find(r => r.name === 'Auctioneer');
+      if (!role) {
+        try {
+          role = await message.guild.roles.create({
+            name: 'Auctioneer',
+            color: 0xFF8800,
+            reason: 'Created by auction bot'
+          });
+        } catch (e) {
+          await message.reply('❌ Failed to create Auctioneer role. Make sure the bot has **Manage Roles** permission.');
+          return;
+        }
+      }
+
+      // Toggle — if they already have it, remove it
+      if (target.roles.cache.has(role.id)) {
+        await target.roles.remove(role);
+        const embed = new EmbedBuilder()
+          .setTitle('🔨 Auctioneer Removed')
+          .setDescription(`${target} no longer has the **Auctioneer** role.`)
+          .setColor(0xFF4444)
+          .setFooter({ text: `Done by ${message.author.tag}` })
+          .setTimestamp();
+        await message.channel.send({ embeds: [embed] });
+      } else {
+        await target.roles.add(role);
+        const embed = new EmbedBuilder()
+          .setTitle('✅ Auctioneer Granted')
+          .setDescription(`${target} has been given the **Auctioneer** role and can now run auction commands.`)
+          .setColor(0xFF8800)
+          .setFooter({ text: `Done by ${message.author.tag}` })
+          .setTimestamp();
+        await message.channel.send({ embeds: [embed] });
+      }
+      return;
+    }
+
+    // .addsquad / .as
+    if (cmd === 'addsquad' || cmd === 'as') {
+      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      const target = message.mentions.members.first();
+      const afterMention = aucRaw.replace(/^(addsquad|as)\s+/, '').replace(/<@!?\d+>\s*/, '').trim();
+      const words = afterMention.split(/\s+/).filter(Boolean);
+      if (!target || words.length === 0) {
+        await message.reply(`❌ Usage: \`${aucPfx}addsquad @user <player> [price]\``); return;
+      }
+      const lastWord = words[words.length - 1];
+      const priceRaw = parseAmount(lastWord);
+      let playerName, price;
+      if (priceRaw && words.length > 1) {
+        playerName = words.slice(0, -1).join(' ');
+        price = priceRaw;
+      } else {
+        playerName = words.join(' ');
+        price = 0;
+      }
+      if (!gd.squads) gd.squads = {};
+      if (!gd.squads[target.id]) gd.squads[target.id] = [];
+      gd.squads[target.id].push({ player: playerName, price });
+      scheduleAuctionSave();
+      const embed = new EmbedBuilder()
+        .setTitle('✅ Player Added to Squad')
+        .setColor(0x57F287)
+        .addFields(
+          { name: 'Player', value: `**${playerName}**`,              inline: true },
+          { name: 'Price',  value: price ? formatAmount(price) : 'N/A', inline: true },
+          { name: 'Owner',  value: `${target}`,                      inline: true }
+        )
+        .setFooter({ text: `Added by ${message.author.tag}` })
+        .setTimestamp();
+      await message.channel.send({ embeds: [embed] }); return;
     }
   }
 
