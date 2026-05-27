@@ -1214,6 +1214,19 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // .sync — manual force-push to JSONBin (Admin only)
+    if (cmd === 'sync') {
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        await message.reply('❌ Admin only.'); return;
+      }
+      await message.reply('🔄 Syncing data to JSONBin...');
+      cgDirty = true;
+      auctionDirty = true;
+      await flushCg();
+      await flushAuction();
+      await message.reply('✅ All data synced to JSONBin!'); return;
+    }
+
     // .addsquad / .as
     if (cmd === 'addsquad' || cmd === 'as') {
       if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
@@ -1366,6 +1379,17 @@ client.on('messageCreate', async (message) => {
 });
 
 process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
+
+// ── Graceful shutdown — flush everything before going offline ──────────────
+async function shutdownFlush() {
+  console.log('⚠️  Shutdown detected — flushing data to JSONBin...');
+  await flushCg();
+  await flushAuction();
+  console.log('✅ Flush complete. Exiting.');
+  process.exit(0);
+}
+process.on('SIGTERM', shutdownFlush);
+process.on('SIGINT',  shutdownFlush);
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  HTTP KEEPALIVE  (for Render / Railway / UptimeRobot)
