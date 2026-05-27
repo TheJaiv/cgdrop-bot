@@ -136,30 +136,15 @@ function getGuildData(guildId) {
 // ══════════════════════════════════════════════════════════════════════════════
 function parseAmount(value) {
   if (!value) return null;
-  const s = String(value).trim().toLowerCase();
-  try {
-    if (s.endsWith('b')) return Math.round(parseFloat(s) * 1_000_000_000);
-    if (s.endsWith('m')) return Math.round(parseFloat(s) * 1_000_000);
-    if (s.endsWith('k')) return Math.round(parseFloat(s) * 1_000);
-    const n = parseInt(s.replace(/,/g, ''));
-    return isNaN(n) ? null : n;
-  } catch { return null; }
+  const s = String(value).trim().replace(/,/g, '');
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n;
 }
 
 function formatAmount(amount) {
-  if (amount >= 1_000_000_000) {
-    const v = amount / 1_000_000_000;
-    return (v % 1 === 0 ? v : v.toFixed(2).replace(/\.?0+$/, '')) + 'B';
-  }
-  if (amount >= 1_000_000) {
-    const v = amount / 1_000_000;
-    return (v % 1 === 0 ? v : v.toFixed(2).replace(/\.?0+$/, '')) + 'M';
-  }
-  if (amount >= 1_000) {
-    const v = amount / 1_000;
-    return (v % 1 === 0 ? v : v.toFixed(1).replace(/\.?0+$/, '')) + 'K';
-  }
-  return String(amount);
+  if (amount === null || amount === undefined) return '0';
+  // Show up to 2 decimal places, strip trailing zeros
+  return parseFloat(amount.toFixed(2)).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 }
 
 function fmt(n) { return Number(n || 0).toLocaleString(); }
@@ -957,6 +942,13 @@ client.on('messageCreate', async (message) => {
     if (cmd === 'bid' || cmd === 'b') {
       const auction = gd.auction;
       if (!auction) { await message.reply('❌ No auction running.'); return; }
+
+      // Block self-overbid — can't bid if you're already the highest bidder
+      if (auction.highest_bidder_id === userId) {
+        await message.reply(`❌ You already have the highest bid of **${formatAmount(auction.current_bid)}**! Wait for someone else to bid first.`);
+        return;
+      }
+
       const userPurse = gd.purses[userId] || 0;
       let bidAmt;
       if (!parts[1]) {
@@ -968,8 +960,8 @@ client.on('messageCreate', async (message) => {
       const minBid = auction.highest_bidder_id ? auction.current_bid + auction.difference : auction.base;
       if (bidAmt < minBid) { await message.reply(`❌ Minimum bid is **${formatAmount(minBid)}**.`); return; }
       if (userPurse < bidAmt) { await message.reply(`❌ Insufficient funds! Your balance: **${formatAmount(userPurse)}**`); return; }
-      auction.current_bid      = bidAmt;
-      auction.highest_bidder   = message.member.displayName;
+      auction.current_bid       = bidAmt;
+      auction.highest_bidder    = message.member.displayName;
       auction.highest_bidder_id = userId;
       scheduleAuctionSave();
       const embed = new EmbedBuilder().setTitle('💸 New Bid Placed!').setColor(0x00CC00)
