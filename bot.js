@@ -16,6 +16,14 @@ const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
 const DEFAULT_CGDROP_PREFIX  = '!';
 const DEFAULT_AUCTION_PREFIX = '.';
 
+// ── Server approval checks ─────────────────────────────────────────────────
+function isAuctionApproved(guildId) {
+  return !!(auctionData.approvedGuilds && auctionData.approvedGuilds[String(guildId)]);
+}
+function isCgApproved(guildId) {
+  return !!(cgData.approvedGuilds && cgData.approvedGuilds[String(guildId)]);
+}
+
 // cgdrop timing
 const BOT_WAIT_MS    = 5000;
 
@@ -595,16 +603,23 @@ client.on('messageCreate', async (message) => {
 
   if (usesCg) {
 
+    // Always allow !help regardless of approval
+    const cgOwnerCmds = ['approveauction','approvecg','unapproveauction','unapprovecg','listapprovals'];
+    if (cgCmd !== 'help' && cgCmd !== 'ping' && !cgOwnerCmds.includes(cgCmd) && !isCgApproved(guildId)) {
+      await message.channel.send('⛔ This server is not approved for cgdrop commands.\nContact **frenzy_guy** to get access.');
+      return;
+    }
+
     // !ping
     if (cgCmd === 'ping') {
-      await message.reply('✅ Bot is alive and watching for cgdrop!');
+      await message.channel.send('✅ Bot is alive and watching for cgdrop!');
       return;
     }
 
     // !stats
     if (cgCmd === 'stats') {
-      if (cgData.stats.total === 0) { await message.reply('📊 No drops registered yet!'); return; }
-      await message.reply(buildStatsMsg(cgData.stats, 'Drop Stats'));
+      if (cgData.stats.total === 0) { await message.channel.send('📊 No drops registered yet!'); return; }
+      await message.channel.send(buildStatsMsg(cgData.stats, 'Drop Stats'));
       return;
     }
 
@@ -612,39 +627,39 @@ client.on('messageCreate', async (message) => {
     if (cgCmd === 'mystats') {
       const us = cgData.userStats && cgData.userStats[userId];
       if (!us || us.total === 0) {
-        await message.reply(`📊 No personal drop stats recorded for you yet${cgData.recordingEnabled === false ? ' (recording is currently off)' : ''}!`);
+        await message.channel.send(`📊 No personal drop stats recorded for you yet${cgData.recordingEnabled === false ? ' (recording is currently off)' : ''}!`);
         return;
       }
-      await message.reply(buildStatsMsg(us, `${message.author.username}'s Stats`));
+      await message.channel.send(buildStatsMsg(us, `${message.author.username}'s Stats`));
       return;
     }
 
     // !recording on/off
     if (cgCmd === 'recording on') {
-      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Owner only!'); return; }
       cgData.recordingEnabled = true; scheduleCgSave();
-      await message.reply('✅ **Recording ON**'); return;
+      await message.channel.send('✅ **Recording ON**'); return;
     }
     if (cgCmd === 'recording off') {
-      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Owner only!'); return; }
       cgData.recordingEnabled = false; scheduleCgSave();
-      await message.reply('🔕 **Recording OFF**'); return;
+      await message.channel.send('🔕 **Recording OFF**'); return;
     }
 
     // !unknown
     if (cgCmd === 'unknown') {
       const unknowns = cgData.stats.unknown || [];
-      if (unknowns.length === 0) { await message.reply('✅ No unknown card values logged!'); return; }
+      if (unknowns.length === 0) { await message.channel.send('✅ No unknown card values logged!'); return; }
       const list = unknowns.slice(-20).map(u => `• Value: **${u.value}** by ${u.user} at ${u.time}`).join('\n');
-      await message.reply(`⚠️ **Unknown card values (last 20):**\n${list}`);
+      await message.channel.send(`⚠️ **Unknown card values (last 20):**\n${list}`);
       return;
     }
 
     // !resetstats
     if (cgCmd === 'resetstats') {
-      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Owner only!'); return; }
       cgData.stats = { total: 0, ovr: {}, unknown: [] }; scheduleCgSave();
-      await message.reply('🗑️ Global stats reset!'); return;
+      await message.channel.send('🗑️ Global stats reset!'); return;
     }
 
     // !resetmystats
@@ -652,16 +667,16 @@ client.on('messageCreate', async (message) => {
       if (cgData.userStats && cgData.userStats[userId])
         cgData.userStats[userId] = { total: 0, ovr: {}, unknown: [] };
       scheduleCgSave();
-      await message.reply('🗑️ Your personal stats have been reset!'); return;
+      await message.channel.send('🗑️ Your personal stats have been reset!'); return;
     }
 
     // !myavg
     if (cgCmd === 'myavg') {
-      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have access to this command!'); return; }
+      if (!isWhitelisted(userId)) { await message.channel.send('❌ You do not have access to this command!'); return; }
       const isOwner      = userId === OWNER_ID;
       const earningsData = isOwner ? cgData.owner : (cgData.userEarnings && cgData.userEarnings[userId]);
       if (!earningsData || !earningsData.days || Object.keys(earningsData.days).length === 0) {
-        await message.reply('📊 No earnings data yet!'); return;
+        await message.channel.send('📊 No earnings data yet!'); return;
       }
       const allDays   = Object.entries(earningsData.days);
       const totalDays = allDays.length;
@@ -677,47 +692,47 @@ client.on('messageCreate', async (message) => {
       msg += divider + '\n';
       msg += pad('Avg/day',C.label) + pad(fmt(avgDrop),C.drop) + pad(fmt(avgVote),C.vote) + pad(fmt(avgMatch),C.match) + fmt(avgAll) + '\n';
       msg += '```';
-      await message.reply(msg); return;
+      await message.channel.send(msg); return;
     }
 
     // !adduser
     if (cgCmd && cgCmd.startsWith('adduser')) {
-      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Owner only!'); return; }
       const mentioned = message.mentions.users.first();
-      if (!mentioned) { await message.reply('❌ Usage: `!adduser @user`'); return; }
-      if (mentioned.id === OWNER_ID) { await message.reply('❌ You are already the owner!'); return; }
+      if (!mentioned) { await message.channel.send('❌ Usage: `!adduser @user`'); return; }
+      if (mentioned.id === OWNER_ID) { await message.channel.send('❌ You are already the owner!'); return; }
       cgData.whitelist = cgData.whitelist || {};
       cgData.whitelist[mentioned.id] = mentioned.tag;
       scheduleCgSave();
-      await message.reply(`✅ **${mentioned.tag}** granted access to \`!myearnings\` and \`!myavg\`!`); return;
+      await message.channel.send(`✅ **${mentioned.tag}** granted access to \`!myearnings\` and \`!myavg\`!`); return;
     }
 
     // !removeuser
     if (cgCmd && cgCmd.startsWith('removeuser')) {
-      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Owner only!'); return; }
       const mentioned = message.mentions.users.first();
-      if (!mentioned) { await message.reply('❌ Usage: `!removeuser @user`'); return; }
+      if (!mentioned) { await message.channel.send('❌ Usage: `!removeuser @user`'); return; }
       if (!cgData.whitelist || !cgData.whitelist[mentioned.id]) {
-        await message.reply(`❌ **${mentioned.tag}** is not in the whitelist.`); return;
+        await message.channel.send(`❌ **${mentioned.tag}** is not in the whitelist.`); return;
       }
       delete cgData.whitelist[mentioned.id]; scheduleCgSave();
-      await message.reply(`✅ **${mentioned.tag}** removed from whitelist.`); return;
+      await message.channel.send(`✅ **${mentioned.tag}** removed from whitelist.`); return;
     }
 
     // !listusers
     if (cgCmd === 'listusers') {
-      if (userId !== OWNER_ID) { await message.reply('❌ Owner only!'); return; }
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Owner only!'); return; }
       const entries = Object.values(cgData.whitelist || {});
-      if (entries.length === 0) { await message.reply('📋 Whitelist is empty.'); return; }
-      await message.reply(`📋 **Whitelisted users:**\n${entries.map(t => `• ${t}`).join('\n')}`); return;
+      if (entries.length === 0) { await message.channel.send('📋 Whitelist is empty.'); return; }
+      await message.channel.send(`📋 **Whitelisted users:**\n${entries.map(t => `• ${t}`).join('\n')}`); return;
     }
 
     // !addvote
     if (cgCmd && cgCmd.startsWith('addvote')) {
-      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      if (!isWhitelisted(userId)) { await message.channel.send('❌ You do not have permission!'); return; }
       const parts  = content.slice(cgPfx.length).trim().split(' ');
       const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
-      if (isNaN(amount)) { await message.reply('❌ Usage: `!addvote 4500` or `!addvote 4500 yesterday`'); return; }
+      if (isNaN(amount)) { await message.channel.send('❌ Usage: `!addvote 4500` or `!addvote 4500 yesterday`'); return; }
       const offset = parts[2] === 'yesterday' ? -1 : 0;
       const date   = getISTDate(offset);
       if (userId === OWNER_ID) {
@@ -731,15 +746,15 @@ client.on('messageCreate', async (message) => {
         cgData.userEarnings[userId].days[date].vote = (cgData.userEarnings[userId].days[date].vote || 0) + amount;
       }
       scheduleCgSave();
-      await message.reply(`✅ Added **${fmt(amount)} coins** from Vote to **${date}**!`); return;
+      await message.channel.send(`✅ Added **${fmt(amount)} coins** from Vote to **${date}**!`); return;
     }
 
     // !addmatch
     if (cgCmd && cgCmd.startsWith('addmatch')) {
-      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      if (!isWhitelisted(userId)) { await message.channel.send('❌ You do not have permission!'); return; }
       const parts  = content.slice(cgPfx.length).trim().split(' ');
       const amount = parseInt((parts[1] || '').replace(/,/g, '').replace(/−/g, '-'));
-      if (isNaN(amount)) { await message.reply('❌ Usage: `!addmatch 4500` or `!addmatch 4500 yesterday`'); return; }
+      if (isNaN(amount)) { await message.channel.send('❌ Usage: `!addmatch 4500` or `!addmatch 4500 yesterday`'); return; }
       const offset = parts[2] === 'yesterday' ? -1 : 0;
       const date   = getISTDate(offset);
       if (userId === OWNER_ID) {
@@ -753,49 +768,49 @@ client.on('messageCreate', async (message) => {
         cgData.userEarnings[userId].days[date].match = (cgData.userEarnings[userId].days[date].match || 0) + amount;
       }
       scheduleCgSave();
-      await message.reply(`✅ Added **${fmt(amount)} coins** from Match to **${date}**!`); return;
+      await message.channel.send(`✅ Added **${fmt(amount)} coins** from Match to **${date}**!`); return;
     }
 
     // !myearnings
     if (cgCmd === 'myearnings') {
-      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have access!'); return; }
+      if (!isWhitelisted(userId)) { await message.channel.send('❌ You do not have access!'); return; }
       const isOwner      = userId === OWNER_ID;
       const earningsData = isOwner ? cgData.owner : (cgData.userEarnings && cgData.userEarnings[userId]);
       const msg = buildEarningsMsg(earningsData, isOwner ? 'Your' : message.author.username);
-      if (!msg) { await message.reply('📊 No earnings data yet!'); return; }
-      await message.reply(msg); return;
+      if (!msg) { await message.channel.send('📊 No earnings data yet!'); return; }
+      await message.channel.send(msg); return;
     }
 
     // !remind off/on
     if (cgCmd === 'remind off') {
       cgData.reminderDisabled = cgData.reminderDisabled || {};
       cgData.reminderDisabled[userId] = true; scheduleCgSave();
-      await message.reply('🔕 Reminders disabled! Type `!remind on` to enable.'); return;
+      await message.channel.send('🔕 Reminders disabled! Type `!remind on` to enable.'); return;
     }
     if (cgCmd === 'remind on') {
       cgData.reminderDisabled = cgData.reminderDisabled || {};
       delete cgData.reminderDisabled[userId]; scheduleCgSave();
-      await message.reply('🔔 Reminders enabled!'); return;
+      await message.channel.send('🔔 Reminders enabled!'); return;
     }
 
     // !setreminder
     if (cgCmd && cgCmd.startsWith('setreminder')) {
-      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      if (!isWhitelisted(userId)) { await message.channel.send('❌ You do not have permission!'); return; }
       const mins = parseInt(cgCmd.split(' ')[1]);
       if (isNaN(mins) || mins < 1 || mins > 120) {
-        await message.reply('❌ Usage: `!setreminder 40` (1–120 minutes)'); return;
+        await message.channel.send('❌ Usage: `!setreminder 40` (1–120 minutes)'); return;
       }
       cgData.reminderTime = cgData.reminderTime || {};
       cgData.reminderTime[userId] = mins; scheduleCgSave();
-      await message.reply(`✅ Drop reminder set to **${mins} minutes**!`); return;
+      await message.channel.send(`✅ Drop reminder set to **${mins} minutes**!`); return;
     }
 
     // !reminderstatus
     if (cgCmd === 'reminderstatus') {
-      if (!isWhitelisted(userId)) { await message.reply('❌ You do not have permission!'); return; }
+      if (!isWhitelisted(userId)) { await message.channel.send('❌ You do not have permission!'); return; }
       const mins   = (cgData.reminderTime && cgData.reminderTime[userId]) || 60;
       const status = (cgData.reminderDisabled && cgData.reminderDisabled[userId]) ? '🔕 Disabled' : '🔔 Enabled';
-      await message.reply(`⏰ Your reminder is **${status}** and set to **${mins} minutes**.`); return;
+      await message.channel.send(`⏰ Your reminder is **${status}** and set to **${mins} minutes**.`); return;
     }
 
     // !help
@@ -865,9 +880,9 @@ client.on('messageCreate', async (message) => {
       }
 
       // ── Direct sub-command ───────────────────────────────────────────────
-      if (sub === 'drop')    { await message.reply({ embeds: [dropEmbed()] });    return; }
-      if (sub === 'wl')      { await message.reply({ embeds: [wlEmbed()] });      return; }
-      if (sub === 'auction') { await message.reply({ embeds: [auctionEmbed()] }); return; }
+      if (sub === 'drop')    { await message.channel.send({ embeds: [dropEmbed()] });    return; }
+      if (sub === 'wl')      { await message.channel.send({ embeds: [wlEmbed()] });      return; }
+      if (sub === 'auction') { await message.channel.send({ embeds: [auctionEmbed()] }); return; }
 
       // ── Main menu with buttons ───────────────────────────────────────────
       const menuEmbed = new EmbedBuilder()
@@ -886,7 +901,7 @@ client.on('messageCreate', async (message) => {
         new ButtonBuilder().setCustomId('help_auction').setLabel('🏏 Auction').setStyle(ButtonStyle.Danger)
       );
 
-      const sent = await message.reply({ embeds: [menuEmbed], components: [row] });
+      const sent = await message.channel.send({ embeds: [menuEmbed], components: [row] });
 
       // Collector — only the person who ran !help can click, expires in 60s
       const collector = sent.createMessageComponentCollector({
@@ -917,16 +932,23 @@ client.on('messageCreate', async (message) => {
     const parts = aucRaw.split(/\s+/);
     const cmd   = parts[0].toLowerCase();
 
+    // Allow approve/unapprove/listapprovals even on unapproved servers (owner only)
+    const ownerOnlyCmds = ['approveauction','approvecg','unapproveauction','unapprovecg','listapprovals','sync'];
+    if (!ownerOnlyCmds.includes(cmd) && !isAuctionApproved(guildId)) {
+      await message.channel.send('⛔ This server is not approved for auction commands.\nContact **frenzy_guy** to get access.');
+      return;
+    }
+
     // .setpurse / .sp
     if (cmd === 'setpurse' || cmd === 'sp') {
       if (!hasAuctionPermission(message.member)) {
-        await message.reply('❌ You need **Administrator** or **Auctioneer** role.'); return;
+        await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return;
       }
       const mentioned = message.mentions.members.first();
       const amtRaw    = parts[2];
-      if (!mentioned || !amtRaw) { await message.reply(`❌ Usage: \`${aucPfx}setpurse @user <amount>\``); return; }
+      if (!mentioned || !amtRaw) { await message.channel.send(`❌ Usage: \`${aucPfx}setpurse @user <amount>\``); return; }
       const parsed = parseAmount(amtRaw);
-      if (!parsed) { await message.reply('❌ Invalid amount.'); return; }
+      if (!parsed) { await message.channel.send('❌ Invalid amount.'); return; }
       gd.purses[mentioned.id] = parsed;
       scheduleAuctionSave();
       const embed = new EmbedBuilder()
@@ -939,9 +961,9 @@ client.on('messageCreate', async (message) => {
 
     // .setlogchannel / .slc
     if (cmd === 'setlogchannel' || cmd === 'slc') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const ch = message.mentions.channels.first();
-      if (!ch) { await message.reply(`❌ Usage: \`${aucPfx}setlogchannel #channel\``); return; }
+      if (!ch) { await message.channel.send(`❌ Usage: \`${aucPfx}setlogchannel #channel\``); return; }
       gd.logChannel = ch.id; scheduleAuctionSave();
       const embed = new EmbedBuilder().setTitle('📋 Log Channel Set').setDescription(`Logs → ${ch}`).setColor(0x0099FF);
       await message.channel.send({ embeds: [embed] }); return;
@@ -949,9 +971,9 @@ client.on('messageCreate', async (message) => {
 
     // .setdifference / .sd
     if (cmd === 'setdifference' || cmd === 'sd') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const parsed = parseAmount(parts[1]);
-      if (!parsed) { await message.reply('❌ Invalid amount.'); return; }
+      if (!parsed) { await message.channel.send('❌ Invalid amount.'); return; }
       gd.difference = parsed; scheduleAuctionSave();
       const embed = new EmbedBuilder().setTitle('⚙️ Bid Increment Set')
         .setDescription(`Min increment: **${formatAmount(parsed)}**`).setColor(0xFF8800);
@@ -960,11 +982,11 @@ client.on('messageCreate', async (message) => {
 
     // .sell
     if (cmd === 'sell') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
-      if (gd.auction) { await message.reply('❌ Auction already running! Use `.sold` first.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
+      if (gd.auction) { await message.channel.send('❌ Auction already running! Use `.sold` first.'); return; }
       const playerName = parts[1];
       const base       = parseAmount(parts[2]);
-      if (!playerName || !base) { await message.reply(`❌ Usage: \`${aucPfx}sell <player> <base> [increment]\``); return; }
+      if (!playerName || !base) { await message.channel.send(`❌ Usage: \`${aucPfx}sell <player> <base> [increment]\``); return; }
       const diff = parts[3] ? parseAmount(parts[3]) : (gd.difference || 500000);
       gd.auction = { player: playerName, base, current_bid: base, difference: diff,
         highest_bidder: null, highest_bidder_id: null, channel_id: String(message.channel.id) };
@@ -982,11 +1004,11 @@ client.on('messageCreate', async (message) => {
     // .bid / .b
     if (cmd === 'bid' || cmd === 'b') {
       const auction = gd.auction;
-      if (!auction) { await message.reply('❌ No auction running.'); return; }
+      if (!auction) { await message.channel.send('❌ No auction running.'); return; }
 
       // Block self-overbid — can't bid if you're already the highest bidder
       if (auction.highest_bidder_id === userId) {
-        await message.reply(`❌ You already have the highest bid of **${formatAmount(auction.current_bid)}**! Wait for someone else to bid first.`);
+        await message.channel.send(`❌ You already have the highest bid of **${formatAmount(auction.current_bid)}**! Wait for someone else to bid first.`);
         return;
       }
 
@@ -996,11 +1018,11 @@ client.on('messageCreate', async (message) => {
         bidAmt = auction.current_bid + auction.difference;
       } else {
         bidAmt = parseAmount(parts[1]);
-        if (!bidAmt) { await message.reply('❌ Invalid bid amount.'); return; }
+        if (!bidAmt) { await message.channel.send('❌ Invalid bid amount.'); return; }
       }
       const minBid = auction.highest_bidder_id ? auction.current_bid + auction.difference : auction.base;
-      if (bidAmt < minBid) { await message.reply(`❌ Minimum bid is **${formatAmount(minBid)}**.`); return; }
-      if (userPurse < bidAmt) { await message.reply(`❌ Insufficient funds! Your balance: **${formatAmount(userPurse)}**`); return; }
+      if (bidAmt < minBid) { await message.channel.send(`❌ Minimum bid is **${formatAmount(minBid)}**.`); return; }
+      if (userPurse < bidAmt) { await message.channel.send(`❌ Insufficient funds! Your balance: **${formatAmount(userPurse)}**`); return; }
       auction.current_bid       = bidAmt;
       auction.highest_bidder    = message.member.displayName;
       auction.highest_bidder_id = userId;
@@ -1017,16 +1039,16 @@ client.on('messageCreate', async (message) => {
 
     // .sold
     if (cmd === 'sold') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       await doSold(message, gd); return;
     }
 
     // .addqueue / .aq
     if (cmd === 'addqueue' || cmd === 'aq') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const playerName = parts[1];
       const base       = parseAmount(parts[2]);
-      if (!playerName || !base) { await message.reply(`❌ Usage: \`${aucPfx}aq <player> <base> [increment]\``); return; }
+      if (!playerName || !base) { await message.channel.send(`❌ Usage: \`${aucPfx}aq <player> <base> [increment]\``); return; }
       const diff = parts[3] ? parseAmount(parts[3]) : (gd.difference || 500000);
       if (!Array.isArray(gd.queue)) gd.queue = [];
       gd.queue.push({ player: playerName, base, difference: diff });
@@ -1044,9 +1066,9 @@ client.on('messageCreate', async (message) => {
 
     // .startqueue / .sq
     if (cmd === 'startqueue' || cmd === 'sq') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
-      if (gd.auction) { await message.reply(`❌ Auction already running! Use \`${aucPfx}sold\` first.`); return; }
-      if (!gd.queue || gd.queue.length === 0) { await message.reply(`❌ Queue is empty. Add players with \`${aucPfx}aq\` first.`); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
+      if (gd.auction) { await message.channel.send(`❌ Auction already running! Use \`${aucPfx}sold\` first.`); return; }
+      if (!gd.queue || gd.queue.length === 0) { await message.channel.send(`❌ Queue is empty. Add players with \`${aucPfx}aq\` first.`); return; }
       const next = gd.queue.shift();
       gd.auction = { player: next.player, base: next.base, current_bid: next.base, difference: next.difference,
         highest_bidder: null, highest_bidder_id: null, channel_id: String(message.channel.id) };
@@ -1082,22 +1104,22 @@ client.on('messageCreate', async (message) => {
 
     // .removequeue / .rq
     if (cmd === 'removequeue' || cmd === 'rq') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const idx = parseInt(parts[1]) - 1;
       if (isNaN(idx) || idx < 0 || idx >= (gd.queue || []).length) {
-        await message.reply(`❌ Invalid index. Queue has ${(gd.queue || []).length} player(s).`); return;
+        await message.channel.send(`❌ Invalid index. Queue has ${(gd.queue || []).length} player(s).`); return;
       }
       const removed = gd.queue.splice(idx, 1)[0];
       scheduleAuctionSave();
-      await message.reply(`🗑️ Removed **${removed.player}** from the queue.`); return;
+      await message.channel.send(`🗑️ Removed **${removed.player}** from the queue.`); return;
     }
 
     // .clearqueue / .cq
     if (cmd === 'clearqueue' || cmd === 'cq') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const count = (gd.queue || []).length;
       gd.queue = []; scheduleAuctionSave();
-      await message.reply(`🗑️ Cleared **${count}** player(s) from the queue.`); return;
+      await message.channel.send(`🗑️ Cleared **${count}** player(s) from the queue.`); return;
     }
 
     // .bal / .b / .wallet
@@ -1147,34 +1169,34 @@ client.on('messageCreate', async (message) => {
     // .delete
     if (cmd === 'delete') {
       if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        await message.reply('❌ Admin only.'); return;
+        await message.channel.send('❌ Admin only.'); return;
       }
       const target = message.mentions.members.first();
-      if (!target) { await message.reply(`❌ Usage: \`${aucPfx}delete @user <index|all>\``); return; }
+      if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}delete @user <index|all>\``); return; }
       const indexArg = parts[2];
-      if (!indexArg) { await message.reply('❌ Provide index or `all`.'); return; }
+      if (!indexArg) { await message.channel.send('❌ Provide index or `all`.'); return; }
       if (!gd.squads) gd.squads = {};
       if (['all','everyone','max'].includes(indexArg.toLowerCase())) {
         gd.squads[target.id] = []; scheduleAuctionSave();
-        await message.reply(`🗑️ Cleared all players from **${target.displayName}**'s squad.`); return;
+        await message.channel.send(`🗑️ Cleared all players from **${target.displayName}**'s squad.`); return;
       }
       const idx = parseInt(indexArg) - 1;
       const squad = gd.squads[target.id] || [];
       if (isNaN(idx) || idx < 0 || idx >= squad.length) {
-        await message.reply(`❌ Invalid index. Squad has ${squad.length} player(s).`); return;
+        await message.channel.send(`❌ Invalid index. Squad has ${squad.length} player(s).`); return;
       }
       const removed = squad.splice(idx, 1)[0];
       gd.squads[target.id] = squad; scheduleAuctionSave();
-      await message.reply(`🗑️ Removed **${removed.player}** from **${target.displayName}**'s squad.`); return;
+      await message.channel.send(`🗑️ Removed **${removed.player}** from **${target.displayName}**'s squad.`); return;
     }
 
     // .setauctioneer / .sa  — grant/revoke Auctioneer role
     if (cmd === 'setauctioneer' || cmd === 'sa') {
       if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        await message.reply('❌ Admin only.'); return;
+        await message.channel.send('❌ Admin only.'); return;
       }
       const target = message.mentions.members.first();
-      if (!target) { await message.reply(`❌ Usage: \`${aucPfx}setauctioneer @user\``); return; }
+      if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}setauctioneer @user\``); return; }
 
       // Find or create the Auctioneer role
       let role = message.guild.roles.cache.find(r => r.name === 'Auctioneer');
@@ -1186,7 +1208,7 @@ client.on('messageCreate', async (message) => {
             reason: 'Created by auction bot'
           });
         } catch (e) {
-          await message.reply('❌ Failed to create Auctioneer role. Make sure the bot has **Manage Roles** permission.');
+          await message.channel.send('❌ Failed to create Auctioneer role. Make sure the bot has **Manage Roles** permission.');
           return;
         }
       }
@@ -1214,27 +1236,68 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // .approveauction / .approvecg / .unapproveauction / .unapprovecg — OWNER only
+    if (cmd === 'approveauction' || cmd === 'approvecg' || cmd === 'unapproveauction' || cmd === 'unapprovecg') {
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Only the bot owner can use this command.'); return; }
+      const gid     = String(guildId);
+      const approve = cmd.startsWith('approve');
+      const feature = (cmd === 'approveauction' || cmd === 'unapproveauction') ? 'auction' : 'cgdrop';
+
+      if (feature === 'auction') {
+        auctionData.approvedGuilds = auctionData.approvedGuilds || {};
+        if (approve) auctionData.approvedGuilds[gid] = true;
+        else delete auctionData.approvedGuilds[gid];
+        scheduleAuctionSave();
+      } else {
+        cgData.approvedGuilds = cgData.approvedGuilds || {};
+        if (approve) cgData.approvedGuilds[gid] = true;
+        else delete cgData.approvedGuilds[gid];
+        scheduleCgSave();
+      }
+
+      const emoji = approve ? '✅' : '🚫';
+      await message.channel.send(`${emoji} **${message.guild.name}** has been ${approve ? 'approved' : 'unapproved'} for **${feature}** commands.`);
+      return;
+    }
+
+    // .listapprovals — OWNER only, shows all approved servers
+    if (cmd === 'listapprovals') {
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Only the bot owner can use this command.'); return; }
+      const aucGuilds = Object.keys(auctionData.approvedGuilds || {});
+      const cgGuilds  = Object.keys(cgData.approvedGuilds || {});
+      const aucNames  = aucGuilds.map(id => { const g = client.guilds.cache.get(id); return g ? g.name : id; });
+      const cgNames   = cgGuilds.map(id =>  { const g = client.guilds.cache.get(id); return g ? g.name : id; });
+      const embed = new EmbedBuilder()
+        .setTitle('🔐 Approved Servers')
+        .setColor(0x5865F2)
+        .addFields(
+          { name: `🏏 Auction (${aucGuilds.length})`, value: aucNames.length ? aucNames.join('\n') : 'None', inline: true },
+          { name: `🎮 CGDrop (${cgGuilds.length})`,   value: cgNames.length  ? cgNames.join('\n')  : 'None', inline: true }
+        ).setTimestamp();
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
     // .sync — manual force-push to JSONBin (Admin only)
     if (cmd === 'sync') {
       if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        await message.reply('❌ Admin only.'); return;
+        await message.channel.send('❌ Admin only.'); return;
       }
-      await message.reply('🔄 Syncing data to JSONBin...');
+      await message.channel.send('🔄 Syncing data to JSONBin...');
       cgDirty = true;
       auctionDirty = true;
       await flushCg();
       await flushAuction();
-      await message.reply('✅ All data synced to JSONBin!'); return;
+      await message.channel.send('✅ All data synced to JSONBin!'); return;
     }
 
     // .addsquad / .as
     if (cmd === 'addsquad' || cmd === 'as') {
-      if (!hasAuctionPermission(message.member)) { await message.reply('❌ No permission.'); return; }
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const target = message.mentions.members.first();
       const afterMention = aucRaw.replace(/^(addsquad|as)\s+/, '').replace(/<@!?\d+>\s*/, '').trim();
       const words = afterMention.split(/\s+/).filter(Boolean);
       if (!target || words.length === 0) {
-        await message.reply(`❌ Usage: \`${aucPfx}addsquad @user <player> [price]\``); return;
+        await message.channel.send(`❌ Usage: \`${aucPfx}addsquad @user <player> [price]\``); return;
       }
       const lastWord = words[words.length - 1];
       const priceRaw = parseAmount(lastWord);
@@ -1268,6 +1331,7 @@ client.on('messageCreate', async (message) => {
   //  CGDROP DETECTION  (no prefix needed)
   // ════════════════════════════════════════════════════════════════════════
   if (!lower.startsWith('cgdrop') && !lower.startsWith('cg drop')) return;
+  if (!isCgApproved(guildId)) return; // silently ignore unapproved servers
   if (processedMsgIds.has(message.id)) return;
   processedMsgIds.add(message.id);
   setTimeout(() => processedMsgIds.delete(message.id), 10 * 60 * 1000);
