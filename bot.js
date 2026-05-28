@@ -851,68 +851,113 @@ client.on('messageCreate', async (message) => {
           .setFooter({ text: `Use ${cgPfx}help drop for drop cmds • ${cgPfx}help auction for auction cmds` });
       }
 
-      function auctionEmbed() {
+      // Auction split into two: bidding/queue and admin
+      function auctionEmbed1() {
         return new EmbedBuilder()
-          .setTitle('🏏 Auction Commands')
+          .setTitle('🏏 Auction — Bidding & Queue')
           .setColor(0xFF0000)
-          .setDescription(`Prefix: \`${aucPfx}\` — Admin/Auctioneer role required for marked commands`)
+          .setDescription(`Prefix: \`${aucPfx}\``)
           .addFields(
-            { name: `\`${aucPfx}sell <player> <base> [inc]\``,  value: 'Start an auction *(Admin/Auctioneer)*', inline: false },
-            { name: `\`${aucPfx}bid <amount>\``,                 value: 'Place a bid (omit amount to auto-bid)', inline: false },
-            { name: `\`${aucPfx}sold\``,                         value: 'End auction & auto-start next from queue *(Admin/Auctioneer)*', inline: false },
-            { name: `\`${aucPfx}aq <player> <base> [inc]\``,    value: 'Add player to auction queue *(Admin/Auctioneer)*', inline: false },
-            { name: `\`${aucPfx}sq\``,                           value: 'Start auction from queue *(Admin/Auctioneer)*', inline: false },
-            { name: `\`${aucPfx}q\``,                            value: 'View the auction queue', inline: true },
-            { name: `\`${aucPfx}rq <index>\``,                  value: 'Remove player from queue *(Admin/Auctioneer)*', inline: true },
-            { name: `\`${aucPfx}cq\``,                           value: 'Clear entire queue *(Admin/Auctioneer)*', inline: true },
-            { name: `\`${aucPfx}bal [@user]\``,                  value: 'Check purse balance', inline: true },
-            { name: `\`${aucPfx}lb\``,                           value: 'Purse leaderboard', inline: true },
-            { name: `\`${aucPfx}squad [@user]\``,               value: "View someone's bought players", inline: true },
-            { name: `\`${aucPfx}setpurse @user <amt>\``,        value: 'Set a user purse *(Admin/Auctioneer)*', inline: true },
-            { name: `\`${aucPfx}slc #channel\``,                value: 'Set log channel *(Admin/Auctioneer)*', inline: true },
-            { name: `\`${aucPfx}sd <amount>\``,                 value: 'Set default bid increment *(Admin/Auctioneer)*', inline: true },
-            { name: `\`${aucPfx}addsquad @user <player> [price]\``, value: 'Manually add player to squad *(Admin/Auctioneer)*', inline: false },
-            { name: `\`${aucPfx}setauctioneer @user\``,         value: 'Grant/revoke Auctioneer role *(Admin)*', inline: false },
-            { name: `\`${aucPfx}delete @user <index|all>\``,    value: 'Remove player from squad *(Admin)*', inline: false },
-            { name: '`/sell` `/setauctionprefix` `/setcgprefix`', value: 'Slash commands', inline: false }
+            { name: `\`${aucPfx}sell <player> <base> [inc]\``, value: 'Start an auction *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}bid <amount>\``,                value: 'Place a bid — omit amount to auto +increment', inline: false },
+            { name: `\`${aucPfx}sold\``,                        value: 'End auction & auto-start next from queue *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}aq <player> <base> [inc]\``,   value: 'Add player to queue *(Admin/Auctioneer)*', inline: false },
+            { name: `\`${aucPfx}sq\``,                          value: 'Start queue *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}q\``,                           value: 'View queue', inline: true },
+            { name: `\`${aucPfx}rq <index>\``,                  value: 'Remove from queue *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}cq\``,                          value: 'Clear queue *(Admin/Auctioneer)*', inline: true },
+            { name: `\`${aucPfx}bal [@user]\``,                 value: 'Check purse balance', inline: true },
+            { name: `\`${aucPfx}lb\``,                          value: 'Purse leaderboard', inline: true },
+            { name: `\`${aucPfx}squad [@user]\``,               value: "View someone's squad", inline: true }
           )
-          .setFooter({ text: `Use ${cgPfx}help drop for drop cmds • ${cgPfx}help wl for whitelisted cmds` });
+          .setFooter({ text: `Page 1/2 — use ${cgPfx}help auction2 for admin cmds` });
+      }
+
+      function auctionEmbed2() {
+        return new EmbedBuilder()
+          .setTitle('🏏 Auction — Admin Commands')
+          .setColor(0xFF6600)
+          .setDescription(`Prefix: \`${aucPfx}\` — Requires Admin or Auctioneer role`)
+          .addFields(
+            { name: `\`${aucPfx}setpurse @user <amt>\``,           value: "Set a user's purse", inline: false },
+            { name: `\`${aucPfx}sd <amount>\``,                    value: 'Set default bid increment', inline: true },
+            { name: `\`${aucPfx}slc #channel\``,                   value: 'Set log channel', inline: true },
+            { name: `\`${aucPfx}addsquad @user <player> [price]\``,value: 'Manually add player to squad', inline: false },
+            { name: `\`${aucPfx}delete @user <index|all>\``,       value: 'Remove player from squad *(Admin only)*', inline: false },
+            { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin only)*', inline: false },
+            { name: `\`${aucPfx}sync\``,                           value: 'Force push all data to JSONBin *(Admin only)*', inline: false },
+            { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
+            { name: '`/sell` `/setauctionprefix` `/setcgprefix`',    value: 'Slash commands', inline: false }
+          )
+          .setFooter({ text: `Page 2/2 — use ${cgPfx}help auction for bidding cmds` });
+      }
+
+      // Owner-only help page
+      function ownerEmbed() {
+        return new EmbedBuilder()
+          .setTitle('👑 Owner Commands')
+          .setColor(0xFFD700)
+          .setDescription('Only usable by the bot owner (you)')
+          .addFields(
+            { name: `\`${aucPfx}approveauction\``,    value: 'Approve this server for auction commands', inline: false },
+            { name: `\`${aucPfx}approvecg\``,         value: 'Approve this server for cgdrop commands', inline: false },
+            { name: `\`${aucPfx}unapproveauction\``,  value: 'Revoke auction access from this server', inline: false },
+            { name: `\`${aucPfx}unapprovecg\``,       value: 'Revoke cgdrop access from this server', inline: false },
+            { name: `\`${aucPfx}listapprovals\``,     value: 'List all approved servers', inline: false },
+            { name: `\`${aucPfx}sync\``,              value: 'Force push all data to JSONBin', inline: false },
+            { name: `\`${cgPfx}adduser @user\``,      value: 'Grant cgdrop whitelist access', inline: false },
+            { name: `\`${cgPfx}removeuser @user\``,   value: 'Revoke cgdrop whitelist access', inline: false },
+            { name: `\`${cgPfx}listusers\``,          value: 'List whitelisted users', inline: false },
+            { name: `\`${cgPfx}recording on/off\``,   value: 'Toggle !mystats recording', inline: false },
+            { name: `\`${cgPfx}resetstats\``,         value: 'Reset global drop stats', inline: false }
+          );
       }
 
       // ── Direct sub-command ───────────────────────────────────────────────
-      if (sub === 'drop')    { await message.channel.send({ embeds: [dropEmbed()] });    return; }
-      if (sub === 'wl')      { await message.channel.send({ embeds: [wlEmbed()] });      return; }
-      if (sub === 'auction') { await message.channel.send({ embeds: [auctionEmbed()] }); return; }
+      if (sub === 'drop')     { await message.channel.send({ embeds: [dropEmbed()] });     return; }
+      if (sub === 'wl')       { await message.channel.send({ embeds: [wlEmbed()] });       return; }
+      if (sub === 'auction')  { await message.channel.send({ embeds: [auctionEmbed1()] }); return; }
+      if (sub === 'auction2') { await message.channel.send({ embeds: [auctionEmbed2()] }); return; }
+      if (sub === 'owner')    { if (userId !== OWNER_ID) return; await message.channel.send({ embeds: [ownerEmbed()] }); return; }
 
       // ── Main menu with buttons ───────────────────────────────────────────
+      const isOwner = userId === OWNER_ID;
       const menuEmbed = new EmbedBuilder()
         .setTitle('📖 Bot Help')
         .setColor(0x5865F2)
         .setDescription('Choose a category below, or use a shortcut:')
         .addFields(
-          { name: `\`${cgPfx}help drop\``,    value: '🎮 Drop commands', inline: true },
-          { name: `\`${cgPfx}help wl\``,      value: '🔒 Whitelisted commands', inline: true },
-          { name: `\`${cgPfx}help auction\``, value: '🏏 Auction commands', inline: true }
+          { name: `\`${cgPfx}help drop\``,     value: '🎮 Drop commands', inline: true },
+          { name: `\`${cgPfx}help wl\``,       value: '🔒 Whitelisted commands', inline: true },
+          { name: `\`${cgPfx}help auction\``,  value: '🏏 Auction bidding & queue', inline: true },
+          { name: `\`${cgPfx}help auction2\``, value: '🔧 Auction admin commands', inline: true },
+          ...(isOwner ? [{ name: `\`${cgPfx}help owner\``, value: '👑 Owner commands', inline: true }] : [])
         );
 
-      const row = new ActionRowBuilder().addComponents(
+      const rowComponents = [
         new ButtonBuilder().setCustomId('help_drop').setLabel('🎮 Drop').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('help_wl').setLabel('🔒 Whitelisted').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId('help_auction').setLabel('🏏 Auction').setStyle(ButtonStyle.Danger)
+        new ButtonBuilder().setCustomId('help_auction').setLabel('🏏 Auction').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('help_auction2').setLabel('🔧 Admin').setStyle(ButtonStyle.Secondary),
+      ];
+      if (isOwner) rowComponents.push(
+        new ButtonBuilder().setCustomId('help_owner').setLabel('👑 Owner').setStyle(ButtonStyle.Secondary)
       );
 
+      const row = new ActionRowBuilder().addComponents(rowComponents);
       const sent = await message.channel.send({ embeds: [menuEmbed], components: [row] });
 
-      // Collector — only the person who ran !help can click, expires in 60s
       const collector = sent.createMessageComponentCollector({
         filter: i => i.user.id === userId,
         time: 60_000
       });
 
       collector.on('collect', async i => {
-        if (i.customId === 'help_drop')    await i.update({ embeds: [dropEmbed()],    components: [] });
-        if (i.customId === 'help_wl')      await i.update({ embeds: [wlEmbed()],      components: [] });
-        if (i.customId === 'help_auction') await i.update({ embeds: [auctionEmbed()], components: [] });
+        if (i.customId === 'help_drop')     await i.update({ embeds: [dropEmbed()],     components: [] });
+        if (i.customId === 'help_wl')       await i.update({ embeds: [wlEmbed()],       components: [] });
+        if (i.customId === 'help_auction')  await i.update({ embeds: [auctionEmbed1()], components: [] });
+        if (i.customId === 'help_auction2') await i.update({ embeds: [auctionEmbed2()], components: [] });
+        if (i.customId === 'help_owner')    await i.update({ embeds: [ownerEmbed()],    components: [] });
       });
 
       collector.on('end', (_, reason) => {
