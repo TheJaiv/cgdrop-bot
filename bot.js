@@ -112,41 +112,63 @@ function loadLocalAuction() {
 
 function saveLocalAuction() {
   try {
+    auctionData._savedAt = Date.now(); // version stamp — used to pick the freshest copy on boot
     fs.writeFileSync(AUCTION_LOCAL_FILE, JSON.stringify(auctionData), 'utf8');
   } catch (e) { console.error('Error writing local auction file:', e.message); }
 }
 
-// ── Dirty flags — mark data as changed, actual upload happens on interval ──
+// ── Saving (JSONBin quota-friendly) ──────────────────────────────────────────
+// Changes are written to the LOCAL file instantly and just flagged dirty in
+// memory. JSONBin uploads (which cost quota) only happen:
+//   • hourly (everything: auction + cgdrop)
+//   • after every sold/unsold (auction)
+//   • on shutdown, and on manual `.sync`
+// This keeps JSONBin requests to roughly a handful per hour instead of per change.
 let cgDirty = false, auctionDirty = false;
+let auctionSavingPromise = null;
 
-function scheduleCgSave()      { cgDirty = true; }
+function scheduleCgSave() { cgDirty = true; }    // uploaded on the next hourly flush / shutdown / .sync
 function scheduleAuctionSave() {
-  saveLocalAuction();   // instant local write
-  auctionDirty = true;  // mark for next 30-min JSONBin sync
+  saveLocalAuction();   // instant local write (no JSONBin request)
+  auctionDirty = true;  // uploaded after a sale / hourly / shutdown / .sync
 }
 
-// ── Flush: only uploads if dirty, resets flag after ────────────────────────
 async function flushCg() {
   if (!cgDirty) return;
   cgDirty = false;
   await saveBin(cgData, cgdropBinId, id => { cgdropBinId = id; }, 'cgdrop', 'cgdrop-bot-data');
 }
 
+// Coalesces concurrent calls and always writes the latest state.
 async function flushAuction() {
+  if (auctionSavingPromise) return auctionSavingPromise; // a write is already running; it'll see the dirty flag
   if (!auctionDirty) return;
-  auctionDirty = false;
-  saveLocalAuction(); // ensure local is up to date
-  await saveBin(auctionData, auctionBinId, id => { auctionBinId = id; }, 'auction', 'auction-bot-data');
+  auctionSavingPromise = (async () => {
+    try {
+      while (auctionDirty) {
+        auctionDirty = false;
+        saveLocalAuction();
+        await saveBin(auctionData, auctionBinId, id => {
+          auctionBinId = id;
+          // Remember the auction bin id inside the (durable) cg bin so restarts reuse it
+          if (cgData.auctionBinId !== id) { cgData.auctionBinId = id; cgDirty = true; }
+        }, 'auction', 'auction-bot-data');
+      }
+    } finally {
+      auctionSavingPromise = null;
+    }
+  })();
+  return auctionSavingPromise;
 }
 
-// ── Periodic upload every 30 minutes ───────────────────────────────────────
-const FLUSH_INTERVAL_MS = 30 * 60 * 1000;
+// ── Periodic upload every hour — pushes everything (auction + cgdrop) ─────────
+const FLUSH_INTERVAL_MS = 60 * 60 * 1000;
 function startFlushInterval() {
   setInterval(async () => {
     await flushCg();
     await flushAuction();
   }, FLUSH_INTERVAL_MS);
-  console.log('⏱️  Auto-flush every 30 min started');
+  console.log('⏱️  Hourly JSONBin push started');
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -173,6 +195,7 @@ function getGuildData(guildId) {
       auctionTimer: 0,   // 0 = no countdown; seconds after each bid
       queuePaused: false,// when true, queue won't auto-advance after a sale
       nextDelay: 0,      // 0 = immediate; seconds of countdown before each auto-advanced player
+      trade: null,       // active trade between two members, if any
     };
   }
   return auctionData.guilds[gid];
@@ -431,7 +454,8 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}bal [@user]\``,                 value: 'Check purse balance', inline: true },
       { name: `\`${aucPfx}lb\``,                          value: 'Purse leaderboard', inline: true },
       { name: `\`${aucPfx}squad [@user]\``,               value: "View someone's squad", inline: true },
-      { name: `\`${aucPfx}ss\``,                          value: 'Squad status vs min/max limits', inline: true }
+      { name: `\`${aucPfx}ss\``,                          value: 'Squad status vs min/max limits', inline: true },
+      { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem/view/accept/cancel` — both sides must total the same value', inline: false }
     )
     .setFooter({ text: navHint });
 }
@@ -450,7 +474,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}addsquad @user <player> [price]\``,value: 'Manually add player to squad', inline: false },
       { name: `\`${aucPfx}delete @user <index|all>\``,       value: 'Remove player from squad *(Admin only)*', inline: false },
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin only)*', inline: false },
-      { name: `\`${aucPfx}sync\``,                           value: 'Force push all data to JSONBin *(Admin only)*', inline: false },
+      { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin only)*', inline: false },
       { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
       { name: '`/sell` `/setauctionprefix` `/setcgprefix`',    value: 'Slash commands', inline: false }
     )
@@ -576,6 +600,29 @@ function startPendingCountdown(guild, channel, gd, seconds) {
   }, preWait + visible * 1000);
 }
 
+// ── Trade helpers ──────────────────────────────────────────────────────────
+function sumOffer(offer) { return (offer || []).reduce((s, p) => s + (p.price || 0), 0); }
+
+function tradeEmbed(gd, guild, aucPfx) {
+  const t = gd.trade;
+  const nameOf = (uid) => { const m = guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
+  const fmtSide = (offer) => offer.length ? offer.map(p => `• **${p.player}** (${formatAmount(p.price)})`).join('\n') : '*nothing yet*';
+  const totA = sumOffer(t.offerA), totB = sumOffer(t.offerB);
+  const bothHave = t.offerA.length > 0 && t.offerB.length > 0;
+  const balanced = bothHave && totA === totB;
+  let status;
+  if (!bothHave)        status = 'Both sides must add at least one player.';
+  else if (totA !== totB) status = `⚖️ Not balanced — difference **${formatAmount(Math.abs(totA - totB))}**.`;
+  else                  status = `✅ Balanced! Both run \`${aucPfx}trade accept\` to confirm.`;
+  return new EmbedBuilder().setTitle('🔄 Trade').setColor(balanced ? 0x57F287 : 0xFFA500)
+    .addFields(
+      { name: `${nameOf(t.a)} gives — ${formatAmount(totA)} ${t.acceptedA ? '✅' : ''}`, value: fmtSide(t.offerA), inline: true },
+      { name: `${nameOf(t.b)} gives — ${formatAmount(totB)} ${t.acceptedB ? '✅' : ''}`, value: fmtSide(t.offerB), inline: true },
+      { name: 'Status', value: status, inline: false }
+    )
+    .setFooter({ text: `${aucPfx}trade add <player> · rem <player> · view · accept · cancel` });
+}
+
 async function doSold(guild, channel, gd) {
   cancelAuctionTimer(guild.id); // stop any running countdown
   const auction = gd.auction;
@@ -670,6 +717,9 @@ async function doSold(guild, channel, gd) {
       startAuctionTimer(guild, ch, gd); // next player also counts down with no bids
     }
   }
+
+  // Persist to JSONBin once per sale — the main durability point (purses & squads)
+  await flushAuction();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -690,24 +740,44 @@ const client = new Client({
 client.once('ready', async () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
 
-  // Load both bins
+  if (!JSONBIN_KEY) console.warn('⚠️  JSONBIN_KEY is not set — nothing will persist to JSONBin!');
+
+  // Load cg bin first (it also stores the auction bin id as a durable pointer)
   if (cgdropBinId) {
     const loaded = await loadBin(cgdropBinId, 'cgdrop');
     if (loaded) cgData = { ...cgData, ...loaded };
   }
 
-  // Auction: prefer local file, only pull JSONBin as fallback on first boot
-  const localAuction = loadLocalAuction();
-  if (localAuction) {
-    auctionData = { ...auctionData, ...localAuction };
-    console.log('📂 Auction loaded from local file (no JSONBin pull needed)');
-  } else if (auctionBinId) {
+  // Recover the auction bin id from the cg bin if env didn't provide it,
+  // so we always reuse the SAME bin across restarts (no new empty bin).
+  if (!auctionBinId && cgData.auctionBinId) {
+    auctionBinId = cgData.auctionBinId;
+    console.log(`🔗 Recovered auction bin id from cg bin: ${auctionBinId}`);
+  }
+
+  // Auction: load BOTH the JSONBin copy and the local file, then keep whichever
+  // was saved most recently. This is safe on both ephemeral hosts (local wiped →
+  // use bin) and persistent disks (local fresher → use local, never overwritten).
+  let binAuction = null;
+  if (auctionBinId) {
     const loaded = await loadBin(auctionBinId, 'auction');
-    if (loaded) {
-      auctionData = { ...auctionData, ...loaded };
-      saveLocalAuction(); // seed local file from JSONBin
-      console.log('☁️  Auction seeded from JSONBin → saved locally');
-    }
+    if (loaded && Object.keys(loaded).length) binAuction = loaded;
+  }
+  const localAuction = loadLocalAuction();
+  let chosen = null, src = null;
+  if (binAuction && localAuction) {
+    if ((binAuction._savedAt || 0) >= (localAuction._savedAt || 0)) { chosen = binAuction; src = 'JSONBin'; }
+    else { chosen = localAuction; src = 'local file'; }
+  } else if (binAuction) { chosen = binAuction; src = 'JSONBin'; }
+  else if (localAuction) { chosen = localAuction; src = 'local file'; }
+
+  if (chosen) {
+    auctionData = { ...auctionData, ...chosen };
+    saveLocalAuction(); // re-sync local copy
+    console.log(`📂 Auction loaded from ${src}${chosen._savedAt ? ` (saved ${new Date(chosen._savedAt).toISOString()})` : ''}`);
+    if (src === 'local file' && auctionBinId) { auctionDirty = true; await flushAuction(); } // push the fresher local copy up
+  } else if (!auctionBinId) {
+    console.log('🆕 No auction data yet — a bin will be created and remembered on first save.');
   }
 
   await restoreReminders();
@@ -1687,17 +1757,46 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [embed] }); return;
     }
 
-    // .sync — manual force-push to JSONBin (Admin only)
+    // .sync [push|pull] — manual JSONBin sync (Admin only). Default: push.
     if (cmd === 'sync') {
       if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
         await message.channel.send('❌ Admin only.'); return;
       }
-      await message.channel.send('🔄 Syncing data to JSONBin...');
+      const mode = (parts[1] || 'push').toLowerCase();
+
+      if (mode === 'pull' || mode === 'load' || mode === 'restore') {
+        if (!auctionBinId) { await message.channel.send('❌ No auction bin to pull from yet.'); return; }
+        await message.channel.send('⬇️ Pulling latest data from JSONBin...');
+        const loaded = await loadBin(auctionBinId, 'auction');
+        if (!loaded || !Object.keys(loaded).length) { await message.channel.send('❌ JSONBin returned no data — nothing pulled.'); return; }
+        auctionData = { ...auctionData, ...loaded };
+        saveLocalAuction();
+        const gd2 = getGuildData(guildId);
+        const embed = new EmbedBuilder().setTitle('⬇️ Data Pulled from JSONBin').setColor(0x57F287)
+          .setDescription('In-memory state replaced with the JSONBin copy.')
+          .addFields(
+            { name: 'Guilds', value: String(Object.keys(auctionData.guilds || {}).length), inline: true },
+            { name: 'This server — purses', value: String(Object.keys(gd2.purses || {}).length), inline: true },
+            { name: 'This server — squads', value: String(Object.keys(gd2.squads || {}).length), inline: true },
+            { name: 'Queue', value: String((gd2.queue || []).length), inline: true }
+          ).setFooter({ text: `Pulled by ${message.author.tag}` }).setTimestamp();
+        await message.channel.send({ embeds: [embed] }); return;
+      }
+
+      // push (default)
+      await message.channel.send('⬆️ Pushing all data to JSONBin...');
       cgDirty = true;
       auctionDirty = true;
       await flushCg();
       await flushAuction();
-      await message.channel.send('✅ All data synced to JSONBin!'); return;
+      const gd2 = getGuildData(guildId);
+      const embed = new EmbedBuilder().setTitle('✅ Data Synced to JSONBin').setColor(0x57F287)
+        .addFields(
+          { name: 'Guilds saved', value: String(Object.keys(auctionData.guilds || {}).length), inline: true },
+          { name: 'This server — purses', value: String(Object.keys(gd2.purses || {}).length), inline: true },
+          { name: 'This server — squads', value: String(Object.keys(gd2.squads || {}).length), inline: true }
+        ).setFooter({ text: `Synced by ${message.author.tag} • use ${aucPfx}sync pull to reload` }).setTimestamp();
+      await message.channel.send({ embeds: [embed] }); return;
     }
 
     // .addsquad / .as
@@ -1738,6 +1837,108 @@ client.on('messageCreate', async (message) => {
         .setFooter({ text: `Added by ${message.author.tag}` })
         .setTimestamp();
       await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .trade / .tr — player-to-player squad trade, balanced by player price
+    if (cmd === 'trade' || cmd === 'tr') {
+      if (!gd.squads) gd.squads = {};
+      const sub = (parts[1] || '').toLowerCase();
+      const knownSubs = ['view', 'v', 'add', 'rem', 'remove', 'accept', 'ok', 'cancel'];
+
+      // No active trade → must start one with a mention
+      if (!gd.trade) {
+        if (knownSubs.includes(sub)) { await message.channel.send(`❌ No active trade. Start one with \`${aucPfx}trade @user\`.`); return; }
+        const target = message.mentions.members.first();
+        if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}trade @user\` to start a trade, then \`${aucPfx}trade add <player>\`.`); return; }
+        if (target.id === userId) { await message.channel.send("❌ You can't trade with yourself."); return; }
+        if (target.user.bot)      { await message.channel.send("❌ You can't trade with a bot."); return; }
+        gd.trade = { a: userId, b: target.id, offerA: [], offerB: [], acceptedA: false, acceptedB: false, channel_id: String(message.channel.id) };
+        scheduleAuctionSave();
+        await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🔄 Trade Started').setColor(0x00B0F4)
+          .setDescription(`**${message.member.displayName}** ↔ **${target.displayName}**\nEach side adds their own squad players with \`${aucPfx}trade add <player>\`. When both sides total the **same value**, both run \`${aucPfx}trade accept\`.`)] });
+        return;
+      }
+
+      const t = gd.trade;
+      const isParty = (userId === t.a || userId === t.b);
+
+      // Anyone can view; unknown sub on an active trade just shows it
+      if (sub === 'view' || sub === 'v' || (!knownSubs.includes(sub) && !isParty)) {
+        await message.channel.send({ embeds: [tradeEmbed(gd, message.guild, aucPfx)] }); return;
+      }
+      if (!isParty) { await message.channel.send('❌ A trade is already in progress between two other members. Try again later.'); return; }
+
+      if (sub === 'cancel') {
+        gd.trade = null; scheduleAuctionSave();
+        await message.channel.send('🚫 Trade cancelled.'); return;
+      }
+
+      if (sub === 'add' || sub === 'rem' || sub === 'remove') {
+        const playerName = parts.slice(2).join(' ').trim();
+        if (!playerName) { await message.channel.send(`❌ Usage: \`${aucPfx}trade ${sub} <player>\``); return; }
+        const mine  = (userId === t.a) ? t.offerA : t.offerB;
+        const squad = gd.squads[userId] || [];
+        const eq = (a, b) => a.toLowerCase() === b.toLowerCase();
+
+        if (sub === 'add') {
+          const inSquad = squad.find(p => eq(p.player, playerName));
+          if (!inSquad) { await message.channel.send(`❌ **${playerName}** is not in your squad.`); return; }
+          if (mine.find(p => eq(p.player, playerName))) { await message.channel.send(`❌ **${inSquad.player}** is already in your offer.`); return; }
+          mine.push({ player: inSquad.player, price: inSquad.price || 0 });
+        } else {
+          const idx = mine.findIndex(p => eq(p.player, playerName));
+          if (idx === -1) { await message.channel.send(`❌ **${playerName}** is not in your offer.`); return; }
+          mine.splice(idx, 1);
+        }
+        t.acceptedA = false; t.acceptedB = false; // any change invalidates prior accepts
+        scheduleAuctionSave();
+        await message.channel.send({ embeds: [tradeEmbed(gd, message.guild, aucPfx)] }); return;
+      }
+
+      if (sub === 'accept' || sub === 'ok') {
+        const totA = sumOffer(t.offerA), totB = sumOffer(t.offerB);
+        if (!(t.offerA.length && t.offerB.length)) { await message.channel.send('❌ Both sides must offer at least one player first.'); return; }
+        if (totA !== totB) { await message.channel.send(`❌ Trade isn't balanced — **${formatAmount(totA)}** vs **${formatAmount(totB)}**. Adjust the players first.`); return; }
+        if (userId === t.a) t.acceptedA = true; else t.acceptedB = true;
+        scheduleAuctionSave();
+        if (!(t.acceptedA && t.acceptedB)) {
+          const e = tradeEmbed(gd, message.guild, aucPfx).setFooter({ text: `Waiting for the other party to ${aucPfx}trade accept...` });
+          await message.channel.send({ embeds: [e] }); return;
+        }
+
+        // Both accepted & balanced → validate and execute
+        const squadA = gd.squads[t.a] || [], squadB = gd.squads[t.b] || [];
+        const findIdx = (squad, name) => squad.findIndex(p => p.player.toLowerCase() === name.toLowerCase());
+        for (const p of t.offerA) if (findIdx(squadA, p.player) === -1) { gd.trade = null; scheduleAuctionSave(); await message.channel.send(`❌ Trade aborted — **${p.player}** is no longer in the offering squad.`); return; }
+        for (const p of t.offerB) if (findIdx(squadB, p.player) === -1) { gd.trade = null; scheduleAuctionSave(); await message.channel.send(`❌ Trade aborted — **${p.player}** is no longer in the offering squad.`); return; }
+
+        const maxSquad = gd.maxSquad || 0;
+        const newA = squadA.length - t.offerA.length + t.offerB.length;
+        const newB = squadB.length - t.offerB.length + t.offerA.length;
+        if (maxSquad > 0 && (newA > maxSquad || newB > maxSquad)) {
+          gd.trade = null; scheduleAuctionSave();
+          await message.channel.send(`❌ Trade aborted — it would push a squad over the max size (**${maxSquad}**).`); return;
+        }
+
+        const pull = (squad, offer) => offer.map(o => squad.splice(findIdx(squad, o.player), 1)[0]);
+        const movedAtoB = pull(squadA, t.offerA);
+        const movedBtoA = pull(squadB, t.offerB);
+        squadB.push(...movedAtoB);
+        squadA.push(...movedBtoA);
+        gd.squads[t.a] = squadA; gd.squads[t.b] = squadB;
+
+        const nameOf = (uid) => { const m = message.guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
+        const embed = new EmbedBuilder().setTitle('✅ Trade Completed').setColor(0xFFD700)
+          .addFields(
+            { name: `${nameOf(t.a)} received`, value: movedBtoA.map(p => `**${p.player}** (${formatAmount(p.price)})`).join('\n') || '—', inline: true },
+            { name: `${nameOf(t.b)} received`, value: movedAtoB.map(p => `**${p.player}** (${formatAmount(p.price)})`).join('\n') || '—', inline: true }
+          ).setTimestamp();
+        gd.trade = null; scheduleAuctionSave();
+        await flushAuction(); // persist the completed trade (squad ownership change)
+        await message.channel.send({ embeds: [embed] });
+        await sendLog(message.guild, embed);
+        return;
+      }
     }
   }
 
