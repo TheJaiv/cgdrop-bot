@@ -68,7 +68,7 @@ async function loadBin(binId, label) {
   }
 }
 
-async function saveBin(data, binIdRef, setFn, label, binName) {
+async function saveBin(data, binIdRef, setFn, label, binName, envVarName) {
   try {
     if (!binIdRef) {
       const res  = await fetch('https://api.jsonbin.io/v3/b', {
@@ -84,7 +84,7 @@ async function saveBin(data, binIdRef, setFn, label, binName) {
       const json = await res.json();
       setFn(json.metadata.id);
       console.log(`✅ Created new JSONBin for ${label}: ${json.metadata.id}`);
-      console.log(`⚠️  ADD TO ENV: ${binName.toUpperCase().replace(/-/g,'_')}_BIN_ID=${json.metadata.id}`);
+      console.log(`⚠️  ADD TO ENV (Render):  ${envVarName}=${json.metadata.id}`);
     } else {
       await fetch(`https://api.jsonbin.io/v3/b/${binIdRef}`, {
         method: 'PUT',
@@ -136,7 +136,7 @@ function scheduleAuctionSave() {
 async function flushCg() {
   if (!cgDirty) return;
   cgDirty = false;
-  await saveBin(cgData, cgdropBinId, id => { cgdropBinId = id; }, 'cgdrop', 'cgdrop-bot-data');
+  await saveBin(cgData, cgdropBinId, id => { cgdropBinId = id; }, 'cgdrop', 'cgdrop-bot-data', 'CGDROP_BIN_ID');
 }
 
 // Coalesces concurrent calls and always writes the latest state.
@@ -148,11 +148,16 @@ async function flushAuction() {
       while (auctionDirty) {
         auctionDirty = false;
         saveLocalAuction();
-        await saveBin(auctionData, auctionBinId, id => {
-          auctionBinId = id;
-          // Remember the auction bin id inside the (durable) cg bin so restarts reuse it
-          if (cgData.auctionBinId !== id) { cgData.auctionBinId = id; cgDirty = true; }
-        }, 'auction', 'auction-bot-data');
+        await saveBin(auctionData, auctionBinId, id => { auctionBinId = id; }, 'auction', 'auction-bot-data', 'AUCTION_BIN_ID');
+        // Persist the auction bin id into the cg bin RIGHT NOW (not just flagged),
+        // so a restart can recover it regardless of flush ordering.
+        if (auctionBinId && cgData.auctionBinId !== auctionBinId) {
+          cgData.auctionBinId = auctionBinId;
+          cgDirty = true;
+          await flushCg();
+          console.log(`🔗 Stored auction bin id in cg bin: ${auctionBinId}`);
+          console.log(`👉 To make this permanent, set env:  AUCTION_BIN_ID=${auctionBinId}`);
+        }
       }
     } finally {
       auctionSavingPromise = null;
@@ -165,8 +170,8 @@ async function flushAuction() {
 const FLUSH_INTERVAL_MS = 60 * 60 * 1000;
 function startFlushInterval() {
   setInterval(async () => {
+    await flushAuction(); // auction first so the bin-id pointer is captured before cg saves
     await flushCg();
-    await flushAuction();
   }, FLUSH_INTERVAL_MS);
   console.log('⏱️  Hourly JSONBin push started');
 }
@@ -748,9 +753,12 @@ client.once('ready', async () => {
     if (loaded) cgData = { ...cgData, ...loaded };
   }
 
-  // Recover the auction bin id from the cg bin if env didn't provide it,
-  // so we always reuse the SAME bin across restarts (no new empty bin).
-  if (!auctionBinId && cgData.auctionBinId) {
+  // Prefer the env var (Render): it's the durable source of truth and means we
+  // only ever UPDATE that bin, never create a new one.
+  if (AUCTION_BIN_ID_ENV) {
+    console.log(`✅ Using AUCTION_BIN_ID from env: ${AUCTION_BIN_ID_ENV}`);
+  } else if (!auctionBinId && cgData.auctionBinId) {
+    // Fallback: recover from the cg bin if env didn't provide it.
     auctionBinId = cgData.auctionBinId;
     console.log(`🔗 Recovered auction bin id from cg bin: ${auctionBinId}`);
   }
@@ -779,6 +787,14 @@ client.once('ready', async () => {
   } else if (!auctionBinId) {
     console.log('🆕 No auction data yet — a bin will be created and remembered on first save.');
   }
+
+  // ── Bin id summary — copy these into env so no new bins are ever created ──
+  console.log('──────────────────────────────────────────────');
+  console.log(`📌 CGDROP_BIN_ID = ${cgdropBinId || '(not set — set this in env!)'}`);
+  console.log(`📌 AUCTION_BIN_ID = ${auctionBinId || '(none yet — will be created on first save)'}`);
+  if (!AUCTION_BIN_ID_ENV && auctionBinId) console.log(`👉 Add to env to make permanent:  AUCTION_BIN_ID=${auctionBinId}`);
+  if (!cgdropBinId) console.warn('⚠️  No cgdrop bin configured — the auction bin id cannot be remembered across restarts. Set CGDROP_BIN_ID (or AUCTION_BIN_ID) in env!');
+  console.log('──────────────────────────────────────────────');
 
   await restoreReminders();
   startFlushInterval();
@@ -1787,14 +1803,15 @@ client.on('messageCreate', async (message) => {
       await message.channel.send('⬆️ Pushing all data to JSONBin...');
       cgDirty = true;
       auctionDirty = true;
+      await flushAuction(); // auction first so the bin-id pointer is captured before cg saves
       await flushCg();
-      await flushAuction();
       const gd2 = getGuildData(guildId);
       const embed = new EmbedBuilder().setTitle('✅ Data Synced to JSONBin').setColor(0x57F287)
         .addFields(
           { name: 'Guilds saved', value: String(Object.keys(auctionData.guilds || {}).length), inline: true },
           { name: 'This server — purses', value: String(Object.keys(gd2.purses || {}).length), inline: true },
-          { name: 'This server — squads', value: String(Object.keys(gd2.squads || {}).length), inline: true }
+          { name: 'This server — squads', value: String(Object.keys(gd2.squads || {}).length), inline: true },
+          { name: 'AUCTION_BIN_ID (set this in env!)', value: `\`${auctionBinId || 'none'}\``, inline: false }
         ).setFooter({ text: `Synced by ${message.author.tag} • use ${aucPfx}sync pull to reload` }).setTimestamp();
       await message.channel.send({ embeds: [embed] }); return;
     }
@@ -2062,8 +2079,8 @@ process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:'
 // ── Graceful shutdown — flush everything before going offline ──────────────
 async function shutdownFlush() {
   console.log('⚠️  Shutdown detected — flushing data to JSONBin...');
+  await flushAuction(); // auction first so the bin-id pointer is captured before cg saves
   await flushCg();
-  await flushAuction();
   console.log('✅ Flush complete. Exiting.');
   process.exit(0);
 }
