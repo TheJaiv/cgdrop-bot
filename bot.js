@@ -477,9 +477,10 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}ssl <min> <max>\``,                value: 'Set min/max squad size (0 = none)', inline: true },
       { name: `\`${aucPfx}st <seconds>\``,                   value: 'Bid countdown timer — auto-sold at 0 (0 = off)', inline: true },
       { name: `\`${aucPfx}addsquad @user <player> [price]\``,value: 'Manually add player to squad', inline: false },
-      { name: `\`${aucPfx}delete @user <index|all>\``,       value: 'Remove player from squad *(Admin only)*', inline: false },
-      { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin only)*', inline: false },
-      { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin only)*', inline: false },
+      { name: `\`${aucPfx}delete @user <index|all>\``,       value: 'Remove player from squad *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse & squad *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
       { name: '`/sell` `/setauctionprefix` `/setcgprefix`',    value: 'Slash commands', inline: false }
     )
@@ -1671,8 +1672,8 @@ client.on('messageCreate', async (message) => {
 
     // .delete
     if (cmd === 'delete') {
-      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        await message.channel.send('❌ Admin only.'); return;
+      if (!hasAuctionPermission(message.member)) {
+        await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return;
       }
       const target = message.mentions.members.first();
       if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}delete @user <index|all>\``); return; }
@@ -1695,8 +1696,8 @@ client.on('messageCreate', async (message) => {
 
     // .setauctioneer / .sa  — grant/revoke Auctioneer role
     if (cmd === 'setauctioneer' || cmd === 'sa') {
-      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        await message.channel.send('❌ Admin only.'); return;
+      if (!hasAuctionPermission(message.member)) {
+        await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return;
       }
       const target = message.mentions.members.first();
       if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}setauctioneer @user\``); return; }
@@ -1782,8 +1783,8 @@ client.on('messageCreate', async (message) => {
 
     // .sync [push|pull] — manual JSONBin sync (Admin only). Default: push.
     if (cmd === 'sync') {
-      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        await message.channel.send('❌ Admin only.'); return;
+      if (!hasAuctionPermission(message.member)) {
+        await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return;
       }
       const mode = (parts[1] || 'push').toLowerCase();
 
@@ -1861,6 +1862,37 @@ client.on('messageCreate', async (message) => {
         .setFooter({ text: `Added by ${message.author.tag}` })
         .setTimestamp();
       await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .swap @userA @userB — swap two members' entire auction state (purse + squad)
+    if (cmd === 'swap') {
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return; }
+      const mentioned = [...message.mentions.members.values()];
+      if (mentioned.length < 2 || mentioned[0].id === mentioned[1].id) {
+        await message.channel.send(`❌ Usage: \`${aucPfx}swap @userA @userB\` — swaps purse & squad between two members.`); return;
+      }
+      const [A, B] = mentioned;
+      if (!gd.purses) gd.purses = {};
+      if (!gd.squads) gd.squads = {};
+      // swap purses
+      const pa = gd.purses[A.id] || 0, pb = gd.purses[B.id] || 0;
+      gd.purses[A.id] = pb; gd.purses[B.id] = pa;
+      // swap squads
+      const sa = gd.squads[A.id] || [], sb = gd.squads[B.id] || [];
+      gd.squads[A.id] = sb; gd.squads[B.id] = sa;
+      // cancel any active trade involving either member (its references are now stale)
+      if (gd.trade && [gd.trade.a, gd.trade.b].some(id => id === A.id || id === B.id)) gd.trade = null;
+      scheduleAuctionSave();
+      await flushAuction(); // persist this big change immediately
+      const embed = new EmbedBuilder().setTitle('🔄 Swapped').setColor(0x00B0F4)
+        .setDescription(`Swapped **purse & squad** between ${A} and ${B}.`)
+        .addFields(
+          { name: A.displayName, value: `Balance: **${formatAmount(gd.purses[A.id])}**\nSquad: **${(gd.squads[A.id] || []).length}** player(s)`, inline: true },
+          { name: B.displayName, value: `Balance: **${formatAmount(gd.purses[B.id])}**\nSquad: **${(gd.squads[B.id] || []).length}** player(s)`, inline: true }
+        ).setFooter({ text: `By ${message.author.tag}` }).setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      await sendLog(message.guild, embed);
+      return;
     }
 
     // .trade / .tr — player-to-player squad trade, balanced by player price
