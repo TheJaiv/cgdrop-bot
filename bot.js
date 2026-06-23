@@ -460,7 +460,7 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}lb\``,                          value: 'Purse leaderboard', inline: true },
       { name: `\`${aucPfx}squad [@user]\``,               value: "View someone's squad", inline: true },
       { name: `\`${aucPfx}ss\``,                          value: 'Squad status vs min/max limits', inline: true },
-      { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem/view/accept/cancel` — both sides must total the same value', inline: false }
+      { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem <player>`, `trade cash <amount>`, `view/accept/cancel` — both sides must total the same value (players + cash)', inline: false }
     )
     .setFooter({ text: navHint });
 }
@@ -611,21 +611,28 @@ function sumOffer(offer) { return (offer || []).reduce((s, p) => s + (p.price ||
 function tradeEmbed(gd, guild, aucPfx) {
   const t = gd.trade;
   const nameOf = (uid) => { const m = guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
-  const fmtSide = (offer) => offer.length ? offer.map(p => `• **${p.player}** (${formatAmount(p.price)})`).join('\n') : '*nothing yet*';
-  const totA = sumOffer(t.offerA), totB = sumOffer(t.offerB);
-  const bothHave = t.offerA.length > 0 && t.offerB.length > 0;
-  const balanced = bothHave && totA === totB;
+  const fmtSide = (offer, cash) => {
+    const lines = offer.map(p => `• **${p.player}** (${formatAmount(p.price)})`);
+    if (cash > 0) lines.push(`💰 **${formatAmount(cash)}** cash`);
+    return lines.length ? lines.join('\n') : '*nothing yet*';
+  };
+  const cashA = t.cashA || 0, cashB = t.cashB || 0;
+  const totA = sumOffer(t.offerA) + cashA, totB = sumOffer(t.offerB) + cashB;
+  const atLeastOnePlayer = (t.offerA.length + t.offerB.length) > 0;
+  const bothHave = totA > 0 && totB > 0;
+  const balanced = bothHave && atLeastOnePlayer && totA === totB;
   let status;
-  if (!bothHave)        status = 'Both sides must add at least one player.';
-  else if (totA !== totB) status = `⚖️ Not balanced — difference **${formatAmount(Math.abs(totA - totB))}**.`;
-  else                  status = `✅ Balanced! Both run \`${aucPfx}trade accept\` to confirm.`;
+  if (!bothHave)             status = 'Each side must offer players and/or cash.';
+  else if (!atLeastOnePlayer) status = 'A trade needs at least one player.';
+  else if (totA !== totB)    status = `⚖️ Not balanced — difference **${formatAmount(Math.abs(totA - totB))}**. Add players or \`${aucPfx}trade cash <amount>\` to even it out.`;
+  else                       status = `✅ Balanced! Both run \`${aucPfx}trade accept\` to confirm.`;
   return new EmbedBuilder().setTitle('🔄 Trade').setColor(balanced ? 0x57F287 : 0xFFA500)
     .addFields(
-      { name: `${nameOf(t.a)} gives — ${formatAmount(totA)} ${t.acceptedA ? '✅' : ''}`, value: fmtSide(t.offerA), inline: true },
-      { name: `${nameOf(t.b)} gives — ${formatAmount(totB)} ${t.acceptedB ? '✅' : ''}`, value: fmtSide(t.offerB), inline: true },
+      { name: `${nameOf(t.a)} gives — ${formatAmount(totA)} ${t.acceptedA ? '✅' : ''}`, value: fmtSide(t.offerA, cashA), inline: true },
+      { name: `${nameOf(t.b)} gives — ${formatAmount(totB)} ${t.acceptedB ? '✅' : ''}`, value: fmtSide(t.offerB, cashB), inline: true },
       { name: 'Status', value: status, inline: false }
     )
-    .setFooter({ text: `${aucPfx}trade add <player> · rem <player> · view · accept · cancel` });
+    .setFooter({ text: `${aucPfx}trade add/rem <player> · cash <amount> · view · accept · cancel` });
 }
 
 async function doSold(guild, channel, gd) {
@@ -1860,7 +1867,7 @@ client.on('messageCreate', async (message) => {
     if (cmd === 'trade' || cmd === 'tr') {
       if (!gd.squads) gd.squads = {};
       const sub = (parts[1] || '').toLowerCase();
-      const knownSubs = ['view', 'v', 'add', 'rem', 'remove', 'accept', 'ok', 'cancel'];
+      const knownSubs = ['view', 'v', 'add', 'rem', 'remove', 'cash', 'money', 'accept', 'ok', 'cancel'];
 
       // No active trade → must start one with a mention
       if (!gd.trade) {
@@ -1869,10 +1876,10 @@ client.on('messageCreate', async (message) => {
         if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}trade @user\` to start a trade, then \`${aucPfx}trade add <player>\`.`); return; }
         if (target.id === userId) { await message.channel.send("❌ You can't trade with yourself."); return; }
         if (target.user.bot)      { await message.channel.send("❌ You can't trade with a bot."); return; }
-        gd.trade = { a: userId, b: target.id, offerA: [], offerB: [], acceptedA: false, acceptedB: false, channel_id: String(message.channel.id) };
+        gd.trade = { a: userId, b: target.id, offerA: [], offerB: [], cashA: 0, cashB: 0, acceptedA: false, acceptedB: false, channel_id: String(message.channel.id) };
         scheduleAuctionSave();
         await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🔄 Trade Started').setColor(0x00B0F4)
-          .setDescription(`**${message.member.displayName}** ↔ **${target.displayName}**\nEach side adds their own squad players with \`${aucPfx}trade add <player>\`. When both sides total the **same value**, both run \`${aucPfx}trade accept\`.`)] });
+          .setDescription(`**${message.member.displayName}** ↔ **${target.displayName}**\nEach side adds squad players with \`${aucPfx}trade add <player>\` and/or money with \`${aucPfx}trade cash <amount>\`. When both sides total the **same value**, both run \`${aucPfx}trade accept\`.`)] });
         return;
       }
 
@@ -1912,10 +1919,23 @@ client.on('messageCreate', async (message) => {
         await message.channel.send({ embeds: [tradeEmbed(gd, message.guild, aucPfx)] }); return;
       }
 
+      if (sub === 'cash' || sub === 'money') {
+        const amt = parseAmount(parts[2]);
+        if (amt === null || amt < 0) { await message.channel.send(`❌ Usage: \`${aucPfx}trade cash <amount>\` (use 0 to clear).`); return; }
+        const myPurse = gd.purses[userId] || 0;
+        if (amt > myPurse) { await message.channel.send(`❌ You only have **${formatAmount(myPurse)}** in your purse.`); return; }
+        if (userId === t.a) t.cashA = amt; else t.cashB = amt;
+        t.acceptedA = false; t.acceptedB = false;
+        scheduleAuctionSave();
+        await message.channel.send({ embeds: [tradeEmbed(gd, message.guild, aucPfx)] }); return;
+      }
+
       if (sub === 'accept' || sub === 'ok') {
-        const totA = sumOffer(t.offerA), totB = sumOffer(t.offerB);
-        if (!(t.offerA.length && t.offerB.length)) { await message.channel.send('❌ Both sides must offer at least one player first.'); return; }
-        if (totA !== totB) { await message.channel.send(`❌ Trade isn't balanced — **${formatAmount(totA)}** vs **${formatAmount(totB)}**. Adjust the players first.`); return; }
+        const cashA = t.cashA || 0, cashB = t.cashB || 0;
+        const totA = sumOffer(t.offerA) + cashA, totB = sumOffer(t.offerB) + cashB;
+        if ((t.offerA.length + t.offerB.length) === 0) { await message.channel.send('❌ A trade needs at least one player.'); return; }
+        if (!(totA > 0 && totB > 0)) { await message.channel.send('❌ Each side must offer players and/or cash.'); return; }
+        if (totA !== totB) { await message.channel.send(`❌ Trade isn't balanced — **${formatAmount(totA)}** vs **${formatAmount(totB)}**. Adjust players or cash first.`); return; }
         if (userId === t.a) t.acceptedA = true; else t.acceptedB = true;
         scheduleAuctionSave();
         if (!(t.acceptedA && t.acceptedB)) {
@@ -1928,6 +1948,13 @@ client.on('messageCreate', async (message) => {
         const findIdx = (squad, name) => squad.findIndex(p => p.player.toLowerCase() === name.toLowerCase());
         for (const p of t.offerA) if (findIdx(squadA, p.player) === -1) { gd.trade = null; scheduleAuctionSave(); await message.channel.send(`❌ Trade aborted — **${p.player}** is no longer in the offering squad.`); return; }
         for (const p of t.offerB) if (findIdx(squadB, p.player) === -1) { gd.trade = null; scheduleAuctionSave(); await message.channel.send(`❌ Trade aborted — **${p.player}** is no longer in the offering squad.`); return; }
+
+        // Purses must still cover the cash each side is putting in
+        const purseA = gd.purses[t.a] || 0, purseB = gd.purses[t.b] || 0;
+        if (cashA > purseA || cashB > purseB) {
+          gd.trade = null; scheduleAuctionSave();
+          await message.channel.send('❌ Trade aborted — a party no longer has enough balance for the cash offered.'); return;
+        }
 
         const maxSquad = gd.maxSquad || 0;
         const newA = squadA.length - t.offerA.length + t.offerB.length;
@@ -1944,11 +1971,21 @@ client.on('messageCreate', async (message) => {
         squadA.push(...movedBtoA);
         gd.squads[t.a] = squadA; gd.squads[t.b] = squadB;
 
+        // Transfer cash: each side pays its own cash and receives the other's
+        gd.purses[t.a] = purseA - cashA + cashB;
+        gd.purses[t.b] = purseB - cashB + cashA;
+
         const nameOf = (uid) => { const m = message.guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
+        const recv = (players, cash) => {
+          const lines = players.map(p => `**${p.player}** (${formatAmount(p.price)})`);
+          if (cash > 0) lines.push(`💰 ${formatAmount(cash)} cash`);
+          return lines.join('\n') || '—';
+        };
         const embed = new EmbedBuilder().setTitle('✅ Trade Completed').setColor(0xFFD700)
           .addFields(
-            { name: `${nameOf(t.a)} received`, value: movedBtoA.map(p => `**${p.player}** (${formatAmount(p.price)})`).join('\n') || '—', inline: true },
-            { name: `${nameOf(t.b)} received`, value: movedAtoB.map(p => `**${p.player}** (${formatAmount(p.price)})`).join('\n') || '—', inline: true }
+            { name: `${nameOf(t.a)} received`, value: recv(movedBtoA, cashB), inline: true },
+            { name: `${nameOf(t.b)} received`, value: recv(movedAtoB, cashA), inline: true },
+            { name: 'New balances', value: `${nameOf(t.a)}: ${formatAmount(gd.purses[t.a])}\n${nameOf(t.b)}: ${formatAmount(gd.purses[t.b])}`, inline: false }
           ).setTimestamp();
         gd.trade = null; scheduleAuctionSave();
         await flushAuction(); // persist the completed trade (squad ownership change)
