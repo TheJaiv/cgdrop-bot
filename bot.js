@@ -3,7 +3,7 @@ const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, REST, Rout
 const http = require('http');
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  CONFIG  (all secrets via environment variables)d
+//  CONFIG  (all secrets via environment variables)ds
 // ══════════════════════════════════════════════════════════════════════════════
 const JSONBIN_KEY         = process.env.JSONBIN_KEY;
 const CGDROP_BIN_ID_ENV   = process.env.CGDROP_BIN_ID || process.env.JSONBIN_BIN_ID || null;
