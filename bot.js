@@ -171,6 +171,8 @@ function getGuildData(guildId) {
       minSquad: 0,       // 0 = no minimum
       maxSquad: 0,       // 0 = no maximum
       auctionTimer: 0,   // 0 = no countdown; seconds after each bid
+      queuePaused: false,// when true, queue won't auto-advance after a sale
+      nextDelay: 0,      // 0 = immediate; seconds of countdown before each auto-advanced player
     };
   }
   return auctionData.guilds[gid];
@@ -193,6 +195,27 @@ function formatAmount(amount) {
 }
 
 function fmt(n) { return Number(n || 0).toLocaleString(); }
+
+// Parse multi-entry queue text (one per line or comma-separated).
+// Each entry: "<player...> <base> [increment]". Returns parsed items + unparsable lines.
+function parseQueueEntries(text, defaultDiff) {
+  const entries = text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+  const items = [], failed = [];
+  for (const entry of entries) {
+    const words         = entry.split(/\s+/).filter(Boolean);
+    const lastAmt       = words.length ? parseAmount(words[words.length - 1]) : null;
+    const secondLastAmt = words.length >= 3 ? parseAmount(words[words.length - 2]) : null;
+    let player = null, base = null, diff = defaultDiff;
+    if (lastAmt !== null && secondLastAmt !== null) {
+      player = words.slice(0, -2).join(' '); base = secondLastAmt; diff = lastAmt;
+    } else if (lastAmt !== null) {
+      player = words.slice(0, -1).join(' '); base = lastAmt;
+    }
+    if (!player || base === null || base <= 0) { failed.push(entry); continue; }
+    items.push({ player, base, diff });
+  }
+  return { items, failed };
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  PERMISSION HELPERS
@@ -398,8 +421,11 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}bid <amount>\``,                value: 'Place a bid — omit amount to auto +increment', inline: false },
       { name: `\`${aucPfx}sold\``,                        value: 'End auction & auto-start next from queue *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}aq <player> <base> [inc]\``,   value: 'Add to queue — multiple at once, one per line or comma-separated *(Admin/Auctioneer)*', inline: false },
-      { name: `\`${aucPfx}sq\``,                          value: 'Start queue *(Admin/Auctioneer)*', inline: true },
-      { name: `\`${aucPfx}q\``,                           value: 'View queue', inline: true },
+      { name: `\`${aucPfx}aqs <set> <players…>\``,        value: 'Add players under a named set — queue auto-stops at the end of each set *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}sq\``,                          value: 'Start / resume queue *(Admin/Auctioneer)*', inline: true },
+      { name: `\`${aucPfx}si <seconds>\``,                value: 'Countdown before each auto-advanced player — 0 = off *(Admin/Auctioneer)*', inline: true },
+      { name: `\`${aucPfx}stq\``,                         value: 'Stop queue / cancel scheduled start *(Admin/Auctioneer)*', inline: true },
+      { name: `\`${aucPfx}q\``,                           value: 'View queue (grouped by set)', inline: true },
       { name: `\`${aucPfx}rq <index>\``,                  value: 'Remove from queue *(Admin/Auctioneer)*', inline: true },
       { name: `\`${aucPfx}cq\``,                          value: 'Clear queue *(Admin/Auctioneer)*', inline: true },
       { name: `\`${aucPfx}bal [@user]\``,                 value: 'Check purse balance', inline: true },
@@ -444,7 +470,7 @@ function cancelAuctionTimer(guildId) {
 
 function bigCountdown(n) {
   const keycap = { 3: '3️⃣', 2: '2️⃣', 1: '1️⃣' }[n] || String(n);
-  return `# ⏳ ${keycap}\n### Going... bid now or it's **SOLD**!`;
+  return `# ⏳ ${keycap}\n### Going... bid now or it closes!`;
 }
 
 // Start (or restart, on each bid) the countdown for a guild's live auction.
@@ -479,8 +505,74 @@ function startAuctionTimer(guild, channel, gd) {
     if (state.cancelled) return;
     auctionTimers.delete(gid);
     if (!gd.auction) return;
-    if (countdownMsg) { try { await countdownMsg.edit('# 🔨 SOLD!'); } catch (_) {} }
-    await doSold(guild, channel, gd);
+    if (countdownMsg) { try { await countdownMsg.edit("# ⏳ Time's up!"); } catch (_) {} }
+    await doSold(guild, channel, gd); // sells to highest bidder, or marks UNSOLD if no bids
+  }, preWait + visible * 1000);
+}
+
+// Shift the front of the queue into a live auction, announce it, and arm the bid timer.
+async function startNextFromQueue(guild, channel, gd, startedByTag) {
+  if (!gd.queue || gd.queue.length === 0) return false;
+  gd.queuePaused = false;
+  const next = gd.queue.shift();
+  gd.auction = { player: next.player, base: next.base, current_bid: next.base, difference: next.difference, set: next.set || null,
+    highest_bidder: null, highest_bidder_id: null, channel_id: String(channel.id) };
+  scheduleAuctionSave();
+  const embed = new EmbedBuilder().setTitle('🏏 AUCTION STARTED!')
+    .setDescription(`*From queue — ${gd.queue.length} player(s) remaining.*`).setColor(0xFF0000)
+    .addFields(
+      { name: 'Player',        value: `**${next.player}**`,          inline: true },
+      { name: 'Base Price',    value: formatAmount(next.base),       inline: true },
+      { name: 'Min Increment', value: formatAmount(next.difference), inline: true }
+    );
+  if (next.set) embed.addFields({ name: 'Set', value: next.set, inline: true });
+  if (gd.auctionTimer) embed.addFields({ name: '⏱️ Timer', value: `${gd.auctionTimer}s — no bid before 0 = UNSOLD; each bid resets it.`, inline: false });
+  embed.addFields({ name: 'How to bid', value: `Use \`${getAuctionPrefix(guild.id)}bid <amount>\``, inline: false });
+  if (startedByTag) embed.setFooter({ text: `Started by ${startedByTag}` });
+  embed.setTimestamp();
+  await channel.send({ embeds: [embed] });
+  startAuctionTimer(guild, channel, gd);
+  return true;
+}
+
+// ── Pending "next player starts in N seconds" countdown (in-memory) ─────────
+const pendingStarts = new Map(); // guildId -> { handles: [], cancelled: bool }
+
+function cancelPendingStart(guildId) {
+  const t = pendingStarts.get(String(guildId));
+  if (!t) return;
+  t.cancelled = true;
+  t.handles.forEach(clearTimeout);
+  pendingStarts.delete(String(guildId));
+}
+
+function startPendingCountdown(guild, channel, gd, seconds) {
+  const gid = String(guild.id);
+  cancelPendingStart(gid);
+  const state = { handles: [], cancelled: false };
+  pendingStarts.set(gid, state);
+  const schedule = (fn, ms) => { state.handles.push(setTimeout(fn, ms)); };
+
+  const visible = Math.min(seconds, 3);
+  const preWait = (seconds - visible) * 1000;
+  let msg = null;
+
+  const tick = async (n) => {
+    if (state.cancelled) return;
+    const keycap = { 3: '3️⃣', 2: '2️⃣', 1: '1️⃣' }[n] || String(n);
+    const content = `# ⏳ ${keycap}\n### Next player is coming up for bidding...`;
+    try { if (!msg) msg = await channel.send(content); else await msg.edit(content); } catch (_) {}
+  };
+
+  for (let i = 0; i < visible; i++) { const n = visible - i; schedule(() => tick(n), preWait + i * 1000); }
+
+  schedule(async () => {
+    if (state.cancelled) return;
+    pendingStarts.delete(gid);
+    if (gd.auction) return;                          // something already started
+    if (!gd.queue || gd.queue.length === 0) return;  // queue emptied meanwhile
+    if (msg) { try { await msg.edit('# 🏏 Starting!'); } catch (_) {} }
+    await startNextFromQueue(guild, channel, gd, null);
   }, preWait + visible * 1000);
 }
 
@@ -526,31 +618,57 @@ async function doSold(guild, channel, gd) {
   await ch.send({ embeds: [embed] });
   await sendLog(guild, embed);
 
-  // Auto-start next from queue
+  // Auto-advance the queue — unless it's stopped or we've hit a set boundary
   if (gd.queue && gd.queue.length > 0) {
-    const next = gd.queue.shift();
-    gd.auction = {
-      player: next.player,
-      base: next.base,
-      current_bid: next.base,
-      difference: next.difference,
-      highest_bidder: null,
-      highest_bidder_id: null,
-      channel_id: String(ch.id)
-    };
-    scheduleAuctionSave();
+    const next     = gd.queue[0];
+    const soldSet  = auction.set || null;
+    const nextSet  = next.set || null;
 
-    const nextEmbed = new EmbedBuilder()
-      .setTitle('🏏 NEXT AUCTION STARTED!')
-      .setDescription(`*Auto-started from queue — ${gd.queue.length} player(s) remaining.*`)
-      .setColor(0xFF0000)
-      .addFields(
-        { name: 'Player',        value: `**${next.player}**`,           inline: true },
-        { name: 'Base Price',    value: formatAmount(next.base),        inline: true },
-        { name: 'Min Increment', value: formatAmount(next.difference),  inline: true }
-      )
-      .setTimestamp();
-    await ch.send({ embeds: [nextEmbed] });
+    if (gd.queuePaused) {
+      await ch.send({ embeds: [new EmbedBuilder().setColor(0xAAAAAA)
+        .setTitle('⏸️ Queue Stopped')
+        .setDescription(`Auto-advance is off. Use \`.sq\` to start the next player (**${next.player}**${nextSet ? ` — set: ${nextSet}` : ''}).`)] });
+    } else if (nextSet !== soldSet) {
+      await ch.send({ embeds: [new EmbedBuilder().setColor(0x57F287)
+        .setTitle(`✅ Set Complete${soldSet ? ` — ${soldSet}` : ''}`)
+        .setDescription(`Next up: **${nextSet ? `Set ${nextSet}` : 'Ungrouped players'}** (${gd.queue.length} player(s) left).\nUse \`.sq\` to start it.`)] });
+    } else if (gd.nextDelay > 0) {
+      // Delay before the next player comes up — announce, then run the pre-start countdown
+      await ch.send({ embeds: [new EmbedBuilder().setColor(0x00B0F4)
+        .setTitle('⏳ Up Next')
+        .setDescription(`**${next.player}**${nextSet ? ` *(set: ${nextSet})*` : ''} comes up for bidding in **${gd.nextDelay}s**.`)
+        .addFields({ name: 'Base Price', value: formatAmount(next.base), inline: true })
+        .setTimestamp()] });
+      startPendingCountdown(guild, ch, gd, gd.nextDelay);
+    } else {
+      gd.queue.shift();
+      gd.auction = {
+        player: next.player,
+        base: next.base,
+        current_bid: next.base,
+        difference: next.difference,
+        set: nextSet,
+        highest_bidder: null,
+        highest_bidder_id: null,
+        channel_id: String(ch.id)
+      };
+      scheduleAuctionSave();
+
+      const nextEmbed = new EmbedBuilder()
+        .setTitle('🏏 NEXT AUCTION STARTED!')
+        .setDescription(`*Auto-started from queue — ${gd.queue.length} player(s) remaining.*`)
+        .setColor(0xFF0000)
+        .addFields(
+          { name: 'Player',        value: `**${next.player}**`,           inline: true },
+          { name: 'Base Price',    value: formatAmount(next.base),        inline: true },
+          { name: 'Min Increment', value: formatAmount(next.difference),  inline: true }
+        );
+      if (nextSet) nextEmbed.addFields({ name: 'Set', value: nextSet, inline: true });
+      if (gd.auctionTimer) nextEmbed.addFields({ name: '⏱️ Timer', value: `${gd.auctionTimer}s — no bid before 0 = UNSOLD; each bid resets it.`, inline: false });
+      nextEmbed.setTimestamp();
+      await ch.send({ embeds: [nextEmbed] });
+      startAuctionTimer(guild, ch, gd); // next player also counts down with no bids
+    }
   }
 }
 
@@ -640,7 +758,7 @@ client.on('interactionCreate', async interaction => {
     if (!base) return interaction.reply({ content: '❌ Invalid base price.', ephemeral: true });
     const diff = incRaw ? parseAmount(incRaw) : (gd.difference || 500000);
 
-    gd.auction = { player: playerName, base, current_bid: base, difference: diff,
+    gd.auction = { player: playerName, base, current_bid: base, difference: diff, set: null,
       highest_bidder: null, highest_bidder_id: null, channel_id: String(interaction.channelId) };
     scheduleAuctionSave();
 
@@ -655,7 +773,9 @@ client.on('interactionCreate', async interaction => {
       )
       .setFooter({ text: `Started by ${interaction.user.tag}` })
       .setTimestamp();
+    if (gd.auctionTimer) embed.addFields({ name: '⏱️ Timer', value: `${gd.auctionTimer}s — no bid before 0 = UNSOLD; each bid resets it.`, inline: false });
     await interaction.reply({ embeds: [embed] });
+    if (gd.auctionTimer && interaction.channel) startAuctionTimer(interaction.guild, interaction.channel, gd);
     return;
   }
 
@@ -1172,7 +1292,8 @@ client.on('messageCreate', async (message) => {
       const base       = parseAmount(parts[2]);
       if (!playerName || !base) { await message.channel.send(`❌ Usage: \`${aucPfx}sell <player> <base> [increment]\``); return; }
       const diff = parts[3] ? parseAmount(parts[3]) : (gd.difference || 500000);
-      gd.auction = { player: playerName, base, current_bid: base, difference: diff,
+      cancelPendingStart(guildId); // a manual sell overrides any scheduled .startin
+      gd.auction = { player: playerName, base, current_bid: base, difference: diff, set: null,
         highest_bidder: null, highest_bidder_id: null, channel_id: String(message.channel.id) };
       scheduleAuctionSave();
       const embed = new EmbedBuilder().setTitle('🏏 AUCTION STARTED!').setColor(0xFF0000)
@@ -1182,7 +1303,10 @@ client.on('messageCreate', async (message) => {
           { name: 'Min Increment', value: formatAmount(diff),   inline: true },
           { name: 'How to bid',    value: `Use \`${aucPfx}bid <amount>\``, inline: false }
         ).setFooter({ text: `Started by ${message.author.tag}` }).setTimestamp();
-      await message.channel.send({ embeds: [embed] }); return;
+      if (gd.auctionTimer) embed.addFields({ name: '⏱️ Timer', value: `${gd.auctionTimer}s — no bid before 0 = UNSOLD; each bid resets it.`, inline: false });
+      await message.channel.send({ embeds: [embed] });
+      startAuctionTimer(message.guild, message.channel, gd); // counts down even with no bids
+      return;
     }
 
     // .bid / .b
@@ -1225,7 +1349,7 @@ client.on('messageCreate', async (message) => {
           { name: 'Bid',    value: formatAmount(bidAmt),    inline: true },
           { name: 'Bidder', value: `<@${userId}>`,          inline: true }
         );
-      if (gd.auctionTimer) embed.setFooter({ text: `⏱️ ${gd.auctionTimer}s timer started — a new bid resets it.` });
+      if (gd.auctionTimer) embed.setFooter({ text: `⏱️ Timer reset to ${gd.auctionTimer}s.` });
       embed.setTimestamp();
       await message.channel.send({ embeds: [embed] });
       // Start / reset the countdown (only when a timer is configured)
@@ -1239,87 +1363,120 @@ client.on('messageCreate', async (message) => {
       await doSold(message.guild, message.channel, gd); return;
     }
 
-    // .addqueue / .aq  — add one OR many (one per line / comma-separated)
-    if (cmd === 'addqueue' || cmd === 'aq') {
+    // .addqueue / .aq  — add one OR many (one per line / comma-separated), no set
+    // .addqueueset / .aqs <set> — same but tag every player with a set name
+    if (cmd === 'addqueue' || cmd === 'aq' || cmd === 'addqueueset' || cmd === 'aqs') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
-      const body = aucRaw.slice(parts[0].length).trim();
+      const isSet = (cmd === 'addqueueset' || cmd === 'aqs');
+      let body = aucRaw.slice(parts[0].length).trim();
+      let setName = null;
+      if (isSet) {
+        const m = body.match(/^(\S+)\s+([\s\S]+)$/); // first token = set name, rest = players
+        if (!m) {
+          await message.channel.send(`❌ Usage: \`${aucPfx}aqs <set> <player> <base> [inc]\` — set name is one word; add several players one per line or comma-separated.`);
+          return;
+        }
+        setName = m[1]; body = m[2].trim();
+      }
       if (!body) {
         await message.channel.send(
-          `❌ Usage: \`${aucPfx}aq <player> <base> [increment]\`\nAdd several at once — one per line or comma-separated:\n\`\`\`\n${aucPfx}aq Kohli 2000000\nRohit 1500000 100000\nMS Dhoni 1000000\n\`\`\``
+          `❌ Usage: \`${aucPfx}${isSet ? 'aqs <set> ' : ''}<player> <base> [increment]\`\nAdd several at once — one per line or comma-separated:\n\`\`\`\n${aucPfx}${isSet ? 'aqs Marquee\n' : 'aq '}Kohli 2000000\nRohit 1500000 100000\nMS Dhoni 1000000\n\`\`\``
         );
         return;
       }
       if (!Array.isArray(gd.queue)) gd.queue = [];
 
-      const entries = body.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
-      const added = [], failed = [];
-      for (const entry of entries) {
-        const words         = entry.split(/\s+/).filter(Boolean);
-        const lastAmt       = words.length ? parseAmount(words[words.length - 1]) : null;
-        const secondLastAmt = words.length >= 3 ? parseAmount(words[words.length - 2]) : null;
-        let player = null, base = null, diff = gd.difference || 500000;
-        if (lastAmt !== null && secondLastAmt !== null) {
-          player = words.slice(0, -2).join(' '); base = secondLastAmt; diff = lastAmt;
-        } else if (lastAmt !== null) {
-          player = words.slice(0, -1).join(' '); base = lastAmt;
-        }
-        if (!player || base === null || base <= 0) { failed.push(entry); continue; }
-        gd.queue.push({ player, base, difference: diff });
-        added.push({ player, base, diff });
-      }
-
-      if (added.length === 0) {
-        await message.channel.send(`❌ Couldn't parse any entries. Usage: \`${aucPfx}aq <player> <base> [increment]\` — one per line or comma-separated.`);
+      const { items, failed } = parseQueueEntries(body, gd.difference || 500000);
+      if (items.length === 0) {
+        await message.channel.send(`❌ Couldn't parse any entries. Usage: \`${aucPfx}${isSet ? 'aqs <set> ' : ''}<player> <base> [increment]\` — one per line or comma-separated.`);
         return;
       }
+      for (const it of items) gd.queue.push({ player: it.player, base: it.base, difference: it.diff, set: setName });
       scheduleAuctionSave();
 
-      const startPos = gd.queue.length - added.length + 1;
-      const lines = added.map((a, i) => `\`#${startPos + i}\` **${a.player}** — Base ${formatAmount(a.base)}, Inc ${formatAmount(a.diff)}`);
+      const startPos = gd.queue.length - items.length + 1;
+      const lines = items.map((a, i) => `\`#${startPos + i}\` **${a.player}** — Base ${formatAmount(a.base)}, Inc ${formatAmount(a.diff)}`);
       const embed = new EmbedBuilder()
-        .setTitle(added.length === 1 ? '📋 Player Added to Queue' : `📋 ${added.length} Players Added to Queue`)
+        .setTitle(items.length === 1 ? '📋 Player Added to Queue' : `📋 ${items.length} Players Added to Queue`)
         .setColor(0x5865F2)
-        .setDescription(lines.join('\n').slice(0, 4096))
+        .setDescription((setName ? `**Set: ${setName}**\n` : '') + lines.join('\n').slice(0, 4000))
         .setFooter({ text: `Added by ${message.author.tag} • ${gd.queue.length} in queue` })
         .setTimestamp();
       if (failed.length) embed.addFields({ name: `⚠️ Skipped ${failed.length}`, value: failed.map(f => `• ${f}`).join('\n').slice(0, 1024) });
       await message.channel.send({ embeds: [embed] }); return;
     }
 
-    // .startqueue / .sq
+    // .startqueue / .sq  — start (or resume) the queue from the front
     if (cmd === 'startqueue' || cmd === 'sq') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       if (gd.auction) { await message.channel.send(`❌ Auction already running! Use \`${aucPfx}sold\` first.`); return; }
       if (!gd.queue || gd.queue.length === 0) { await message.channel.send(`❌ Queue is empty. Add players with \`${aucPfx}aq\` first.`); return; }
-      const next = gd.queue.shift();
-      gd.auction = { player: next.player, base: next.base, current_bid: next.base, difference: next.difference,
-        highest_bidder: null, highest_bidder_id: null, channel_id: String(message.channel.id) };
-      scheduleAuctionSave();
-      const embed = new EmbedBuilder().setTitle('🏏 AUCTION STARTED!')
-        .setDescription(`*From queue — ${gd.queue.length} player(s) remaining.*`).setColor(0xFF0000)
-        .addFields(
-          { name: 'Player',        value: `**${next.player}**`,   inline: true },
-          { name: 'Base Price',    value: formatAmount(next.base), inline: true },
-          { name: 'Min Increment', value: formatAmount(next.difference), inline: true },
-          { name: 'How to bid',    value: `Use \`${aucPfx}bid <amount>\``, inline: false }
-        ).setFooter({ text: `Started by ${message.author.tag}` }).setTimestamp();
+      cancelPendingStart(guildId); // a manual start overrides any scheduled .startin
+      await startNextFromQueue(message.guild, message.channel, gd, message.author.tag);
+      return;
+    }
+
+    // .startin / .si <seconds>  — countdown before each auto-advanced player (0 = off)
+    if (cmd === 'startin' || cmd === 'si') {
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
+      if (!parts[1]) {
+        const cur = gd.nextDelay || 0;
+        await message.channel.send(cur
+          ? `⏳ Next-player countdown is **${cur}s** — after each sale the next queued player auto-starts after a ${cur}s countdown. Set \`${aucPfx}si 0\` to disable.`
+          : `⏳ Next-player countdown is **off**. Set with \`${aucPfx}si <seconds>\` (1–3600).`);
+        return;
+      }
+      const secs = parseInt(parts[1]);
+      if (isNaN(secs) || secs < 0 || secs > 3600) { await message.channel.send(`❌ Usage: \`${aucPfx}si <seconds>\` — 0 disables, max 3600.`); return; }
+      gd.nextDelay = secs; scheduleAuctionSave();
+      if (!secs) cancelPendingStart(guildId); // kill any in-flight countdown
+      const embed = new EmbedBuilder().setColor(0x00B0F4)
+        .setTitle(secs ? '⏳ Next-Player Countdown Set' : '⏳ Next-Player Countdown Disabled')
+        .setDescription(secs
+          ? `After each sale, the next queued player comes up for bidding after a **${secs}s** countdown (big 3 → 2 → 1). Applies within a set; set boundaries still wait for \`${aucPfx}sq\`.`
+          : 'The next queued player will start immediately after each sale.')
+        .setFooter({ text: `Set by ${message.author.tag}` });
       await message.channel.send({ embeds: [embed] }); return;
     }
 
-    // .queue / .q
+    // .stopqueue / .stq  — stop auto-advance at any time (current auction stays live)
+    if (cmd === 'stopqueue' || cmd === 'stq') {
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
+      cancelPendingStart(guildId); // also cancels a scheduled .startin
+      gd.queuePaused = true; scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('⏸️ Queue Stopped').setColor(0xAAAAAA)
+        .setDescription(`The queue won't auto-advance after the next sale.${gd.auction ? ` The current auction (**${gd.auction.player}**) is still live.` : ''}\nUse \`${aucPfx}sq\` to start the next player when ready.`)
+        .setFooter({ text: `Stopped by ${message.author.tag}` });
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .queue / .q  — grouped by set
     if (cmd === 'queue' || cmd === 'q') {
       const embed = new EmbedBuilder().setTitle('📋 Auction Queue').setColor(0x5865F2).setTimestamp();
       if (gd.auction) {
         embed.addFields({ name: '🔴 Currently Auctioning',
-          value: `**${gd.auction.player}** — Current Bid: ${formatAmount(gd.auction.current_bid)}`, inline: false });
+          value: `**${gd.auction.player}**${gd.auction.set ? ` *(set: ${gd.auction.set})*` : ''} — Current Bid: ${formatAmount(gd.auction.current_bid)}`, inline: false });
       }
       if (!gd.queue || gd.queue.length === 0) {
+        if (gd.queuePaused) embed.setDescription('⏸️ *Queue is stopped.*');
         embed.addFields({ name: 'Queue', value: 'Queue is empty.', inline: false });
       } else {
-        const lines = gd.queue.map((item, i) =>
-          `\`${i+1}.\` **${item.player}** — Base: ${formatAmount(item.base)}, Inc: ${formatAmount(item.difference)}`
-        ).join('\n');
-        embed.addFields({ name: `Up Next (${gd.queue.length} player(s))`, value: lines, inline: false });
+        if (gd.queuePaused) embed.setDescription(`⏸️ *Queue is stopped — use \`${aucPfx}sq\` to start the next player.*`);
+        // group consecutive players by set → one field per set
+        const groups = [];
+        gd.queue.forEach((item, i) => {
+          const s = item.set || null;
+          const last = groups[groups.length - 1];
+          if (!last || last.set !== s) groups.push({ set: s, items: [] });
+          groups[groups.length - 1].items.push({ ...item, pos: i + 1 });
+        });
+        for (const g of groups.slice(0, 24)) {
+          const val = g.items
+            .map(it => `\`${it.pos}.\` **${it.player}** — Base ${formatAmount(it.base)}, Inc ${formatAmount(it.difference)}`)
+            .join('\n').slice(0, 1024);
+          embed.addFields({ name: g.set ? `🏷️ Set: ${g.set} (${g.items.length})` : `📦 Ungrouped (${g.items.length})`, value: val, inline: false });
+        }
+        embed.setFooter({ text: `${gd.queue.length} player(s) in queue` });
       }
       await message.channel.send({ embeds: [embed] }); return;
     }
@@ -1339,6 +1496,7 @@ client.on('messageCreate', async (message) => {
     // .clearqueue / .cq
     if (cmd === 'clearqueue' || cmd === 'cq') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
+      cancelPendingStart(guildId); // a scheduled .startin has nothing to start anymore
       const count = (gd.queue || []).length;
       gd.queue = []; scheduleAuctionSave();
       await message.channel.send(`🗑️ Cleared **${count}** player(s) from the queue.`); return;
