@@ -514,7 +514,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}st <seconds>\``,                   value: 'Bid countdown timer — auto-sold at 0 (0 = off)', inline: true },
       { name: `\`${aucPfx}addsquad @user <player> [price]\``,value: 'Manually add player to squad', inline: false },
       { name: `\`${aucPfx}delete @user <index|all>\``,       value: 'Remove player from squad *(Admin/Auctioneer)*', inline: false },
-      { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse & squad *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse, squad & team name *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
@@ -1984,26 +1984,31 @@ client.on('messageCreate', async (message) => {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return; }
       const mentioned = [...message.mentions.members.values()];
       if (mentioned.length < 2 || mentioned[0].id === mentioned[1].id) {
-        await message.channel.send(`❌ Usage: \`${aucPfx}swap @userA @userB\` — swaps purse & squad between two members.`); return;
+        await message.channel.send(`❌ Usage: \`${aucPfx}swap @userA @userB\` — swaps purse, squad & team name between two members.`); return;
       }
       const [A, B] = mentioned;
       if (!gd.purses) gd.purses = {};
       if (!gd.squads) gd.squads = {};
+      if (!gd.teams)  gd.teams  = {};
       // swap purses
       const pa = gd.purses[A.id] || 0, pb = gd.purses[B.id] || 0;
       gd.purses[A.id] = pb; gd.purses[B.id] = pa;
       // swap squads
       const sa = gd.squads[A.id] || [], sb = gd.squads[B.id] || [];
       gd.squads[A.id] = sb; gd.squads[B.id] = sa;
+      // swap team names (delete the key when the other side had none)
+      const ta = gd.teams[A.id], tb = gd.teams[B.id];
+      if (tb !== undefined) gd.teams[A.id] = tb; else delete gd.teams[A.id];
+      if (ta !== undefined) gd.teams[B.id] = ta; else delete gd.teams[B.id];
       // cancel any active trade involving either member (its references are now stale)
       if (gd.trade && [gd.trade.a, gd.trade.b].some(id => id === A.id || id === B.id)) gd.trade = null;
       scheduleAuctionSave();
       await flushAuction(); // persist this big change immediately
       const embed = new EmbedBuilder().setTitle('🔄 Swapped').setColor(0x00B0F4)
-        .setDescription(`Swapped **purse & squad** between ${A} and ${B}.`)
+        .setDescription(`Swapped **purse, squad & team name** between ${A} and ${B}.`)
         .addFields(
-          { name: A.displayName, value: `Balance: **${formatAmount(gd.purses[A.id])}**\nSquad: **${(gd.squads[A.id] || []).length}** player(s)`, inline: true },
-          { name: B.displayName, value: `Balance: **${formatAmount(gd.purses[B.id])}**\nSquad: **${(gd.squads[B.id] || []).length}** player(s)`, inline: true }
+          { name: A.displayName, value: `Team: **${gd.teams[A.id] || '—'}**\nBalance: **${formatAmount(gd.purses[A.id])}**\nSquad: **${(gd.squads[A.id] || []).length}** player(s)`, inline: true },
+          { name: B.displayName, value: `Team: **${gd.teams[B.id] || '—'}**\nBalance: **${formatAmount(gd.purses[B.id])}**\nSquad: **${(gd.squads[B.id] || []).length}** player(s)`, inline: true }
         ).setFooter({ text: `By ${message.author.tag}` }).setTimestamp();
       await message.channel.send({ embeds: [embed] });
       await sendLog(message.guild, embed);
