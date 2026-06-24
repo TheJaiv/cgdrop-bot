@@ -1966,8 +1966,6 @@ client.on('messageCreate', async (message) => {
         scheduleAuctionSave();
         await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🔄 Trade Started').setColor(0x00B0F4)
           .setDescription(`**${message.member.displayName}** ↔ **${target.displayName}**\nEach side adds squad players with \`${aucPfx}trade add <player>\` and/or money with \`${aucPfx}trade cash <amount>\`. When both sides total the **same value**, both run \`${aucPfx}trade accept\`.`)] });
-        await sendLog(message.guild, new EmbedBuilder().setTitle('🔄 Trade Started').setColor(0x00B0F4)
-          .setDescription(`**${message.member.displayName}** started a trade with **${target.displayName}**.`).setTimestamp(), 'trade');
         return;
       }
 
@@ -1981,11 +1979,8 @@ client.on('messageCreate', async (message) => {
       if (!isParty) { await message.channel.send('❌ A trade is already in progress between two other members. Try again later.'); return; }
 
       if (sub === 'cancel') {
-        const nameOf = (uid) => { const m = message.guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
-        const desc = `Trade between **${nameOf(t.a)}** and **${nameOf(t.b)}** was cancelled by **${message.member.displayName}**.`;
         gd.trade = null; scheduleAuctionSave();
         await message.channel.send('🚫 Trade cancelled.');
-        await sendLog(message.guild, new EmbedBuilder().setTitle('🚫 Trade Cancelled').setColor(0xAAAAAA).setDescription(desc).setTimestamp(), 'trade');
         return;
       }
 
