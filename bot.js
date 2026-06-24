@@ -189,7 +189,10 @@ function getGuildData(guildId) {
   const gid = String(guildId);
   if (!auctionData.guilds[gid]) {
     auctionData.guilds[gid] = {
-      logChannel: null,
+      logChannel: null,    // general/default log channel (fallback for all types)
+      soldChannel: null,   // optional override for SOLD logs
+      unsoldChannel: null, // optional override for UNSOLD logs
+      tradeChannel: null,  // optional override for trade logs
       purses: {},
       squads: {},
       auction: null,
@@ -430,12 +433,15 @@ async function restoreReminders() {
 // ══════════════════════════════════════════════════════════════════════════════
 //  AUCTION HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
-async function sendLog(guild, embed) {
+// type: 'sold' | 'unsold' | 'trade' | undefined — routes to the type-specific
+// channel if set, otherwise falls back to the general log channel.
+async function sendLog(guild, embed, type) {
   const gd = getGuildData(guild.id);
-  if (gd.logChannel) {
-    const ch = guild.channels.cache.get(gd.logChannel);
-    if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
-  }
+  const byType = { sold: gd.soldChannel, unsold: gd.unsoldChannel, trade: gd.tradeChannel };
+  const chId = (type && byType[type]) || gd.logChannel;
+  if (!chId) return;
+  const ch = guild.channels.cache.get(chId);
+  if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
 }
 
 // ── Auction help pages (shared by !help auction and .ahelp) ────────────────
@@ -453,7 +459,7 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}sq\``,                          value: 'Start / resume queue *(Admin/Auctioneer)*', inline: true },
       { name: `\`${aucPfx}si <seconds>\``,                value: 'Countdown before each auto-advanced player — 0 = off *(Admin/Auctioneer)*', inline: true },
       { name: `\`${aucPfx}stq\``,                         value: 'Stop queue / cancel scheduled start *(Admin/Auctioneer)*', inline: true },
-      { name: `\`${aucPfx}q\``,                           value: 'View queue (grouped by set)', inline: true },
+      { name: `\`${aucPfx}q\``,                           value: 'View queue — one set per page, ◀ ▶ to flip', inline: true },
       { name: `\`${aucPfx}rq <index>\``,                  value: 'Remove from queue *(Admin/Auctioneer)*', inline: true },
       { name: `\`${aucPfx}cq\``,                          value: 'Clear queue *(Admin/Auctioneer)*', inline: true },
       { name: `\`${aucPfx}bal [@user]\``,                 value: 'Check purse balance', inline: true },
@@ -473,7 +479,7 @@ function auctionHelpPage2(aucPfx, navHint) {
     .addFields(
       { name: `\`${aucPfx}setpurse @user <amt>\``,           value: "Set a user's purse", inline: false },
       { name: `\`${aucPfx}sd <amount>\``,                    value: 'Set default bid increment', inline: true },
-      { name: `\`${aucPfx}slc #channel\``,                   value: 'Set log channel', inline: true },
+      { name: `\`${aucPfx}slc [sold|unsold|trade] #channel\``, value: 'Set log channel (no type = general/default)', inline: true },
       { name: `\`${aucPfx}ssl <min> <max>\``,                value: 'Set min/max squad size (0 = none)', inline: true },
       { name: `\`${aucPfx}st <seconds>\``,                   value: 'Bid countdown timer — auto-sold at 0 (0 = off)', inline: true },
       { name: `\`${aucPfx}addsquad @user <player> [price]\``,value: 'Manually add player to squad', inline: false },
@@ -606,6 +612,32 @@ function startPendingCountdown(guild, channel, gd, seconds) {
   }, preWait + visible * 1000);
 }
 
+// ── Queue view helpers ─────────────────────────────────────────────────────
+// Group the queue into consecutive runs by set — each run becomes one page.
+function queueGroups(gd) {
+  const groups = [];
+  (gd.queue || []).forEach((item, i) => {
+    const s = item.set || null;
+    const last = groups[groups.length - 1];
+    if (!last || last.set !== s) groups.push({ set: s, items: [] });
+    groups[groups.length - 1].items.push({ ...item, pos: i + 1 });
+  });
+  return groups;
+}
+
+function queuePageEmbed(gd, aucPfx, groups, page) {
+  const g = groups[page];
+  let desc = '';
+  if (gd.auction) desc += `🔴 **Now auctioning:** ${gd.auction.player}${gd.auction.set ? ` *(set: ${gd.auction.set})*` : ''} — ${formatAmount(gd.auction.current_bid)}\n\n`;
+  if (gd.queuePaused) desc += `⏸️ *Queue is stopped — use \`${aucPfx}sq\` to start the next player.*\n\n`;
+  desc += `__${g.set ? `Set: ${g.set}` : 'Ungrouped'}__ — ${g.items.length} player(s)\n`;
+  desc += g.items.map(it => `\`${it.pos}.\` **${it.player}** — Base ${formatAmount(it.base)}, Inc ${formatAmount(it.difference)}`).join('\n');
+  return new EmbedBuilder().setTitle('📋 Auction Queue').setColor(0x5865F2)
+    .setDescription(desc.slice(0, 4096))
+    .setFooter({ text: `Set ${page + 1}/${groups.length} • ${gd.queue.length} player(s) total` })
+    .setTimestamp();
+}
+
 // ── Trade helpers ──────────────────────────────────────────────────────────
 function sumOffer(offer) { return (offer || []).reduce((s, p) => s + (p.price || 0), 0); }
 
@@ -676,7 +708,7 @@ async function doSold(guild, channel, gd) {
 
   const ch = guild.channels.cache.get(auction.channel_id) || channel;
   await ch.send({ embeds: [embed] });
-  await sendLog(guild, embed);
+  await sendLog(guild, embed, bidderId ? 'sold' : 'unsold');
 
   // Auto-advance the queue — unless it's stopped or we've hit a set boundary
   if (gd.queue && gd.queue.length > 0) {
@@ -1305,13 +1337,34 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [embed] }); return;
     }
 
-    // .setlogchannel / .slc
+    // .setlogchannel / .slc [type] #channel  — type: sold | unsold | trade | all (default)
     if (cmd === 'setlogchannel' || cmd === 'slc') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
-      const ch = message.mentions.channels.first();
-      if (!ch) { await message.channel.send(`❌ Usage: \`${aucPfx}setlogchannel #channel\``); return; }
-      gd.logChannel = ch.id; scheduleAuctionSave();
-      const embed = new EmbedBuilder().setTitle('📋 Log Channel Set').setDescription(`Logs → ${ch}`).setColor(0x0099FF);
+      const chMention = (id) => (id ? `<#${id}>` : '*(falls back to general)*');
+
+      // No channel mentioned → show current config
+      if (!message.mentions.channels.first()) {
+        const embed = new EmbedBuilder().setTitle('📋 Log Channels').setColor(0x0099FF)
+          .addFields(
+            { name: 'General (default)', value: gd.logChannel ? `<#${gd.logChannel}>` : '*(not set)*', inline: false },
+            { name: '🔨 Sold',   value: chMention(gd.soldChannel),   inline: true },
+            { name: '🔨 Unsold', value: chMention(gd.unsoldChannel), inline: true },
+            { name: '🔄 Trade',  value: chMention(gd.tradeChannel),  inline: true }
+          ).setFooter({ text: `${aucPfx}slc [sold|unsold|trade|all] #channel` });
+        await message.channel.send({ embeds: [embed] }); return;
+      }
+
+      const ch    = message.mentions.channels.first();
+      const types = ['sold', 'unsold', 'trade', 'all', 'default', 'general'];
+      const type  = types.includes((parts[1] || '').toLowerCase()) ? parts[1].toLowerCase() : 'all';
+      let label;
+      if (type === 'sold')        { gd.soldChannel   = ch.id; label = '🔨 SOLD logs'; }
+      else if (type === 'unsold') { gd.unsoldChannel = ch.id; label = '🔨 UNSOLD logs'; }
+      else if (type === 'trade')  { gd.tradeChannel  = ch.id; label = '🔄 Trade logs'; }
+      else                        { gd.logChannel    = ch.id; label = 'General logs (default for all types)'; }
+      scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('📋 Log Channel Set').setColor(0x0099FF)
+        .setDescription(`**${label}** → ${ch}`);
       await message.channel.send({ embeds: [embed] }); return;
     }
 
@@ -1544,35 +1597,36 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [embed] }); return;
     }
 
-    // .queue / .q  — grouped by set
+    // .queue / .q  — one set per page, navigate with ◀ ▶ buttons
     if (cmd === 'queue' || cmd === 'q') {
-      const embed = new EmbedBuilder().setTitle('📋 Auction Queue').setColor(0x5865F2).setTimestamp();
-      if (gd.auction) {
-        embed.addFields({ name: '🔴 Currently Auctioning',
-          value: `**${gd.auction.player}**${gd.auction.set ? ` *(set: ${gd.auction.set})*` : ''} — Current Bid: ${formatAmount(gd.auction.current_bid)}`, inline: false });
-      }
       if (!gd.queue || gd.queue.length === 0) {
-        if (gd.queuePaused) embed.setDescription('⏸️ *Queue is stopped.*');
+        const embed = new EmbedBuilder().setTitle('📋 Auction Queue').setColor(0x5865F2).setTimestamp();
+        if (gd.auction) embed.addFields({ name: '🔴 Currently Auctioning',
+          value: `**${gd.auction.player}**${gd.auction.set ? ` *(set: ${gd.auction.set})*` : ''} — Current Bid: ${formatAmount(gd.auction.current_bid)}`, inline: false });
+        embed.setDescription(gd.queuePaused ? '⏸️ *Queue is stopped.*' : null);
         embed.addFields({ name: 'Queue', value: 'Queue is empty.', inline: false });
-      } else {
-        if (gd.queuePaused) embed.setDescription(`⏸️ *Queue is stopped — use \`${aucPfx}sq\` to start the next player.*`);
-        // group consecutive players by set → one field per set
-        const groups = [];
-        gd.queue.forEach((item, i) => {
-          const s = item.set || null;
-          const last = groups[groups.length - 1];
-          if (!last || last.set !== s) groups.push({ set: s, items: [] });
-          groups[groups.length - 1].items.push({ ...item, pos: i + 1 });
-        });
-        for (const g of groups.slice(0, 24)) {
-          const val = g.items
-            .map(it => `\`${it.pos}.\` **${it.player}** — Base ${formatAmount(it.base)}, Inc ${formatAmount(it.difference)}`)
-            .join('\n').slice(0, 1024);
-          embed.addFields({ name: g.set ? `🏷️ Set: ${g.set} (${g.items.length})` : `📦 Ungrouped (${g.items.length})`, value: val, inline: false });
-        }
-        embed.setFooter({ text: `${gd.queue.length} player(s) in queue` });
+        await message.channel.send({ embeds: [embed] }); return;
       }
-      await message.channel.send({ embeds: [embed] }); return;
+
+      const groups = queueGroups(gd);
+      let page = 0;
+      const makeRow = (p) => new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('q_prev').setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(p === 0),
+        new ButtonBuilder().setCustomId('q_set').setLabel(`Set ${p + 1}/${groups.length}`).setStyle(ButtonStyle.Primary).setDisabled(true),
+        new ButtonBuilder().setCustomId('q_next').setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(p === groups.length - 1)
+      );
+      const components = groups.length > 1 ? [makeRow(page)] : [];
+      const sent = await message.channel.send({ embeds: [queuePageEmbed(gd, aucPfx, groups, page)], components });
+      if (groups.length <= 1) return;
+
+      const collector = sent.createMessageComponentCollector({ filter: i => i.user.id === userId, time: 120_000 });
+      collector.on('collect', async i => {
+        if (i.customId === 'q_prev' && page > 0) page--;
+        if (i.customId === 'q_next' && page < groups.length - 1) page++;
+        await i.update({ embeds: [queuePageEmbed(gd, aucPfx, groups, page)], components: [makeRow(page)] });
+      });
+      collector.on('end', (_, reason) => { if (reason === 'time') sent.edit({ components: [] }).catch(() => {}); });
+      return;
     }
 
     // .removequeue / .rq
@@ -1912,6 +1966,8 @@ client.on('messageCreate', async (message) => {
         scheduleAuctionSave();
         await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🔄 Trade Started').setColor(0x00B0F4)
           .setDescription(`**${message.member.displayName}** ↔ **${target.displayName}**\nEach side adds squad players with \`${aucPfx}trade add <player>\` and/or money with \`${aucPfx}trade cash <amount>\`. When both sides total the **same value**, both run \`${aucPfx}trade accept\`.`)] });
+        await sendLog(message.guild, new EmbedBuilder().setTitle('🔄 Trade Started').setColor(0x00B0F4)
+          .setDescription(`**${message.member.displayName}** started a trade with **${target.displayName}**.`).setTimestamp(), 'trade');
         return;
       }
 
@@ -1925,8 +1981,12 @@ client.on('messageCreate', async (message) => {
       if (!isParty) { await message.channel.send('❌ A trade is already in progress between two other members. Try again later.'); return; }
 
       if (sub === 'cancel') {
+        const nameOf = (uid) => { const m = message.guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
+        const desc = `Trade between **${nameOf(t.a)}** and **${nameOf(t.b)}** was cancelled by **${message.member.displayName}**.`;
         gd.trade = null; scheduleAuctionSave();
-        await message.channel.send('🚫 Trade cancelled.'); return;
+        await message.channel.send('🚫 Trade cancelled.');
+        await sendLog(message.guild, new EmbedBuilder().setTitle('🚫 Trade Cancelled').setColor(0xAAAAAA).setDescription(desc).setTimestamp(), 'trade');
+        return;
       }
 
       if (sub === 'add' || sub === 'rem' || sub === 'remove') {
@@ -2019,10 +2079,20 @@ client.on('messageCreate', async (message) => {
             { name: `${nameOf(t.b)} received`, value: recv(movedAtoB, cashA), inline: true },
             { name: 'New balances', value: `${nameOf(t.a)}: ${formatAmount(gd.purses[t.a])}\n${nameOf(t.b)}: ${formatAmount(gd.purses[t.b])}`, inline: false }
           ).setTimestamp();
+        // Detailed audit entry for the log channel
+        const logEmbed = new EmbedBuilder().setTitle('🔄 Trade Completed').setColor(0xFFD700)
+          .setDescription(`**${nameOf(t.a)}** ⇄ **${nameOf(t.b)}**  ·  value **${formatAmount(totA)}** each side`)
+          .addFields(
+            { name: `${nameOf(t.a)} → ${nameOf(t.b)}`, value: recv(movedAtoB, cashA), inline: true },
+            { name: `${nameOf(t.b)} → ${nameOf(t.a)}`, value: recv(movedBtoA, cashB), inline: true },
+            { name: 'New balances', value: `${nameOf(t.a)}: ${formatAmount(gd.purses[t.a])}\n${nameOf(t.b)}: ${formatAmount(gd.purses[t.b])}`, inline: false }
+          )
+          .setFooter({ text: `Confirmed by ${message.author.tag}` })
+          .setTimestamp();
         gd.trade = null; scheduleAuctionSave();
         await flushAuction(); // persist the completed trade (squad ownership change)
         await message.channel.send({ embeds: [embed] });
-        await sendLog(message.guild, embed);
+        await sendLog(message.guild, logEmbed, 'trade');
         return;
       }
     }
