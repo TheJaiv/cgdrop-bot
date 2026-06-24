@@ -195,6 +195,7 @@ function getGuildData(guildId) {
       tradeChannel: null,  // optional override for trade logs
       purses: {},
       squads: {},
+      teams: {},           // userId -> team name
       auction: null,
       queue: [],
       difference: 500000,
@@ -226,6 +227,34 @@ function formatAmount(amount) {
 }
 
 function fmt(n) { return Number(n || 0).toLocaleString(); }
+
+// ── Team-name helpers ───────────────────────────────────────────────────────
+function displayNameOf(guild, uid) {
+  const m = guild.members.cache.get(uid);
+  return m ? m.displayName : `User ${uid}`;
+}
+function teamNameOf(gd, uid) { return (gd.teams && gd.teams[uid]) || null; }
+// Team name only (no personal name) — for SOLD logs & bids.
+function teamOnly(gd, guild, uid) { return teamNameOf(gd, uid) || displayNameOf(guild, uid); }
+// Team name with the person's name visible too — for squads, balances, leaderboard, etc.
+function teamLabel(gd, guild, uid) {
+  const t = teamNameOf(gd, uid), n = displayNameOf(guild, uid);
+  return t ? `${t} (${n})` : n;
+}
+// Resolve a target from a mention, a team name, or a raw id; defaults to self.
+// Returns { id, member|null } or null if a name/id was given but not found.
+function resolveMemberTarget(gd, message, argText) {
+  const mention = message.mentions.members.first();
+  if (mention) return { id: mention.id, member: mention };
+  const q = (argText || '').replace(/<@!?\d+>/g, '').trim();
+  if (!q) return { id: message.member.id, member: message.member };
+  if (gd.teams) {
+    const found = Object.entries(gd.teams).find(([, name]) => name.toLowerCase() === q.toLowerCase());
+    if (found) return { id: found[0], member: message.guild.members.cache.get(found[0]) || null };
+  }
+  if (/^\d{5,}$/.test(q)) return { id: q, member: message.guild.members.cache.get(q) || null };
+  return null;
+}
 
 // Parse multi-entry queue text (one per line or comma-separated).
 // Each entry: "<player...> <base> [increment]". Returns parsed items + unparsable lines.
@@ -464,7 +493,8 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}cq\``,                          value: 'Clear queue *(Admin/Auctioneer)*', inline: true },
       { name: `\`${aucPfx}bal [@user]\``,                 value: 'Check purse balance', inline: true },
       { name: `\`${aucPfx}lb\``,                          value: 'Purse leaderboard', inline: true },
-      { name: `\`${aucPfx}squad [@user]\``,               value: "View someone's squad", inline: true },
+      { name: `\`${aucPfx}team [@user] <name>\``,         value: 'Set a team name (yours, or anyone if Admin/Auctioneer) — `clear` to remove', inline: true },
+      { name: `\`${aucPfx}squad [@user|team]\``,          value: "View a squad by mention or team name", inline: true },
       { name: `\`${aucPfx}ss\``,                          value: 'Squad status vs min/max limits', inline: true },
       { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem <player>`, `trade cash <amount>`, `view/accept/cancel` — both sides must total the same value (players + cash)', inline: false }
     )
@@ -643,7 +673,7 @@ function sumOffer(offer) { return (offer || []).reduce((s, p) => s + (p.price ||
 
 function tradeEmbed(gd, guild, aucPfx) {
   const t = gd.trade;
-  const nameOf = (uid) => { const m = guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
+  const nameOf = (uid) => teamLabel(gd, guild, uid);
   const fmtSide = (offer, cash) => {
     const lines = offer.map(p => `• **${p.player}** (${formatAmount(p.price)})`);
     if (cash > 0) lines.push(`💰 **${formatAmount(cash)}** cash`);
@@ -688,7 +718,7 @@ async function doSold(guild, channel, gd) {
     const squadSize = gd.squads[bidderId].length;
     embed = new EmbedBuilder()
       .setTitle('🔨 SOLD!')
-      .setDescription(`**${player}** has been sold to **${bidderName}** for **${formatAmount(bid)}**!`)
+      .setDescription(`**${player}** has been sold to **${teamOnly(gd, guild, bidderId)}** for **${formatAmount(bid)}**!`)
       .setColor(0xFFD700)
       .addFields(
         { name: 'Remaining Balance', value: formatAmount(gd.purses[bidderId]), inline: true },
@@ -1492,9 +1522,9 @@ client.on('messageCreate', async (message) => {
       scheduleAuctionSave();
       const embed = new EmbedBuilder().setTitle('💸 New Bid Placed!').setColor(0x00CC00)
         .addFields(
-          { name: 'Player', value: auction.player,          inline: true },
-          { name: 'Bid',    value: formatAmount(bidAmt),    inline: true },
-          { name: 'Bidder', value: `<@${userId}>`,          inline: true }
+          { name: 'Player', value: auction.player,                          inline: true },
+          { name: 'Bid',    value: formatAmount(bidAmt),                    inline: true },
+          { name: 'Bidder', value: teamOnly(gd, message.guild, userId),     inline: true }
         );
       if (gd.auctionTimer) embed.setFooter({ text: `⏱️ Timer reset to ${gd.auctionTimer}s.` });
       embed.setTimestamp();
@@ -1650,13 +1680,44 @@ client.on('messageCreate', async (message) => {
       await message.channel.send(`🗑️ Cleared **${count}** player(s) from the queue.`); return;
     }
 
-    // .bal / .b / .wallet
+    // .team [@user] <name> — set a team name (self, or anyone if Admin/Auctioneer).
+    // `clear` removes it. No name shows the current one.
+    if (cmd === 'team' || cmd === 'setteam') {
+      if (!gd.teams) gd.teams = {};
+      const mentioned = message.mentions.members.first();
+      const target = mentioned || message.member;
+      if (target.id !== userId && !hasAuctionPermission(message.member)) {
+        await message.channel.send("❌ You need **Administrator** or **Auctioneer** role to set someone else's team name."); return;
+      }
+      let nameRaw = aucRaw.slice(parts[0].length).replace(/<@!?\d+>/g, '').trim();
+      if (!nameRaw) {
+        const cur = gd.teams[target.id];
+        await message.channel.send(cur
+          ? `🏷️ **${target.displayName}**'s team name is **${cur}**.`
+          : `🏷️ **${target.displayName}** has no team name yet. Set with \`${aucPfx}team ${target.id === userId ? '' : '@user '}<name>\`.`);
+        return;
+      }
+      if (['clear', 'remove', 'none', 'reset'].includes(nameRaw.toLowerCase())) {
+        delete gd.teams[target.id]; scheduleAuctionSave();
+        await message.channel.send(`🏷️ Cleared **${target.displayName}**'s team name.`); return;
+      }
+      nameRaw = nameRaw.slice(0, 50);
+      gd.teams[target.id] = nameRaw; scheduleAuctionSave();
+      const embed = new EmbedBuilder().setTitle('🏷️ Team Name Set').setColor(0x00B0F4)
+        .setDescription(`${target} is now **${nameRaw}**.`)
+        .setFooter({ text: `Set by ${message.author.tag}` });
+      await message.channel.send({ embeds: [embed] }); return;
+    }
+
+    // .bal / .wallet [@user | teamname]
     if (cmd === 'bal' || cmd === 'wallet') {
-      const target   = message.mentions.members.first() || message.member;
-      const amount   = gd.purses[target.id] || 0;
-      const embed = new EmbedBuilder().setTitle(`💼 ${target.displayName}'s Wallet`)
-        .setDescription(`**Balance:** ${formatAmount(amount)}`).setColor(0xFFD700)
-        .setThumbnail(target.user.displayAvatarURL());
+      const argText  = aucRaw.slice(parts[0].length).trim();
+      const resolved = resolveMemberTarget(gd, message, argText);
+      if (!resolved) { await message.channel.send(`❌ No member or team named "${argText}" found.`); return; }
+      const amount = gd.purses[resolved.id] || 0;
+      const embed = new EmbedBuilder().setTitle(`💼 ${teamLabel(gd, message.guild, resolved.id)}'s Wallet`)
+        .setDescription(`**Balance:** ${formatAmount(amount)}`).setColor(0xFFD700);
+      if (resolved.member) embed.setThumbnail(resolved.member.user.displayAvatarURL());
       await message.channel.send({ embeds: [embed] }); return;
     }
 
@@ -1670,8 +1731,7 @@ client.on('messageCreate', async (message) => {
       } else {
         const medals = ['🥇','🥈','🥉'];
         const lines  = sorted.slice(0, 10).map(([uid, amt], i) => {
-          const member = message.guild.members.cache.get(uid);
-          const name   = member ? member.displayName : `User ${uid}`;
+          const name   = teamLabel(gd, message.guild, uid);
           const medal  = i < 3 ? medals[i] : `\`${i+1}.\``;
           return `${medal} **${name}** — ${formatAmount(amt)}`;
         });
@@ -1680,12 +1740,14 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [embed] }); return;
     }
 
-    // .squad
+    // .squad [@user | teamname]
     if (cmd === 'squad') {
-      const target  = message.mentions.members.first() || message.member;
-      const players = (gd.squads && gd.squads[target.id]) || [];
-      const embed   = new EmbedBuilder().setTitle(`🏏 ${target.displayName}'s Squad`).setColor(0x0099FF)
-        .setThumbnail(target.user.displayAvatarURL()).setTimestamp();
+      const argText  = aucRaw.slice(parts[0].length).trim();
+      const resolved = resolveMemberTarget(gd, message, argText);
+      if (!resolved) { await message.channel.send(`❌ No member or team named "${argText}" found.`); return; }
+      const players = (gd.squads && gd.squads[resolved.id]) || [];
+      const embed   = new EmbedBuilder().setTitle(`🏏 ${teamLabel(gd, message.guild, resolved.id)}'s Squad`).setColor(0x0099FF).setTimestamp();
+      if (resolved.member) embed.setThumbnail(resolved.member.user.displayAvatarURL());
       if (players.length === 0) {
         embed.setDescription('No players bought yet.');
       } else {
@@ -1711,8 +1773,7 @@ client.on('messageCreate', async (message) => {
         embed.addFields({ name: 'Teams', value: 'No squads yet.', inline: false });
       } else {
         const lines = entries.sort((a, b) => b[1].length - a[1].length).map(([uid, arr]) => {
-          const member = message.guild.members.cache.get(uid);
-          const name   = member ? member.displayName : `User ${uid}`;
+          const name   = teamLabel(gd, message.guild, uid);
           const n      = arr.length;
           let mark = ' ✅';
           if (min && n < min)        mark = ` ⚠️ need ${min - n}`;
@@ -2062,7 +2123,7 @@ client.on('messageCreate', async (message) => {
         gd.purses[t.a] = purseA - cashA + cashB;
         gd.purses[t.b] = purseB - cashB + cashA;
 
-        const nameOf = (uid) => { const m = message.guild.members.cache.get(uid); return m ? m.displayName : `User ${uid}`; };
+        const nameOf = (uid) => teamLabel(gd, message.guild, uid);
         const recv = (players, cash) => {
           const lines = players.map(p => `**${p.player}** (${formatAmount(p.price)})`);
           if (cash > 0) lines.push(`💰 ${formatAmount(cash)} cash`);
