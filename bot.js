@@ -481,7 +481,7 @@ function auctionHelpPage1(aucPfx, navHint) {
     .setDescription(`Prefix: \`${aucPfx}\``)
     .addFields(
       { name: `\`${aucPfx}sell <player> <base> [inc]\``, value: 'Start an auction *(Admin/Auctioneer)*', inline: false },
-      { name: `\`${aucPfx}bid <amount>\``,                value: 'Place a bid — omit amount to auto +increment', inline: false },
+      { name: `\`${aucPfx}bid\` / \`${aucPfx}b\``,          value: 'Place a bid — opens at base, then raises by the increment (no direct jumps)', inline: false },
       { name: `\`${aucPfx}sold\``,                        value: 'End auction & auto-start next from queue *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}aq <player> <base> [inc]\``,   value: 'Add to queue — multiple at once, one per line or comma-separated *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}aqs <set> <players…>\``,        value: 'Add players under a named set — queue auto-stops at the end of each set *(Admin/Auctioneer)*', inline: false },
@@ -1506,15 +1506,9 @@ client.on('messageCreate', async (message) => {
       }
 
       const userPurse = gd.purses[userId] || 0;
-      let bidAmt;
-      if (!parts[1]) {
-        bidAmt = auction.current_bid + auction.difference;
-      } else {
-        bidAmt = parseAmount(parts[1]);
-        if (!bidAmt) { await message.channel.send('❌ Invalid bid amount.'); return; }
-      }
-      const minBid = auction.highest_bidder_id ? auction.current_bid + auction.difference : auction.base;
-      if (bidAmt < minBid) { await message.channel.send(`❌ Minimum bid is **${formatAmount(minBid)}**.`); return; }
+      // Increment-only bidding — no direct jumps. Any amount typed is ignored.
+      // First bid opens at the base price; every bid after raises by the increment.
+      const bidAmt = auction.highest_bidder_id ? auction.current_bid + auction.difference : auction.base;
       if (userPurse < bidAmt) { await message.channel.send(`❌ Insufficient funds! Your balance: **${formatAmount(userPurse)}**`); return; }
       auction.current_bid       = bidAmt;
       auction.highest_bidder    = message.member.displayName;
