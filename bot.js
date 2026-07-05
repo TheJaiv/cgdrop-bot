@@ -517,6 +517,8 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse, squad & team name *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}dm @role <msg>\``,                 value: 'DM the message to everyone with that role *(Owner or users granted via `dmallow`)*', inline: false },
+      { name: `\`${aucPfx}dmallow/dmdeny @user\` / \`${aucPfx}dmlist\``, value: 'Grant/revoke/list `.dm` permission *(Owner only)*', inline: false },
       { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
       { name: '`/sell` `/setauctionprefix` `/setcgprefix`',    value: 'Slash commands', inline: false }
     )
@@ -569,9 +571,10 @@ function startAuctionTimer(guild, channel, gd) {
 
   schedule(async () => {
     if (state.cancelled) return;
-    auctionTimers.delete(gid);
-    if (!gd.auction) return;
+    if (!gd.auction) { auctionTimers.delete(gid); return; }
     if (countdownMsg) { try { await countdownMsg.edit("# ⏳ Time's up!"); } catch (_) {} }
+    if (state.cancelled) return; // a bid landed during the edit above → don't auto-sell
+    auctionTimers.delete(gid);
     await doSold(guild, channel, gd); // sells to highest bidder, or marks UNSOLD if no bids
   }, preWait + visible * 1000);
 }
@@ -1347,6 +1350,67 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // .dmallow / .dmdeny / .dmlist — owner grants who may use .dm in this server
+    if (cmd === 'dmallow' || cmd === 'dmdeny' || cmd === 'dmlist') {
+      if (userId !== OWNER_ID) { await message.channel.send('❌ Owner only!'); return; }
+      gd.dmAllowed = gd.dmAllowed || {};
+      if (cmd === 'dmlist') {
+        const entries = Object.values(gd.dmAllowed);
+        await message.channel.send(entries.length
+          ? `📨 **Users allowed to use \`${aucPfx}dm\`:**\n${entries.map(t => `• ${t}`).join('\n')}`
+          : `📨 No one has \`${aucPfx}dm\` permission in this server yet. Grant with \`${aucPfx}dmallow @user\`.`);
+        return;
+      }
+      const mentioned = message.mentions.members.first();
+      if (!mentioned) { await message.channel.send(`❌ Usage: \`${aucPfx}${cmd} @user\``); return; }
+      if (cmd === 'dmallow') {
+        gd.dmAllowed[mentioned.id] = mentioned.user.tag;
+        scheduleAuctionSave();
+        await message.channel.send(`✅ **${mentioned.user.tag}** can now use \`${aucPfx}dm @role <message>\` in this server.`);
+      } else {
+        if (!gd.dmAllowed[mentioned.id]) { await message.channel.send(`❌ **${mentioned.user.tag}** doesn't have \`${aucPfx}dm\` permission.`); return; }
+        delete gd.dmAllowed[mentioned.id];
+        scheduleAuctionSave();
+        await message.channel.send(`✅ \`${aucPfx}dm\` permission removed from **${mentioned.user.tag}**.`);
+      }
+      return;
+    }
+
+    // .dm @role <message> — DM everyone with that role (owner or dmallow'd users)
+    if (cmd === 'dm') {
+      const canDm = userId === OWNER_ID || !!(gd.dmAllowed && gd.dmAllowed[userId]);
+      if (!canDm) { await message.channel.send(`❌ You need permission from the owner to use this. (\`${aucPfx}dmallow\`)`); return; }
+
+      const role = message.mentions.roles.first();
+      if (!role || !parts[1]) { await message.channel.send(`❌ Usage: \`${aucPfx}dm @role <message>\``); return; }
+      // Everything after the role mention, newlines preserved
+      const roleToken = parts[1];
+      const msgText = aucRaw.slice(aucRaw.indexOf(roleToken) + roleToken.length).trim();
+      if (!msgText) { await message.channel.send(`❌ No message given. Usage: \`${aucPfx}dm @role <message>\``); return; }
+
+      // Populate the member cache so role.members is complete
+      try { await message.guild.members.fetch(); } catch (_) {}
+      const targets = role.members.filter(m => !m.user.bot);
+      if (targets.size === 0) { await message.channel.send(`❌ No (non-bot) members have the **${role.name}** role.`); return; }
+
+      const status = await message.channel.send(`📨 Sending DM to **${targets.size}** member(s) with **${role.name}**...`);
+      const dmEmbed = new EmbedBuilder()
+        .setTitle(`📨 Message for @${role.name}`)
+        .setDescription(msgText.slice(0, 4096))
+        .setColor(role.color || 0x5865F2)
+        .setFooter({ text: `Sent by ${message.author.tag} • ${message.guild.name}` })
+        .setTimestamp();
+
+      let sent = 0, failed = 0;
+      for (const member of targets.values()) {
+        try { await member.send({ embeds: [dmEmbed] }); sent++; }
+        catch (_) { failed++; } // DMs closed / blocked the bot
+        await new Promise(r => setTimeout(r, 350)); // stay under DM rate limits
+      }
+      await status.edit(`✅ DM sent to **${sent}** member(s) with **${role.name}**.${failed ? ` ⚠️ ${failed} couldn't be reached (DMs closed).` : ''}`).catch(() => {});
+      return;
+    }
+
     // .setpurse / .sp
     if (cmd === 'setpurse' || cmd === 'sp') {
       if (!hasAuctionPermission(message.member)) {
@@ -1514,6 +1578,9 @@ client.on('messageCreate', async (message) => {
       auction.highest_bidder    = message.member.displayName;
       auction.highest_bidder_id = userId;
       scheduleAuctionSave();
+      // Reset the countdown NOW — before any await — so a near-expiry timer is
+      // cancelled synchronously and can't auto-sell during the message send.
+      startAuctionTimer(message.guild, message.channel, gd);
       const embed = new EmbedBuilder().setTitle('💸 New Bid Placed!').setColor(0x00CC00)
         .addFields(
           { name: 'Player', value: auction.player,                          inline: true },
@@ -1523,8 +1590,6 @@ client.on('messageCreate', async (message) => {
       if (gd.auctionTimer) embed.setFooter({ text: `⏱️ Timer reset to ${gd.auctionTimer}s.` });
       embed.setTimestamp();
       await message.channel.send({ embeds: [embed] });
-      // Start / reset the countdown (only when a timer is configured)
-      startAuctionTimer(message.guild, message.channel, gd);
       return;
     }
 
