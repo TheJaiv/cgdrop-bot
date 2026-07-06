@@ -517,7 +517,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse, squad & team name *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin/Auctioneer)*', inline: false },
-      { name: `\`${aucPfx}dm @role|@user <msg>\``,           value: 'DM a user, or everyone with a role *(Owner or users granted via `dmallow`)*', inline: false },
+      { name: `\`${aucPfx}dm @role|@user|username <msg>\``,  value: 'DM a user (mention or username), or everyone with a role *(Owner or users granted via `dmallow`)*', inline: false },
       { name: `\`${aucPfx}dmallow/dmdeny @user\` / \`${aucPfx}dmlist\``, value: 'Grant/revoke/list `.dm` permission *(Owner only)*', inline: false },
       { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
       { name: '`/sell` `/setauctionprefix` `/setcgprefix`',    value: 'Slash commands', inline: false }
@@ -1381,19 +1381,28 @@ client.on('messageCreate', async (message) => {
       const canDm = userId === OWNER_ID || !!(gd.dmAllowed && gd.dmAllowed[userId]);
       if (!canDm) { await message.channel.send(`❌ You need permission from the owner to use this. (\`${aucPfx}dmallow\`)`); return; }
 
-      // Identify what was mentioned: <@&id> = role, <@id>/<@!id> = user
-      const role   = message.mentions.roles.first();
-      const member = message.mentions.members.first();
-      if ((!role && !member) || !parts[1]) { await message.channel.send(`❌ Usage: \`${aucPfx}dm @role <message>\` or \`${aucPfx}dm @user <message>\``); return; }
-      // Everything after the mention token, newlines preserved
+      // Target = first token after "dm": <@&id> = role mention, <@id>/<@!id> = user mention,
+      // anything else is treated as a username (the unique one, no @ needed)
+      if (!parts[1]) { await message.channel.send(`❌ Usage: \`${aucPfx}dm @role <message>\`, \`${aucPfx}dm @user <message>\` or \`${aucPfx}dm <username> <message>\``); return; }
       const mentionToken = parts[1];
       const msgText = aucRaw.slice(aucRaw.indexOf(mentionToken) + mentionToken.length).trim();
-      if (!msgText) { await message.channel.send(`❌ No message given. Usage: \`${aucPfx}dm @role|@user <message>\``); return; }
+      if (!msgText) { await message.channel.send(`❌ No message given. Usage: \`${aucPfx}dm @role|@user|<username> <message>\``); return; }
 
-      // The first token decides the mode — a role mention starts with <@&
       const isRoleTarget = /^<@&\d+>$/.test(mentionToken);
+      const isUserMention = /^<@!?\d+>$/.test(mentionToken);
+      const role = isRoleTarget ? message.mentions.roles.first() : null;
+      let member = isUserMention ? message.mentions.members.first() : null;
       if (isRoleTarget && !role) { await message.channel.send('❌ Could not resolve that role.'); return; }
-      if (!isRoleTarget && !member) { await message.channel.send('❌ Could not resolve that user.'); return; }
+      if (isUserMention && !member) { await message.channel.send('❌ Could not resolve that user.'); return; }
+
+      // Plain text → look the member up by username (case-insensitive)
+      if (!isRoleTarget && !member) {
+        try { await message.guild.members.fetch(); } catch (_) {}
+        const q = mentionToken.toLowerCase();
+        member = message.guild.members.cache.find(m => m.user.username.toLowerCase() === q)
+              || (/^\d{5,}$/.test(q) ? message.guild.members.cache.get(q) : null);
+        if (!member) { await message.channel.send(`❌ No member found with the username **${mentionToken}**.`); return; }
+      }
 
       let targets, targetLabel;
       if (isRoleTarget) {
