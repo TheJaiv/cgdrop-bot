@@ -517,7 +517,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse, squad & team name *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin/Auctioneer)*', inline: false },
-      { name: `\`${aucPfx}dm @role <msg>\``,                 value: 'DM the message to everyone with that role *(Owner or users granted via `dmallow`)*', inline: false },
+      { name: `\`${aucPfx}dm @role|@user <msg>\``,           value: 'DM a user, or everyone with a role *(Owner or users granted via `dmallow`)*', inline: false },
       { name: `\`${aucPfx}dmallow/dmdeny @user\` / \`${aucPfx}dmlist\``, value: 'Grant/revoke/list `.dm` permission *(Owner only)*', inline: false },
       { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
       { name: '`/sell` `/setauctionprefix` `/setcgprefix`',    value: 'Slash commands', inline: false }
@@ -1376,38 +1376,54 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // .dm @role <message> — DM everyone with that role (owner or dmallow'd users)
+    // .dm @role|@user <message> — DM a single user, or everyone with a role (owner or dmallow'd users)
     if (cmd === 'dm') {
       const canDm = userId === OWNER_ID || !!(gd.dmAllowed && gd.dmAllowed[userId]);
       if (!canDm) { await message.channel.send(`❌ You need permission from the owner to use this. (\`${aucPfx}dmallow\`)`); return; }
 
-      const role = message.mentions.roles.first();
-      if (!role || !parts[1]) { await message.channel.send(`❌ Usage: \`${aucPfx}dm @role <message>\``); return; }
-      // Everything after the role mention, newlines preserved
-      const roleToken = parts[1];
-      const msgText = aucRaw.slice(aucRaw.indexOf(roleToken) + roleToken.length).trim();
-      if (!msgText) { await message.channel.send(`❌ No message given. Usage: \`${aucPfx}dm @role <message>\``); return; }
+      // Identify what was mentioned: <@&id> = role, <@id>/<@!id> = user
+      const role   = message.mentions.roles.first();
+      const member = message.mentions.members.first();
+      if ((!role && !member) || !parts[1]) { await message.channel.send(`❌ Usage: \`${aucPfx}dm @role <message>\` or \`${aucPfx}dm @user <message>\``); return; }
+      // Everything after the mention token, newlines preserved
+      const mentionToken = parts[1];
+      const msgText = aucRaw.slice(aucRaw.indexOf(mentionToken) + mentionToken.length).trim();
+      if (!msgText) { await message.channel.send(`❌ No message given. Usage: \`${aucPfx}dm @role|@user <message>\``); return; }
 
-      // Populate the member cache so role.members is complete
-      try { await message.guild.members.fetch(); } catch (_) {}
-      const targets = role.members.filter(m => !m.user.bot);
-      if (targets.size === 0) { await message.channel.send(`❌ No (non-bot) members have the **${role.name}** role.`); return; }
+      // The first token decides the mode — a role mention starts with <@&
+      const isRoleTarget = /^<@&\d+>$/.test(mentionToken);
+      if (isRoleTarget && !role) { await message.channel.send('❌ Could not resolve that role.'); return; }
+      if (!isRoleTarget && !member) { await message.channel.send('❌ Could not resolve that user.'); return; }
 
-      const status = await message.channel.send(`📨 Sending DM to **${targets.size}** member(s) with **${role.name}**...`);
+      let targets, targetLabel;
+      if (isRoleTarget) {
+        // Populate the member cache so role.members is complete
+        try { await message.guild.members.fetch(); } catch (_) {}
+        targets = role.members.filter(m => !m.user.bot);
+        targetLabel = `@${role.name}`;
+        if (targets.size === 0) { await message.channel.send(`❌ No (non-bot) members have the **${role.name}** role.`); return; }
+      } else {
+        if (member.user.bot) { await message.channel.send('❌ Cannot DM a bot.'); return; }
+        targets = new Map([[member.id, member]]);
+        targetLabel = member.user.tag;
+      }
+
+      const count = targets.size;
+      const status = await message.channel.send(`📨 Sending DM to **${count}** member(s) — **${targetLabel}**...`);
       const dmEmbed = new EmbedBuilder()
-        .setTitle(`📨 Message for @${role.name}`)
+        .setTitle(`📨 Message for ${targetLabel}`)
         .setDescription(msgText.slice(0, 4096))
-        .setColor(role.color || 0x5865F2)
+        .setColor((isRoleTarget && role.color) || 0x5865F2)
         .setFooter({ text: `Sent by ${message.author.tag} • ${message.guild.name}` })
         .setTimestamp();
 
       let sent = 0, failed = 0;
-      for (const member of targets.values()) {
-        try { await member.send({ embeds: [dmEmbed] }); sent++; }
+      for (const m of targets.values()) {
+        try { await m.send({ embeds: [dmEmbed] }); sent++; }
         catch (_) { failed++; } // DMs closed / blocked the bot
-        await new Promise(r => setTimeout(r, 350)); // stay under DM rate limits
+        if (count > 1) await new Promise(r => setTimeout(r, 350)); // stay under DM rate limits
       }
-      await status.edit(`✅ DM sent to **${sent}** member(s) with **${role.name}**.${failed ? ` ⚠️ ${failed} couldn't be reached (DMs closed).` : ''}`).catch(() => {});
+      await status.edit(`✅ DM sent to **${sent}** member(s) — **${targetLabel}**.${failed ? ` ⚠️ ${failed} couldn't be reached (DMs closed).` : ''}`).catch(() => {});
       return;
     }
 
