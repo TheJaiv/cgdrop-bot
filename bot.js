@@ -518,6 +518,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}dm @role|@user|username <msg>\``,  value: 'DM a user (mention or username), or everyone with a role *(Owner or users granted via `dmallow`)*', inline: false },
+      { name: `\`${aucPfx}gdm @role|@user|username <msg>\``, value: 'Ghost DM — sends just the message, no sender/server info *(same permission as `dm`)*', inline: false },
       { name: `\`${aucPfx}dmallow/dmdeny @user\` / \`${aucPfx}dmlist\``, value: 'Grant/revoke/list `.dm` permission *(Owner only)*', inline: false },
       { name: `\`${aucPfx}approveauction\` / \`${aucPfx}approvecg\``, value: 'Approve server for bot features *(Owner only)*', inline: false },
       { name: '`/sell` `/setauctionprefix` `/setcgprefix`',    value: 'Slash commands', inline: false }
@@ -1376,17 +1377,20 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // .dm @role|@user <message> — DM a single user, or everyone with a role (owner or dmallow'd users)
-    if (cmd === 'dm') {
+    // .dm / .gdm @role|@user|username <message> — DM a single user, or everyone with a role
+    // (owner or dmallow'd users). .gdm is a "ghost" DM: just the raw message, no embed,
+    // no sender, no server name.
+    if (cmd === 'dm' || cmd === 'gdm') {
+      const ghost = cmd === 'gdm';
       const canDm = userId === OWNER_ID || !!(gd.dmAllowed && gd.dmAllowed[userId]);
       if (!canDm) { await message.channel.send(`❌ You need permission from the owner to use this. (\`${aucPfx}dmallow\`)`); return; }
 
-      // Target = first token after "dm": <@&id> = role mention, <@id>/<@!id> = user mention,
+      // Target = first token after the command: <@&id> = role mention, <@id>/<@!id> = user mention,
       // anything else is treated as a username (the unique one, no @ needed)
-      if (!parts[1]) { await message.channel.send(`❌ Usage: \`${aucPfx}dm @role <message>\`, \`${aucPfx}dm @user <message>\` or \`${aucPfx}dm <username> <message>\``); return; }
+      if (!parts[1]) { await message.channel.send(`❌ Usage: \`${aucPfx}${cmd} @role <message>\`, \`${aucPfx}${cmd} @user <message>\` or \`${aucPfx}${cmd} <username> <message>\``); return; }
       const mentionToken = parts[1];
       const msgText = aucRaw.slice(aucRaw.indexOf(mentionToken) + mentionToken.length).trim();
-      if (!msgText) { await message.channel.send(`❌ No message given. Usage: \`${aucPfx}dm @role|@user|<username> <message>\``); return; }
+      if (!msgText) { await message.channel.send(`❌ No message given. Usage: \`${aucPfx}${cmd} @role|@user|<username> <message>\``); return; }
 
       const isRoleTarget = /^<@&\d+>$/.test(mentionToken);
       const isUserMention = /^<@!?\d+>$/.test(mentionToken);
@@ -1418,21 +1422,26 @@ client.on('messageCreate', async (message) => {
       }
 
       const count = targets.size;
-      const status = await message.channel.send(`📨 Sending DM to **${count}** member(s) — **${targetLabel}**...`);
-      const dmEmbed = new EmbedBuilder()
-        .setTitle(`📨 Message for ${targetLabel}`)
-        .setDescription(msgText.slice(0, 4096))
-        .setColor((isRoleTarget && role.color) || 0x5865F2)
-        .setFooter({ text: `Sent by ${message.author.tag} • ${message.guild.name}` })
-        .setTimestamp();
+      const status = await message.channel.send(`📨 Sending ${ghost ? 'ghost ' : ''}DM to **${count}** member(s) — **${targetLabel}**...`);
+      let payload;
+      if (ghost) {
+        payload = { content: msgText.slice(0, 2000) }; // bare message — no embed, no sender, no server
+      } else {
+        payload = { embeds: [new EmbedBuilder()
+          .setTitle(`📨 Message for ${targetLabel}`)
+          .setDescription(msgText.slice(0, 4096))
+          .setColor((isRoleTarget && role.color) || 0x5865F2)
+          .setFooter({ text: `Sent by ${message.author.tag} • ${message.guild.name}` })
+          .setTimestamp()] };
+      }
 
       let sent = 0, failed = 0;
       for (const m of targets.values()) {
-        try { await m.send({ embeds: [dmEmbed] }); sent++; }
+        try { await m.send(payload); sent++; }
         catch (_) { failed++; } // DMs closed / blocked the bot
         if (count > 1) await new Promise(r => setTimeout(r, 350)); // stay under DM rate limits
       }
-      await status.edit(`✅ DM sent to **${sent}** member(s) — **${targetLabel}**.${failed ? ` ⚠️ ${failed} couldn't be reached (DMs closed).` : ''}`).catch(() => {});
+      await status.edit(`✅ ${ghost ? 'Ghost ' : ''}DM sent to **${sent}** member(s) — **${targetLabel}**.${failed ? ` ⚠️ ${failed} couldn't be reached (DMs closed).` : ''}`).catch(() => {});
       return;
     }
 
