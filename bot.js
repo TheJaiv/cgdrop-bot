@@ -2399,6 +2399,22 @@ if (!DISCORD_TOKEN) {
 client.on('error',      e => console.error('❌ Client error:', e));
 client.on('shardError', e => console.error('❌ Shard error:', e));
 client.on('warn',       w => console.warn('⚠️  Client warn:', w));
+// Temporary: surface gateway/session debug lines (skips heartbeat spam)
+client.on('debug', d => { if (/session|limit|gateway|identif|connect|429|rate/i.test(d)) console.log('🐛', d); });
+
+// Boot-time check: ask Discord directly how many gateway sessions we have left.
+// HTTP 401 = bad token · 429 = IP rate-banned · remaining 0 = session limit hit.
+if (DISCORD_TOKEN) {
+  (async () => {
+    try {
+      const res = await fetch('https://discord.com/api/v10/gateway/bot', {
+        headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
+      });
+      const j = await res.json().catch(() => ({}));
+      console.log(`🌐 /gateway/bot check → HTTP ${res.status} — session_start_limit: ${JSON.stringify(j.session_start_limit || j)}`);
+    } catch (e) { console.error('🌐 /gateway/bot check failed (network?):', e.message); }
+  })();
+}
 client.login(DISCORD_TOKEN)
   .then(() => console.log('🔑 Login accepted by Discord — waiting for ready event...'))
   .catch(err => console.error('❌ Discord LOGIN FAILED:', err));
