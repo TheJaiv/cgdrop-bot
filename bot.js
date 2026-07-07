@@ -2390,4 +2390,22 @@ http.createServer((req, res) => res.end('Bot is running!')).listen(PORT, () => {
   console.log(`🌐 HTTP server listening on port ${PORT}`);
 });
 
-client.login(DISCORD_TOKEN);
+// ── Login with loud diagnostics — every outcome must leave a log line ────────
+if (!DISCORD_TOKEN) {
+  console.error('❌ DISCORD_TOKEN env var is MISSING or empty — the bot cannot log in! Set it in Render → Environment.');
+} else {
+  console.log(`🔑 Logging in to Discord... (token present: ${DISCORD_TOKEN.length} chars)`);
+}
+client.on('error',      e => console.error('❌ Client error:', e));
+client.on('shardError', e => console.error('❌ Shard error:', e));
+client.on('warn',       w => console.warn('⚠️  Client warn:', w));
+client.login(DISCORD_TOKEN)
+  .then(() => console.log('🔑 Login accepted by Discord — waiting for ready event...'))
+  .catch(err => console.error('❌ Discord LOGIN FAILED:', err));
+
+// Watchdog: if we're still not connected 60s after boot, say so explicitly
+setTimeout(() => {
+  if (!client.isReady()) {
+    console.error('⏰ 60s after boot and still NOT connected to Discord. If no LOGIN FAILED error above, the gateway connection is hanging (possible session-start limit — it resets within 24h — or network issue).');
+  }
+}, 60_000);
