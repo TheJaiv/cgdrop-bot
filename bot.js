@@ -2368,17 +2368,19 @@ client.on('messageCreate', async (message) => {
 });
 
 process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
+process.on('uncaughtException', (err) => { console.error('Uncaught exception:', err); });
+process.on('exit', (code) => { console.log(`🛑 Process exiting with code ${code}`); });
 
 // ── Graceful shutdown — flush everything before going offline ──────────────
-async function shutdownFlush() {
-  console.log('⚠️  Shutdown detected — flushing data to JSONBin...');
+async function shutdownFlush(signal) {
+  console.log(`⚠️  Shutdown detected (${signal} — host asked the bot to stop) — flushing data to JSONBin...`);
   await flushAuction(); // auction first so the bin-id pointer is captured before cg saves
   await flushCg();
   console.log('✅ Flush complete. Exiting.');
   process.exit(0);
 }
-process.on('SIGTERM', shutdownFlush);
-process.on('SIGINT',  shutdownFlush);
+process.on('SIGTERM', () => shutdownFlush('SIGTERM'));
+process.on('SIGINT',  () => shutdownFlush('SIGINT'));
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  HTTP KEEPALIVE  (for Render / Railway / UptimeRobot)
