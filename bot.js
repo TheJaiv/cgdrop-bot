@@ -211,6 +211,7 @@ function getGuildData(guildId) {
       draftTeams: [],    // roster for the next draft (empty = everyone with a team name)
       draftPool: [],     // allowed player names (empty = any name; host-only visibility)
       draftAuto: false,  // false = pause after each round until the host runs nextround
+      draftPrefs: {},    // userId -> preferred player order, auto-drafted on timeout
     };
   }
   return auctionData.guilds[gid];
@@ -607,11 +608,53 @@ async function announceDraftTurn(guild, gd) {
   }, d.pickSeconds * 1000));
 }
 
-// 30s window expired with no valid name — log the skip and move on.
+// First player in this owner's preset order who is a real (pool) player and
+// not in any squad yet — null when there's nothing usable.
+function firstAvailableFromPrefs(gd, userId) {
+  const prefs = (gd.draftPrefs && gd.draftPrefs[userId]) || [];
+  const pool = gd.draftPool || [];
+  for (const name of prefs) {
+    let canon = name;
+    if (pool.length) {
+      canon = pool.find(n => normPlayer(n) === normPlayer(name));
+      if (!canon) continue;   // not a real player
+    }
+    if (!findTakenPlayer(gd, canon)) return canon;
+  }
+  return null;
+}
+
+// Record a pick (typed or auto) — squad, log line, announcements, then advance.
+async function commitDraftPick(guild, gd, slot, player, auto) {
+  const d = gd.draft;
+  clearDraftTimer(guild.id);
+  d.turnToken = (d.turnToken || 0) + 1;   // kill the running window
+  if (!gd.squads) gd.squads = {};
+  if (!gd.squads[slot.userId]) gd.squads[slot.userId] = [];
+  gd.squads[slot.userId].push({ player, price: 0 });
+  d.picks.push({ player, userId: slot.userId, round: slot.round, pick: slot.pick, makeup: slot.makeup, auto: !!auto });
+  if (slot.makeup) { d.skips[d.makeupIdx].filled = true; d.makeupIdx++; }
+  else d.idx++;
+  scheduleAuctionSave();
+  const ch = guild.channels.cache.get(d.channelId);
+  const autoNote = auto ? ' *(auto-drafted from their preset order)*' : '';
+  if (ch) await ch.send(`✅ **${teamOnly(gd, guild, slot.userId)}** takes **${player}** — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.${autoNote}`).catch(() => {});
+  const ping = teamPing(guild, gd, slot.userId);
+  const line = slot.makeup
+    ? `${ping} Takes **${player}** — makeup for Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.${autoNote}`
+    : `${ping} Takes **${player}** In Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.${autoNote}`;
+  await sendLogText(guild, line, 'draft');
+  await advanceDraft(guild, gd);
+}
+
+// 30s window expired — auto-draft from the owner's preset order if they have
+// a usable one, otherwise log the skip and move on.
 async function draftTimeoutSkip(guild, gd) {
   const d = gd.draft;
   const slot = draftSlot(gd);
   if (!slot) return;
+  const autoPick = firstAvailableFromPrefs(gd, slot.userId);
+  if (autoPick) return commitDraftPick(guild, gd, slot, autoPick, true);
   const ping = teamPing(guild, gd, slot.userId);
   const ch = guild.channels.cache.get(d.channelId);
   if (slot.makeup) {
@@ -718,23 +761,8 @@ async function handleDraftPickAttempt(message, gd) {
     await message.channel.send(`❌ **${taken.entry.player}** is already with **${by}**${when} — timer's still running, name someone else!`).catch(() => {});
     return;
   }
-  clearDraftTimer(message.guild.id);
-  d.turnToken = (d.turnToken || 0) + 1;   // kill the running window
-  if (!gd.squads) gd.squads = {};
-  if (!gd.squads[slot.userId]) gd.squads[slot.userId] = [];
-  gd.squads[slot.userId].push({ player, price: 0 });
-  d.picks.push({ player, userId: slot.userId, round: slot.round, pick: slot.pick, makeup: slot.makeup });
-  if (slot.makeup) { d.skips[d.makeupIdx].filled = true; d.makeupIdx++; }
-  else d.idx++;
-  scheduleAuctionSave();
   await message.react('✅').catch(() => {});
-  await message.channel.send(`✅ **${teamOnly(gd, message.guild, slot.userId)}** takes **${player}** — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.`).catch(() => {});
-  const ping = teamPing(message.guild, gd, slot.userId);
-  const line = slot.makeup
-    ? `${ping} Takes **${player}** — makeup for Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.`
-    : `${ping} Takes **${player}** In Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.`;
-  await sendLogText(message.guild, line, 'draft');
-  await advanceDraft(message.guild, gd);
+  await commitDraftPick(message.guild, gd, slot, player, false);
 }
 
 // ── Auction help pages (shared by !help auction and .ahelp) ────────────────
@@ -765,6 +793,7 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}draftpicks\``,                  value: 'All draft picks so far, grouped by team', inline: true },
       { name: `\`${aucPfx}draftteams\``,                  value: 'Teams in the (next) draft', inline: true },
       { name: `\`${aucPfx}owners\``,                      value: 'All owners with their squad sizes', inline: true },
+      { name: `\`${aucPfx}setorder <p1, p2, …>\``,        value: 'Your preset draft order — timeouts auto-draft your top available player (`myorder` DMs it, `setorder clear` removes)', inline: false },
       { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem <player>`, `trade cash <amount>`, `view/accept/cancel` — both sides must total the same value (players + cash)', inline: false }
     )
     .setFooter({ text: navHint });
@@ -2264,8 +2293,9 @@ client.on('messageCreate', async (message) => {
           return;
         }
         const sample = pool.slice(0, 10).join(', ');
+        const availableCount = pool.filter(n => !findTakenPlayer(gd, n)).length;
         const embed = new EmbedBuilder().setTitle('📋 Player Pool').setColor(0x00B2FF)
-          .setDescription(`**${pool.length}** players loaded — draft picks must exist in this list.\nFirst few: ${sample}${pool.length > 10 ? ', …' : ''}`)
+          .setDescription(`**${pool.length}** players loaded, **${availableCount}** still available (retained/bought/drafted ones aren't) — draft picks must exist in this list.\nFirst few: ${sample}${pool.length > 10 ? ', …' : ''}`)
           .setFooter({ text: `${aucPfx}draftpool <paste|.txt attachment> appends · ${aucPfx}draftpool clear resets` });
         await message.channel.send({ embeds: [embed] });
         return;
@@ -2292,6 +2322,46 @@ client.on('messageCreate', async (message) => {
       }
       scheduleAuctionSave();
       await message.channel.send(`✅ Added **${added}** player(s)${parsed.length - added ? ` (${parsed.length - added} duplicates skipped)` : ''} — pool is now **${gd.draftPool.length}**. Draft picks must exist in it.`);
+      return;
+    }
+
+    // .setorder — a team owner's preferred players; if their timer runs out the
+    // bot auto-drafts the top one still available. .myorder DMs the saved list.
+    if (cmd === 'setorder' || cmd === 'myorder') {
+      gd.draftPrefs = gd.draftPrefs || {};
+      if ((parts[1] || '').toLowerCase() === 'clear') {
+        delete gd.draftPrefs[userId]; scheduleAuctionSave();
+        await message.channel.send('🗑️ Your draft order is cleared — timeouts will skip you now.');
+        return;
+      }
+      if (cmd === 'myorder' || parts.length < 2) {
+        const list = gd.draftPrefs[userId] || [];
+        if (!list.length) { await message.channel.send(`❌ No draft order set — \`${aucPfx}setorder <player1, player2, …>\` (if your timer runs out, the top available one is auto-drafted).`); return; }
+        try {
+          await message.author.send(`📜 **Your draft order (${list.length}):**\n${list.map((n, i) => `${i + 1}. ${n}`).join('\n')}`.slice(0, 1900));
+          await message.channel.send('📬 Sent your draft order in DMs.');
+        } catch (_) {
+          await message.channel.send('❌ Could not DM you — enable DMs from server members and try again.');
+        }
+        return;
+      }
+      const names = parsePlayerList(aucRaw.replace(/^\S+\s*/, '')).slice(0, 200);
+      if (!names.length) { await message.channel.send('❌ No player names found — give them comma-separated or one per line.'); return; }
+      const pool = gd.draftPool || [];
+      let unknown = 0;
+      const cleaned = [];
+      for (const n of names) {
+        let canon = n;
+        if (pool.length) {
+          canon = pool.find(p => normPlayer(p) === normPlayer(n));
+          if (!canon) { unknown++; continue; }
+        }
+        if (!cleaned.some(c => normPlayer(c) === normPlayer(canon))) cleaned.push(canon);
+      }
+      if (!cleaned.length) { await message.channel.send('❌ None of those names exist in the player list.'); return; }
+      gd.draftPrefs[userId] = cleaned; scheduleAuctionSave();
+      await message.delete().catch(() => {});   // keep the order secret from rivals
+      await message.channel.send(`✅ Draft order saved for **${teamOnly(gd, message.guild, userId)}** — **${cleaned.length}** player(s)${unknown ? `, ${unknown} unknown name(s) dropped` : ''}. Timeouts now auto-draft your top available player.`);
       return;
     }
 
@@ -2610,6 +2680,16 @@ client.on('messageCreate', async (message) => {
       } else {
         playerName = words.join(' ');
         price = 0;
+      }
+      // Retention safety — use the pool's spelling, and never let two squads own the same player
+      const poolR = gd.draftPool || [];
+      if (poolR.length) {
+        const canon = poolR.find(n => normPlayer(n) === normPlayer(playerName));
+        if (canon) playerName = canon;
+      }
+      const already = findTakenPlayer(gd, playerName);
+      if (already) {
+        await message.channel.send(`❌ **${already.entry.player}** is already with **${teamOnly(gd, message.guild, already.userId)}** — remove them first with \`${aucPfx}delete\`.`); return;
       }
       if (!gd.squads) gd.squads = {};
       if (!gd.squads[target.id]) gd.squads[target.id] = [];
