@@ -212,6 +212,7 @@ function getGuildData(guildId) {
       draftPool: [],     // allowed player names (empty = any name; host-only visibility)
       draftAuto: false,  // false = pause after each round until the host runs nextround
       draftPrefs: {},    // userId -> preferred player order, auto-drafted on timeout
+      setorderEnabled: false, // preset orders are off until a manager runs autodraft on
     };
   }
   return auctionData.guilds[gid];
@@ -485,6 +486,8 @@ async function sendLog(guild, embed, type) {
 // ══════════════════════════════════════════════════════════════════════════════
 const draftTimers = new Map();   // guildId -> pick-window timeout
 const draftLocks  = new Map();   // guildId -> promise chain serialising picks vs timeouts
+const pendingSetorders = new Map(); // userId -> { guildId, expiresAt } — waiting for a DM reply
+const SETORDER_DM_MS = 10 * 60 * 1000;
 
 // A pick landing while the skip-timeout is mid-await (or vice versa) must not
 // both advance the draft — run every state transition one at a time per guild.
@@ -608,9 +611,56 @@ async function announceDraftTurn(guild, gd) {
   }, d.pickSeconds * 1000));
 }
 
+// Resolve a typed name against the pool: exact match first, else a unique
+// substring match ("kohli" -> "Virat Kohli"). Returns:
+//   { name }                — resolved (raw name passthrough when no pool)
+//   { ambiguous: [names] }  — several pool players match
+//   null                    — nothing in the pool matches
+function poolResolve(gd, raw) {
+  const clean = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!clean) return null;
+  const pool = gd.draftPool || [];
+  if (!pool.length) return { name: clean };
+  const q = normPlayer(clean);
+  const exact = pool.find(n => normPlayer(n) === q);
+  if (exact) return { name: exact };
+  const subs = pool.filter(n => normPlayer(n).includes(q));
+  if (subs.length === 1) return { name: subs[0] };
+  if (subs.length > 1) return { ambiguous: subs.slice(0, 5) };
+  return null;
+}
+
+// Parse + resolve a pasted order and store it. Shared by the DM flow and the
+// inline `.setorder <list>` form. Returns { cleaned, dropped } (dropped =
+// unknown or ambiguous names, in the user's own spelling).
+function saveDraftOrder(gd, userId, text) {
+  const names = parsePlayerList(text).slice(0, 200);
+  const cleaned = [], dropped = [];
+  for (const n of names) {
+    const r = poolResolve(gd, n);
+    if (!r || r.ambiguous) { dropped.push(n); continue; }
+    if (!cleaned.some(c => normPlayer(c) === normPlayer(r.name))) cleaned.push(r.name);
+  }
+  if (cleaned.length) {
+    gd.draftPrefs = gd.draftPrefs || {};
+    gd.draftPrefs[userId] = cleaned;
+    scheduleAuctionSave();
+  }
+  return { cleaned, dropped };
+}
+
+function draftOrderReply(cleaned, dropped) {
+  if (!cleaned.length) {
+    return `❌ None of those matched the player list — nothing saved.${dropped.length ? `\nNot found/ambiguous: ${dropped.slice(0, 10).join(', ')}${dropped.length > 10 ? ', …' : ''}` : ''}`;
+  }
+  return `✅ Draft order saved — **${cleaned.length}** player(s). If your timer runs out, the top one still available is auto-drafted.`
+    + (dropped.length ? `\n⚠️ Dropped (not found/ambiguous): ${dropped.slice(0, 10).join(', ')}${dropped.length > 10 ? ', …' : ''}` : '');
+}
+
 // First player in this owner's preset order who is a real (pool) player and
 // not in any squad yet — null when there's nothing usable.
 function firstAvailableFromPrefs(gd, userId) {
+  if (!gd.setorderEnabled) return null;   // feature is manager-gated, off by default
   const prefs = (gd.draftPrefs && gd.draftPrefs[userId]) || [];
   const pool = gd.draftPool || [];
   for (const name of prefs) {
@@ -744,16 +794,17 @@ async function handleDraftPickAttempt(message, gd) {
     await message.channel.send(`❌ That doesn't look like a player name (too long) — timer's still running!`).catch(() => {});
     return;
   }
-  // Player pool loaded → the name must exist in it (and takes the pool's spelling)
-  const pool = gd.draftPool || [];
-  if (pool.length) {
-    const canon = pool.find(n => normPlayer(n) === normPlayer(player));
-    if (!canon) {
-      await message.channel.send(`❌ **${player}** doesn't exist in the player list — check the spelling, timer's still running!`).catch(() => {});
-      return;
-    }
-    player = canon;
+  // Player pool loaded → the name must exist in it ("kohli" resolves to Virat Kohli)
+  const resolved = poolResolve(gd, player);
+  if (!resolved) {
+    await message.channel.send(`❌ **${player}** doesn't exist in the player list — check the spelling, timer's still running!`).catch(() => {});
+    return;
   }
+  if (resolved.ambiguous) {
+    await message.channel.send(`❌ **${player}** matches several players: ${resolved.ambiguous.map(n => `**${n}**`).join(', ')} — be more specific, timer's still running!`).catch(() => {});
+    return;
+  }
+  player = resolved.name;
   const taken = findTakenPlayer(gd, player);
   if (taken) {
     const by = teamOnly(gd, message.guild, taken.userId);
@@ -793,7 +844,7 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}draftpicks\``,                  value: 'All draft picks so far, grouped by team', inline: true },
       { name: `\`${aucPfx}draftteams\``,                  value: 'Teams in the (next) draft', inline: true },
       { name: `\`${aucPfx}owners\``,                      value: 'All owners with their squad sizes', inline: true },
-      { name: `\`${aucPfx}setorder <p1, p2, …>\``,        value: 'Your preset draft order — timeouts auto-draft your top available player (`myorder` DMs it, `setorder clear` removes)', inline: false },
+      { name: `\`${aucPfx}setorder\``,                    value: 'Set your preset draft order **privately in DMs** — timeouts auto-draft your top available player (`myorder` views it, `setorder clear` removes; needs `autodraft on`)', inline: false },
       { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem <player>`, `trade cash <amount>`, `view/accept/cancel` — both sides must total the same value (players + cash)', inline: false }
     )
     .setFooter({ text: navHint });
@@ -811,6 +862,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}draftstart <rounds> [secs]\``,     value: 'Start a draft — random order each round, timed picks typed in the channel; skips get a second chance after all rounds', inline: false },
       { name: `\`${aucPfx}draftadd @user [team name]\``,     value: 'Add an owner to the draft roster, optionally setting their team name too — `draftremove @user` drops them (unset roster = everyone with a team name)', inline: false },
       { name: `\`${aucPfx}nextround\` / \`${aucPfx}draftauto on|off\``, value: 'Rounds pause after showing the new order — `nextround` starts the next one; `draftauto on` makes them start automatically', inline: false },
+      { name: `\`${aucPfx}autodraft on|off\``,               value: 'Allow owners to set preset orders (setorder) so timeouts auto-draft — off by default', inline: false },
       { name: `\`${aucPfx}draftpool [clear]\``,              value: 'Load the player list (paste it or attach the .txt) — draft picks must then be real players from it', inline: false },
       { name: `\`${aucPfx}draftstop\` / \`${aucPfx}draftresume\``, value: 'Cancel the draft, or restart the current pick timer (e.g. after a bot restart)', inline: false },
       { name: `\`${aucPfx}ssl <min> <max>\``,                value: 'Set min/max squad size (0 = none)', inline: true },
@@ -1274,6 +1326,28 @@ client.on('messageCreate', async (message) => {
   const cgPfx      = guildId ? getCgPrefix(guildId)      : DEFAULT_CGDROP_PREFIX;
   const aucPfx     = guildId ? getAuctionPrefix(guildId) : DEFAULT_AUCTION_PREFIX;
   const userId     = message.author.id;
+
+  // ── DM replies for setorder (draft order arrives privately) ─────────────
+  if (!message.guild && pendingSetorders.has(userId)) {
+    const pending = pendingSetorders.get(userId);
+    if (Date.now() > pending.expiresAt) {
+      pendingSetorders.delete(userId);
+      await message.channel.send('⌛ That setorder request expired — run `setorder` in the server again.');
+      return;
+    }
+    let text = content;
+    const att = message.attachments.first();
+    if (att) {
+      if (att.size > 2 * 1024 * 1024) { await message.channel.send('❌ File too big (max 2 MB).'); return; }
+      try { text = await (await fetch(att.url)).text(); }
+      catch (_) { await message.channel.send('❌ Could not read the attachment — try again.'); return; }
+    }
+    const gdDm = getGuildData(pending.guildId);
+    const { cleaned, dropped } = saveDraftOrder(gdDm, userId, text);
+    if (cleaned.length) pendingSetorders.delete(userId);   // otherwise keep listening so they can retry
+    await message.channel.send(draftOrderReply(cleaned, dropped));
+    return;
+  }
 
   // ── Determine which prefix was used ──────────────────────────────────────
   const usesCg  = content.startsWith(cgPfx);
@@ -2326,17 +2400,23 @@ client.on('messageCreate', async (message) => {
     }
 
     // .setorder — a team owner's preferred players; if their timer runs out the
-    // bot auto-drafts the top one still available. .myorder DMs the saved list.
+    // bot auto-drafts the top one still available. Plain `.setorder` moves to
+    // DMs so the order stays secret; `.myorder` DMs the saved list back.
     if (cmd === 'setorder' || cmd === 'myorder') {
+      if (!gd.setorderEnabled) {
+        await message.channel.send(`❌ Preset draft orders are **disabled** here — an admin can turn them on with \`${aucPfx}autodraft on\`.`);
+        return;
+      }
       gd.draftPrefs = gd.draftPrefs || {};
       if ((parts[1] || '').toLowerCase() === 'clear') {
         delete gd.draftPrefs[userId]; scheduleAuctionSave();
+        pendingSetorders.delete(userId);
         await message.channel.send('🗑️ Your draft order is cleared — timeouts will skip you now.');
         return;
       }
-      if (cmd === 'myorder' || parts.length < 2) {
+      if (cmd === 'myorder') {
         const list = gd.draftPrefs[userId] || [];
-        if (!list.length) { await message.channel.send(`❌ No draft order set — \`${aucPfx}setorder <player1, player2, …>\` (if your timer runs out, the top available one is auto-drafted).`); return; }
+        if (!list.length) { await message.channel.send(`❌ No draft order set — run \`${aucPfx}setorder\` and I'll ask for it in DMs.`); return; }
         try {
           await message.author.send(`📜 **Your draft order (${list.length}):**\n${list.map((n, i) => `${i + 1}. ${n}`).join('\n')}`.slice(0, 1900));
           await message.channel.send('📬 Sent your draft order in DMs.');
@@ -2345,23 +2425,28 @@ client.on('messageCreate', async (message) => {
         }
         return;
       }
-      const names = parsePlayerList(aucRaw.replace(/^\S+\s*/, '')).slice(0, 200);
-      if (!names.length) { await message.channel.send('❌ No player names found — give them comma-separated or one per line.'); return; }
-      const pool = gd.draftPool || [];
-      let unknown = 0;
-      const cleaned = [];
-      for (const n of names) {
-        let canon = n;
-        if (pool.length) {
-          canon = pool.find(p => normPlayer(p) === normPlayer(n));
-          if (!canon) { unknown++; continue; }
+      // `.setorder` with no list → ask for it in DMs
+      if (parts.length < 2) {
+        try {
+          await message.author.send(
+            `📝 **Draft order for ${message.guild.name}** — reply here with your preferred players, top choice first.\n` +
+            `Comma-separated or one per line (a .txt attachment works too). You have 10 minutes.\n` +
+            `If your pick timer runs out, I auto-draft your highest player still available. Short names are fine ("kohli" → Virat Kohli).`
+          );
+          pendingSetorders.set(userId, { guildId, expiresAt: Date.now() + SETORDER_DM_MS });
+          await message.channel.send('📬 Check your DMs — send me your order there so nobody else sees it.');
+        } catch (_) {
+          await message.channel.send(`❌ Could not DM you — enable DMs from server members, or use \`${aucPfx}setorder <player1, player2, …>\` (I'll delete your message right after).`);
         }
-        if (!cleaned.some(c => normPlayer(c) === normPlayer(canon))) cleaned.push(canon);
+        return;
       }
-      if (!cleaned.length) { await message.channel.send('❌ None of those names exist in the player list.'); return; }
-      gd.draftPrefs[userId] = cleaned; scheduleAuctionSave();
-      await message.delete().catch(() => {});   // keep the order secret from rivals
-      await message.channel.send(`✅ Draft order saved for **${teamOnly(gd, message.guild, userId)}** — **${cleaned.length}** player(s)${unknown ? `, ${unknown} unknown name(s) dropped` : ''}. Timeouts now auto-draft your top available player.`);
+      // Inline form — still supported; the message is deleted to keep it secret
+      const { cleaned, dropped } = saveDraftOrder(gd, userId, aucRaw.replace(/^\S+\s*/, ''));
+      await message.delete().catch(() => {});
+      await message.channel.send(`${draftOrderReply(cleaned, dropped).split('\n')[0]} *(tip: plain \`${aucPfx}setorder\` does this privately in DMs)*`);
+      if (dropped.length) {
+        await message.author.send(draftOrderReply(cleaned, dropped)).catch(() => {});
+      }
       return;
     }
 
@@ -2403,6 +2488,22 @@ client.on('messageCreate', async (message) => {
       scheduleAuctionSave();
       await withDraftLock(guildId, () => announceDraftTurn(message.guild, gd))
         .catch(e => console.error('nextround error:', e));
+      return;
+    }
+
+    // .autodraft on|off — allow preset orders + timeout auto-drafting (default: off)
+    if (cmd === 'autodraft') {
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
+      const sub = (parts[1] || '').toLowerCase();
+      if (sub !== 'on' && sub !== 'off') {
+        await message.channel.send(`⚙️ Preset draft orders are **${gd.setorderEnabled ? 'ON' : 'OFF'}** — \`${aucPfx}autodraft on|off\`. When on, owners can \`${aucPfx}setorder\` and timeouts auto-draft their top available player.`);
+        return;
+      }
+      gd.setorderEnabled = (sub === 'on');
+      scheduleAuctionSave();
+      await message.channel.send(gd.setorderEnabled
+        ? `✅ Preset orders **enabled** — owners can now \`${aucPfx}setorder\` (asked in DMs); timeouts auto-draft their top available player.`
+        : '✅ Preset orders **disabled** — timeouts simply skip the pick again.');
       return;
     }
 
@@ -2513,15 +2614,13 @@ client.on('messageCreate', async (message) => {
     if (cmd === 'taken' || cmd === 'picked') {
       const q = parts.slice(1).join(' ').trim();
       if (!q) { await message.channel.send(`❌ Usage: \`${aucPfx}taken <player>\``); return; }
-      const hit = findTakenPlayer(gd, q);
+      let hit = findTakenPlayer(gd, q);   // exact squad match first (covers off-pool retentions)
       if (!hit) {
-        const pool = gd.draftPool || [];
-        if (pool.length) {
-          const canon = pool.find(n => normPlayer(n) === normPlayer(q));
-          if (!canon) { await message.channel.send(`⚠️ **${q}** doesn't exist in the player list at all — check the spelling.`); return; }
-          await message.channel.send(`🟢 **${canon}** is not taken — free to pick!`); return;
-        }
-        await message.channel.send(`🟢 **${q}** is not taken — free to pick!`); return;
+        const r = poolResolve(gd, q);
+        if (!r) { await message.channel.send(`⚠️ **${q}** doesn't exist in the player list at all — check the spelling.`); return; }
+        if (r.ambiguous) { await message.channel.send(`🔎 **${q}** matches several players: ${r.ambiguous.map(n => `**${n}**`).join(', ')} — be more specific.`); return; }
+        hit = findTakenPlayer(gd, r.name);
+        if (!hit) { await message.channel.send(`🟢 **${r.name}** is not taken — free to pick!`); return; }
       }
       const by = teamLabel(gd, message.guild, hit.userId);
       if (hit.pickInfo) {
