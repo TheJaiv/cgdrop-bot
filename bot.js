@@ -863,6 +863,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}draftadd @user [team name]\``,     value: 'Add an owner to the draft roster, optionally setting their team name too — `draftremove @user` drops them (unset roster = everyone with a team name)', inline: false },
       { name: `\`${aucPfx}nextround\` / \`${aucPfx}draftauto on|off\``, value: 'Rounds pause after showing the new order — `nextround` starts the next one; `draftauto on` makes them start automatically', inline: false },
       { name: `\`${aucPfx}autodraft on|off\``,               value: 'Allow owners to set preset orders (setorder) so timeouts auto-draft — off by default', inline: false },
+      { name: `\`${aucPfx}resetall [full]\``,                value: 'Wipe ALL squads, draft, pool & preset orders for a fresh season (`full` = team names & purses too) — asks for confirm', inline: false },
       { name: `\`${aucPfx}draftpool [clear]\``,              value: 'Load the player list (paste it or attach the .txt) — draft picks must then be real players from it', inline: false },
       { name: `\`${aucPfx}draftstop\` / \`${aucPfx}draftresume\``, value: 'Cancel the draft, or restart the current pick timer (e.g. after a bot restart)', inline: false },
       { name: `\`${aucPfx}ssl <min> <max>\``,                value: 'Set min/max squad size (0 = none)', inline: true },
@@ -2332,6 +2333,28 @@ client.on('messageCreate', async (message) => {
       gd.draft.active = false;
       scheduleAuctionSave();
       await message.channel.send(`🛑 Draft stopped — **${gd.draft.picks.length}** pick(s) already made stay in the squads.`);
+      return;
+    }
+
+    // .resetall [full] confirm — wipe the server's draft data for a fresh season
+    if (cmd === 'resetall') {
+      if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
+      const full = (parts[1] || '').toLowerCase() === 'full';
+      const confirmed = parts.map(p => p.toLowerCase()).includes('confirm');
+      if (!confirmed) {
+        await message.channel.send(
+          `⚠️ **This wipes for the whole server:** all squads, the draft (state, picks, roster), the player pool and every preset order.` +
+          (full ? ' **Plus all team names and purses.**' : ` Team names & purses stay (\`${aucPfx}resetall full\` wipes those too).`) +
+          `\nType \`${aucPfx}resetall ${full ? 'full ' : ''}confirm\` to do it.`);
+        return;
+      }
+      clearDraftTimer(guildId);
+      for (const [uid, p] of pendingSetorders) { if (p.guildId === guildId) pendingSetorders.delete(uid); }
+      gd.squads = {}; gd.draft = null; gd.draftTeams = []; gd.draftPool = []; gd.draftPrefs = {};
+      if (full) { gd.teams = {}; gd.purses = {}; }
+      scheduleAuctionSave();
+      await flushAuction(); // a wipe must hit JSONBin immediately
+      await message.channel.send(`🧹 **Server reset complete** — squads, draft, pool and preset orders wiped${full ? ', plus team names and purses' : ''}. Fresh season!`);
       return;
     }
 
