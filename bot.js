@@ -1,5 +1,5 @@
 const fs   = require('fs');
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const http = require('http');
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1166,7 +1166,9 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
-  ]
+    GatewayIntentBits.DirectMessages,   // setorder replies arrive in DMs
+  ],
+  partials: [Partials.Channel]          // DM channels are uncached — without this, DM messageCreate never fires
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1349,6 +1351,8 @@ client.on('messageCreate', async (message) => {
     await message.channel.send(draftOrderReply(cleaned, dropped));
     return;
   }
+  // Any other DM: ignore — every command below assumes a guild
+  if (!message.guild) return;
 
   // ── Determine which prefix was used ──────────────────────────────────────
   const usesCg  = content.startsWith(cgPfx);
