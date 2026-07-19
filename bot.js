@@ -681,7 +681,7 @@ async function commitDraftPick(guild, gd, slot, player, auto) {
   d.turnToken = (d.turnToken || 0) + 1;   // kill the running window
   if (!gd.squads) gd.squads = {};
   if (!gd.squads[slot.userId]) gd.squads[slot.userId] = [];
-  gd.squads[slot.userId].push({ player, price: 0 });
+  gd.squads[slot.userId].push({ player, price: 0, round: slot.round }); // round shown in .squad instead of a price
   d.picks.push({ player, userId: slot.userId, round: slot.round, pick: slot.pick, makeup: slot.makeup, auto: !!auto });
   if (slot.makeup) { d.skips[d.makeupIdx].filled = true; d.makeupIdx++; }
   else d.idx++;
@@ -2230,7 +2230,16 @@ client.on('messageCreate', async (message) => {
       if (players.length === 0) {
         embed.setDescription('No players bought yet.');
       } else {
-        embed.setDescription(players.map((p,i) => `\`${i+1}.\` **${p.player}** — ${formatAmount(p.price)}`).join('\n'));
+        // Drafted → round taken; bought → price; added with no price → retained
+        const draftRoundOf = (name) => {
+          const pk = ((gd.draft && gd.draft.picks) || []).find(x => x.userId === resolved.id && normPlayer(x.player) === normPlayer(name));
+          return pk ? pk.round : null;
+        };
+        embed.setDescription(players.map((p, i) => {
+          const r = p.round || draftRoundOf(p.player);
+          const tag = r ? `Draft — Round ${r}` : (p.price > 0 ? formatAmount(p.price) : 'Retained');
+          return `\`${i + 1}.\` **${p.player}** — ${tag}`;
+        }).join('\n'));
       }
       const min = gd.minSquad || 0, max = gd.maxSquad || 0;
       if (min || max) {
