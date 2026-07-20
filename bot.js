@@ -839,12 +839,12 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}team [@user] <name>\``,         value: 'Set a team name (yours, or anyone if Admin/Auctioneer) — `clear` to remove', inline: true },
       { name: `\`${aucPfx}squad [@user|team]\``,          value: "View a squad by mention or team name", inline: true },
       { name: `\`${aucPfx}ss\``,                          value: 'Squad status vs min/max limits', inline: true },
-      { name: `\`${aucPfx}taken <player>\``,              value: 'Is a player taken? By whom & which draft round', inline: true },
-      { name: `\`${aucPfx}draft\``,                       value: "Draft status — round, order, who's on the clock", inline: true },
-      { name: `\`${aucPfx}draftpicks\``,                  value: 'All draft picks so far, grouped by team', inline: true },
-      { name: `\`${aucPfx}draftteams\``,                  value: 'Teams in the (next) draft', inline: true },
-      { name: `\`${aucPfx}owners\``,                      value: 'All owners with their squad sizes', inline: true },
-      { name: `\`${aucPfx}setorder\``,                    value: 'Set your preset draft order **privately in DMs** — timeouts auto-draft your top available player (`myorder` views it, `setorder clear` removes; needs `autodraft on`)', inline: false },
+      { name: `\`${aucPfx}taken/s <player>\``,            value: 'Is a player taken? By whom & which draft round', inline: true },
+      { name: `\`${aucPfx}draft\` / \`${aucPfx}d\``,      value: "Draft status — round, order, who's on the clock", inline: true },
+      { name: `\`${aucPfx}draftpicks/dpk\``,              value: 'All draft picks so far, grouped by team', inline: true },
+      { name: `\`${aucPfx}draftteams/dt\``,               value: 'Teams in the (next) draft', inline: true },
+      { name: `\`${aucPfx}owners/o\``,                    value: 'All owners with their squad sizes', inline: true },
+      { name: `\`${aucPfx}setorder/so\``,                    value: 'Set your preset draft order **privately in DMs** — timeouts auto-draft your top available player (`myorder` views it, `setorder clear` removes; needs `autodraft on`)', inline: false },
       { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem <player>`, `trade cash <amount>`, `view/accept/cancel` — both sides must total the same value (players + cash)', inline: false }
     )
     .setFooter({ text: navHint });
@@ -859,16 +859,16 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}setpurse @user <amt>\``,           value: "Set a user's purse", inline: false },
       { name: `\`${aucPfx}sd <amount>\``,                    value: 'Set default bid increment', inline: true },
       { name: `\`${aucPfx}slc [sold|unsold|trade|draft|skip] #channel\``, value: 'Set log channel (no type = general/default)', inline: true },
-      { name: `\`${aucPfx}draftstart <rounds> [secs]\``,     value: 'Start a draft — random order each round, timed picks typed in the channel; skips get a second chance after all rounds', inline: false },
-      { name: `\`${aucPfx}draftadd @user [team name]\``,     value: 'Add an owner to the draft roster, optionally setting their team name too — `draftremove @user` drops them (unset roster = everyone with a team name)', inline: false },
+      { name: `\`${aucPfx}draftstart/ds <rounds> [secs]\``,  value: 'Start a draft — random order each round, timed picks typed in the channel; skips get a second chance after all rounds', inline: false },
+      { name: `\`${aucPfx}draftadd/da @user [team name]\``,  value: 'Add an owner to the draft roster, optionally setting their team name too — `draftremove @user` drops them (unset roster = everyone with a team name)', inline: false },
       { name: `\`${aucPfx}nextround\` / \`${aucPfx}draftauto on|off\``, value: 'Rounds pause after showing the new order — `nextround` starts the next one; `draftauto on` makes them start automatically', inline: false },
-      { name: `\`${aucPfx}autodraft on|off\``,               value: 'Allow owners to set preset orders (setorder) so timeouts auto-draft — off by default', inline: false },
+      { name: `\`${aucPfx}autodraft/ad on|off\``,            value: 'Allow owners to set preset orders (setorder) so timeouts auto-draft — off by default', inline: false },
       { name: `\`${aucPfx}resetall [full]\``,                value: 'Wipe ALL squads, draft, pool & preset orders for a fresh season (`full` = team names & purses too) — asks for confirm', inline: false },
-      { name: `\`${aucPfx}draftpool [clear]\``,              value: 'Load the player list (paste it or attach the .txt) — draft picks must then be real players from it', inline: false },
-      { name: `\`${aucPfx}draftstop\` / \`${aucPfx}draftresume\``, value: 'Cancel the draft, or restart the current pick timer (e.g. after a bot restart)', inline: false },
+      { name: `\`${aucPfx}draftpool/dp [clear]\``,           value: 'Load the player list (paste it or attach the .txt) — draft picks must then be real players from it', inline: false },
+      { name: `\`${aucPfx}draftstop/dstop\` · \`${aucPfx}draftresume/dr\``, value: 'Cancel the draft, or restart the current pick timer (e.g. after a bot restart)', inline: false },
       { name: `\`${aucPfx}ssl <min> <max>\``,                value: 'Set min/max squad size (0 = none)', inline: true },
       { name: `\`${aucPfx}st <seconds>\``,                   value: 'Bid countdown timer — auto-sold at 0 (0 = off)', inline: true },
-      { name: `\`${aucPfx}addsquad @user <player> [price]\``,value: 'Manually add player to squad', inline: false },
+      { name: `\`${aucPfx}addsquad @user <players…>\``,   value: 'Add to squad — one player [price], or comma-separated names for bulk retention', inline: false },
       { name: `\`${aucPfx}delete @user <index|name|all>\``,  value: 'Remove player from squad by index or name — also frees them for the draft *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse, squad & team name *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
@@ -2311,7 +2311,7 @@ client.on('messageCreate', async (message) => {
 
     // ── DRAFT MODE ─────────────────────────────────────────────────────────
     // .draftstart <rounds> [seconds-per-pick]
-    if (cmd === 'draftstart') {
+    if (cmd === 'draftstart' || cmd === 'ds') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       if (gd.draft && gd.draft.active) { await message.channel.send(`❌ A draft is already running — \`${aucPfx}draftstop\` first.`); return; }
       const rounds = parseInt(parts[1]);
@@ -2339,7 +2339,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .draftstop — cancel the draft (picks already made stay in squads)
-    if (cmd === 'draftstop') {
+    if (cmd === 'draftstop' || cmd === 'dstop') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       if (!gd.draft || !gd.draft.active) { await message.channel.send('❌ No draft is running.'); return; }
       clearDraftTimer(guildId);
@@ -2372,7 +2372,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .draftresume — re-announce the current pick with a fresh timer (after a bot restart/stall)
-    if (cmd === 'draftresume') {
+    if (cmd === 'draftresume' || cmd === 'dr') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       if (!gd.draft || !gd.draft.active) { await message.channel.send('❌ No draft to resume.'); return; }
       if (gd.draft.waiting) { await message.channel.send(`⏸️ The draft is paused between rounds — use \`${aucPfx}nextround\` instead.`); return; }
@@ -2385,7 +2385,7 @@ client.on('messageCreate', async (message) => {
 
     // .draftpool — load the player list (paste it or attach the cv pl .txt file).
     // When a pool is loaded, draft picks must be real players from it.
-    if (cmd === 'draftpool') {
+    if (cmd === 'draftpool' || cmd === 'dp') {
       // Whole command is host-only — members must not see the pool (they can only probe names via taken)
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const sub = (parts[1] || '').toLowerCase();
@@ -2438,7 +2438,7 @@ client.on('messageCreate', async (message) => {
     // .setorder — a team owner's preferred players; if their timer runs out the
     // bot auto-drafts the top one still available. Plain `.setorder` moves to
     // DMs so the order stays secret; `.myorder` DMs the saved list back.
-    if (cmd === 'setorder' || cmd === 'myorder') {
+    if (cmd === 'setorder' || cmd === 'so' || cmd === 'myorder' || cmd === 'mo') {
       if (!gd.setorderEnabled) {
         await message.channel.send(`❌ Preset draft orders are **disabled** here — an admin can turn them on with \`${aucPfx}autodraft on\`.`);
         return;
@@ -2450,7 +2450,7 @@ client.on('messageCreate', async (message) => {
         await message.channel.send('🗑️ Your draft order is cleared — timeouts will skip you now.');
         return;
       }
-      if (cmd === 'myorder') {
+      if (cmd === 'myorder' || cmd === 'mo') {
         const list = gd.draftPrefs[userId] || [];
         if (!list.length) { await message.channel.send(`❌ No draft order set — run \`${aucPfx}setorder\` and I'll ask for it in DMs.`); return; }
         try {
@@ -2488,7 +2488,7 @@ client.on('messageCreate', async (message) => {
 
     // .draftadd @user [team name] — add an owner to the draft roster, optionally
     // naming their team in the same go (several @users at once works, without a name)
-    if (cmd === 'draftadd') {
+    if (cmd === 'draftadd' || cmd === 'da') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       if (gd.draft && gd.draft.active) { await message.channel.send('❌ Draft is running — roster is locked until it ends.'); return; }
       const mentioned = [...message.mentions.members.values()];
@@ -2528,7 +2528,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .autodraft on|off — allow preset orders + timeout auto-drafting (default: off)
-    if (cmd === 'autodraft') {
+    if (cmd === 'autodraft' || cmd === 'ad') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const sub = (parts[1] || '').toLowerCase();
       if (sub !== 'on' && sub !== 'off') {
@@ -2544,7 +2544,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .draftauto on|off — auto-start each round instead of pausing (default: off)
-    if (cmd === 'draftauto') {
+    if (cmd === 'draftauto' || cmd === 'dauto') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       const sub = (parts[1] || '').toLowerCase();
       if (sub !== 'on' && sub !== 'off') {
@@ -2560,7 +2560,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .draftremove @user — drop a team from the roster (`all` clears it)
-    if (cmd === 'draftremove') {
+    if (cmd === 'draftremove' || cmd === 'drm') {
       if (!hasAuctionPermission(message.member)) { await message.channel.send('❌ No permission.'); return; }
       if (gd.draft && gd.draft.active) { await message.channel.send('❌ Draft is running — roster is locked until it ends.'); return; }
       if ((parts[1] || '').toLowerCase() === 'all') {
@@ -2577,7 +2577,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .draftteams — who's in the next draft, with squad sizes
-    if (cmd === 'draftteams') {
+    if (cmd === 'draftteams' || cmd === 'dt') {
       const roster = (gd.draftTeams && gd.draftTeams.length) ? gd.draftTeams : Object.keys(gd.teams || {});
       if (!roster.length) { await message.channel.send(`❌ No teams yet — \`${aucPfx}draftadd @user\` or \`${aucPfx}team @user <name>\`.`); return; }
       const src = (gd.draftTeams && gd.draftTeams.length) ? 'roster set by host' : 'all named teams (no roster set)';
@@ -2589,7 +2589,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .owners / .teams — every owner with a team name, and their squad size
-    if (cmd === 'owners' || cmd === 'teams') {
+    if (cmd === 'owners' || cmd === 'teams' || cmd === 'o') {
       const entries = Object.keys(gd.teams || {});
       if (!entries.length) { await message.channel.send(`❌ No owners yet — assign teams with \`${aucPfx}team @user <name>\` or \`${aucPfx}draftadd @user <name>\`.`); return; }
       const maxSquad = gd.maxSquad || 0;
@@ -2606,7 +2606,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .draftpicks — every draft pick so far, grouped by team
-    if (cmd === 'draftpicks') {
+    if (cmd === 'draftpicks' || cmd === 'dpk') {
       const d = gd.draft;
       if (!d || !d.picks.length) { await message.channel.send('❌ No draft picks yet.'); return; }
       const byTeam = {};
@@ -2623,7 +2623,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .draft / .draftstatus — round, order, skips, who's on the clock
-    if (cmd === 'draft' || cmd === 'draftstatus') {
+    if (cmd === 'draft' || cmd === 'draftstatus' || cmd === 'd') {
       const d = gd.draft;
       if (!d) { await message.channel.send(`❌ No draft yet — start one with \`${aucPfx}draftstart <rounds>\`.`); return; }
       const slot = draftSlot(gd);
@@ -2647,7 +2647,7 @@ client.on('messageCreate', async (message) => {
     }
 
     // .taken <player> / .picked <player> — is a player taken, by whom, which round
-    if (cmd === 'taken' || cmd === 'picked') {
+    if (cmd === 'taken' || cmd === 'picked' || cmd === 's' || cmd === 'search') {
       const q = parts.slice(1).join(' ').trim();
       if (!q) { await message.channel.send(`❌ Usage: \`${aucPfx}taken <player>\``); return; }
       let hit = findTakenPlayer(gd, q);   // exact squad match first (covers off-pool retentions)
@@ -2804,7 +2804,32 @@ client.on('messageCreate', async (message) => {
       const afterMention = aucRaw.replace(/^(addsquad|as)\s+/, '').replace(/<@!?\d+>\s*/, '').trim();
       const words = afterMention.split(/\s+/).filter(Boolean);
       if (!target || words.length === 0) {
-        await message.channel.send(`❌ Usage: \`${aucPfx}addsquad @user <player> [price]\``); return;
+        await message.channel.send(`❌ Usage: \`${aucPfx}addsquad @user <player> [price]\` — or several players comma-separated for bulk retention`); return;
+      }
+      // Bulk retention: comma/newline-separated names, all added price-less
+      if (/[,\n]/.test(afterMention)) {
+        const names = parsePlayerList(afterMention).slice(0, 100);
+        if (!gd.squads) gd.squads = {};
+        if (!gd.squads[target.id]) gd.squads[target.id] = [];
+        const limit = gd.maxSquad || 0;
+        const added = [], skipped = [];
+        for (const n of names) {
+          const r = poolResolve(gd, n);
+          if (!r) { skipped.push(`${n} — not in the player list`); continue; }
+          if (r.ambiguous) { skipped.push(`${n} — ambiguous (${r.ambiguous.slice(0, 3).join(', ')})`); continue; }
+          const dup = findTakenPlayer(gd, r.name);
+          if (dup) { skipped.push(`${r.name} — already with ${teamOnly(gd, message.guild, dup.userId)}`); continue; }
+          if (limit > 0 && gd.squads[target.id].length >= limit) { skipped.push(`${r.name} — squad full (${limit})`); continue; }
+          gd.squads[target.id].push({ player: r.name, price: 0 });
+          added.push(r.name);
+        }
+        scheduleAuctionSave();
+        const embed = new EmbedBuilder().setTitle('📥 Retention — Bulk Add').setColor(added.length ? 0x57F287 : 0xED4245)
+          .setDescription(`**${teamLabel(gd, message.guild, target.id)}** — added **${added.length}**, skipped **${skipped.length}** (squad now ${gd.squads[target.id].length}${limit ? `/${limit}` : ''})`);
+        if (added.length)   embed.addFields({ name: 'Added',   value: added.join(', ').slice(0, 1024),  inline: false });
+        if (skipped.length) embed.addFields({ name: 'Skipped', value: skipped.join('\n').slice(0, 1024), inline: false });
+        await message.channel.send({ embeds: [embed] });
+        return;
       }
       const lastWord = words[words.length - 1];
       const priceRaw = parseAmount(lastWord);
