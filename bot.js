@@ -547,30 +547,21 @@ function findTakenPlayer(gd, name) {
   return null;
 }
 
-// Ping target for draft logs — a role matching the team name if one exists,
-// otherwise the manager themselves. (Requested: ping the team, not the player.)
-function teamPing(guild, gd, uid) {
-  const tname = teamNameOf(gd, uid);
-  if (tname) {
-    const role = guild.roles.cache.find(r => r.name.toLowerCase() === tname.toLowerCase());
-    if (role) return `<@&${role.id}>`;
-  }
-  return `<@${uid}>`;
-}
-
 function pickOrdinal(n) {
   const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-// Plain-text log (embeds never ping) — draft/skip channel, falling back to general.
-async function sendLogText(guild, content, type) {
+// Draft/skip-channel log, falling back to general. Accepts a plain string or a
+// full payload — pings must go in `content` (embeds never ping), the pretty part
+// in the embed.
+async function sendLogText(guild, payload, type) {
   const gd = getGuildData(guild.id);
   const byType = { draft: gd.draftChannel, skip: gd.skipChannel };
   const chId = (type && byType[type]) || gd.logChannel;
   if (!chId) return;
   const ch = guild.channels.cache.get(chId);
-  if (ch) await ch.send(content).catch(() => {});
+  if (ch) await ch.send(typeof payload === 'string' ? { content: payload } : payload).catch(() => {});
 }
 
 // Whose turn is it — { userId, round, pick, makeup } or null when nothing pending.
@@ -689,11 +680,14 @@ async function commitDraftPick(guild, gd, slot, player, auto) {
   const ch = guild.channels.cache.get(d.channelId);
   const autoNote = auto ? ' *(auto-drafted from their preset order)*' : '';
   if (ch) await ch.send(`✅ **${teamOnly(gd, guild, slot.userId)}** takes **${player}** — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.${autoNote}`).catch(() => {});
-  const ping = teamPing(guild, gd, slot.userId);
-  const line = slot.makeup
-    ? `${ping} Takes **${player}** — makeup for Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.${autoNote}`
-    : `${ping} Takes **${player}** In Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.${autoNote}`;
-  await sendLogText(guild, line, 'draft');
+  const tname = teamOnly(gd, guild, slot.userId);
+  const logEmbed = new EmbedBuilder()
+    .setTitle(`🏏 ${tname} Takes ${player}`)
+    .setDescription((slot.makeup
+      ? `Makeup pick — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick`
+      : `In Round ${slot.round}, ${pickOrdinal(slot.pick)} pick`) + (auto ? ' · auto-drafted from preset order' : ''))
+    .setColor(0x57F287).setTimestamp();
+  await sendLogText(guild, { embeds: [logEmbed] }, 'draft');
   await advanceDraft(guild, gd);
 }
 
@@ -705,18 +699,24 @@ async function draftTimeoutSkip(guild, gd) {
   if (!slot) return;
   const autoPick = firstAvailableFromPrefs(gd, slot.userId);
   if (autoPick) return commitDraftPick(guild, gd, slot, autoPick, true);
-  const ping = teamPing(guild, gd, slot.userId);
   const ch = guild.channels.cache.get(d.channelId);
+  const tname = teamOnly(gd, guild, slot.userId);
   if (slot.makeup) {
     d.skips[d.makeupIdx].finalSkipped = true;
     d.makeupIdx++;
     if (ch) await ch.send(`⏭️ Skipped again — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick is left for the host/managers to fill.`).catch(() => {});
-    await sendLogText(guild, `${ping} Could not decide their makeup pick within ${d.pickSeconds} seconds — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick is left for the host/managers.`, 'skip');
+    const e = new EmbedBuilder().setTitle(`⏭️ ${tname} Skipped Again`)
+      .setDescription(`Could not decide their makeup pick within ${d.pickSeconds} seconds — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick is left for the host/managers.`)
+      .setColor(0xED4245).setTimestamp();
+    await sendLogText(guild, { embeds: [e] }, 'skip');
   } else {
     d.skips.push({ userId: slot.userId, round: slot.round, pick: slot.pick });
     d.idx++;
     if (ch) await ch.send(`⏭️ Time's up — skipped for later (retried after all rounds).`).catch(() => {});
-    await sendLogText(guild, `${ping} Could not decide their pick within ${d.pickSeconds} seconds and is skipped for later.`, 'skip');
+    const e = new EmbedBuilder().setTitle(`⏭️ ${tname} Skipped`)
+      .setDescription(`Could not decide their pick within ${d.pickSeconds} seconds and is skipped for later — Round ${slot.round}, ${pickOrdinal(slot.pick)} pick.`)
+      .setColor(0xED4245).setTimestamp();
+    await sendLogText(guild, { embeds: [e] }, 'skip');
   }
   scheduleAuctionSave();
   await advanceDraft(guild, gd);
@@ -777,7 +777,9 @@ async function finishDraft(guild, gd) {
   }
   const ch = guild.channels.cache.get(d.channelId);
   if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
-  await sendLogText(guild, `🏁 **Draft complete** — ${d.picks.length} player(s) drafted${unfilled.length ? `, ${unfilled.length} slot(s) left for the host/managers` : ''}.`, 'draft');
+  await sendLogText(guild, { embeds: [new EmbedBuilder().setTitle('🏁 Draft Complete')
+    .setDescription(`**${d.picks.length}** player(s) drafted${unfilled.length ? ` · **${unfilled.length}** slot(s) left for the host/managers` : ''}.`)
+    .setColor(0xFFD700).setTimestamp()] }, 'draft');
   scheduleAuctionSave();
   await flushAuction(); // durability point — all drafted players are in squads now
 }
@@ -2333,7 +2335,9 @@ client.on('messageCreate', async (message) => {
         .setDescription(`**${rounds}** round(s) · **${secs}s** per pick · fresh random order every round\nPicks happen **in this channel** — when pinged, just type the player's name. Retained/taken players don't count.\n${gd.draftAuto ? 'Rounds start **automatically**.' : `After each round the draft **pauses** — start the next with \`${aucPfx}nextround\`.`}`)
         .addFields({ name: 'Round 1 order', value: lines.slice(0, 1024), inline: false });
       await message.channel.send({ embeds: [embed] });
-      await sendLogText(message.guild, `🏏 **Draft started** — ${rounds} round(s), ${participants.length} teams, ${secs}s per pick.`, 'draft');
+      await sendLogText(message.guild, { embeds: [new EmbedBuilder().setTitle('🏏 Draft Started')
+        .setDescription(`**${rounds}** round(s) · **${participants.length}** teams · **${secs}s** per pick.`)
+        .setColor(0x00B2FF).setTimestamp()] }, 'draft');
       await announceDraftTurn(message.guild, gd);
       return;
     }
