@@ -1032,27 +1032,38 @@ function payHelpEmbed(aucPfx) {
   return new EmbedBuilder()
     .setTitle('💵 Staff Payments')
     .setColor(0x2ECC71)
-    .setDescription(`A record only — the currency itself is transferred with your other bot. Claiming takes the amount off the staff member's balance straight away and leaves it **pending transfer** until an admin confirms it.\nPrefix: \`${aucPfx}\` · a ping is optional everywhere (a username, nickname or team name works) · amounts accept \`200k\` / \`1.5l\` / \`2cr\``)
+    .setDescription(
+      `Log small payments as they happen, they add up, the staff member claims the total and collects it **in your other bot** — this one only keeps the record.\n` +
+      `Prefix: \`${aucPfx}\` · pings optional (username / nickname / team name all work) · amounts accept \`200k\` \`1.5l\` \`2cr\``)
     .addFields(
-      { name: `\`${aucPfx}pay [@user]\``,            value: 'Your unclaimed balance, anything awaiting transfer, who to claim from, and your recent log *(staff see only themselves)*', inline: false },
-      { name: `\`${aucPfx}payclaim [amount] [note]\``, value: 'Claim it — comes off your balance immediately and the bot DMs you the ticket instructions (no amount = everything)', inline: false },
-      { name: `\`${aucPfx}paylog [@user]\``,          value: 'Full payment history', inline: true },
-      { name: `\`${aucPfx}paylist\``,                 value: 'Everyone with an unclaimed balance or a pending claim *(pay admin)*', inline: true },
-      { name: `\`${aucPfx}payclaims\``,               value: 'Current pending payments — claimed, not yet transferred *(pay admin)*', inline: true },
-      { name: `\`${aucPfx}purchase <amount> <list> [note]\``, value: 'Run a total through a percentage list — everyone\'s cut is added to what they\'re owed *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}payshare\` / \`${aucPfx}payshare <list>\``, value: 'See all percentage lists, or one list\'s members and their %', inline: false },
-      { name: `\`${aucPfx}payshare <list> add <@user|name> <pct>\``, value: 'Add or edit someone in a list (creates the list) · `rem <user>` · `rename <new name>` · `delete` *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}purchases\``,                   value: 'Recent payouts and how each one was split', inline: true },
-      { name: `\`${aucPfx}payadd @user <amt> [note]\``,   value: 'Add to what a staff member is owed *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}payremove @user <amt> [note]\``, value: 'Reduce what they are owed *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}payset @user <amt> [note]\``,   value: 'Overwrite the remaining amount *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}paydone @user [all] [note]\``,  value: 'Currency sent in the other bot → removes the pending claim (`all` clears every one) *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}paydeny @user [reason]\``,      value: 'Cancel a pending claim and put the amount back on their balance *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}payer @user @admin\``,          value: 'Set who that staff member claims from — `payer default @admin` sets the fallback for everyone *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}payadmin add|remove @user\``,   value: 'Grant/revoke pay-admin rights; no args lists them *(Admin/Auctioneer)*', inline: false },
-      { name: `\`${aucPfx}payticket <text|clear>\``,      value: 'Set the ticket instructions staff get when they claim *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}payclear @user\``,              value: 'Remove a staff member from the ledger entirely *(pay admin)*', inline: false },
-      { name: `\`${aucPfx}slc pay #channel\``,            value: 'Route payment logs to their own channel', inline: false }
+      { name: '__For staff__', value:
+        `\`${aucPfx}pay\` — what you're owed, who to claim it from, your log\n` +
+        `\`${aucPfx}payclaim [amount]\` — claim it (no amount = everything). The bot DMs you the ticket instructions`, inline: false },
+
+      { name: '__Logging payments__', value:
+        `\`${aucPfx}payadd <user> <amt> [note]\` — log a payment for one person\n` +
+        `\`${aucPfx}payremove <user> <amt> [note]\` — take a logged payment back off\n` +
+        `\`${aucPfx}purchase <amt> <list> [note]\` — split a total across a list (add \`pending\` to skip the claim step)`, inline: false },
+
+      { name: '__Percentage lists__', value:
+        `\`${aucPfx}payshare\` — every list · \`${aucPfx}payshare <list>\` — one list\n` +
+        `\`${aucPfx}payshare <list> add <user> <pct>\` — add/edit someone (makes the list)\n` +
+        `\`${aucPfx}payshare <list> rem <user>\` · \`rename <new name>\` · \`delete\``, inline: false },
+
+      { name: '__Claims__', value:
+        `\`${aucPfx}payclaims\` — everything claimed and waiting to be transferred\n` +
+        `\`${aucPfx}paydone <user> [all]\` — you sent it → clears that pending log\n` +
+        `\`${aucPfx}paydeny <user> [reason]\` — cancel a claim, amount goes back on their balance`, inline: false },
+
+      { name: '__Who pays / who can run this__', value:
+        `\`${aucPfx}payer <user> <admin>\` — who that staff member claims from\n` +
+        `\`${aucPfx}payer default <admin>\` — the fallback for everyone else\n` +
+        `\`${aucPfx}payadmin add|remove <user>\` — who can use these commands *(Admin/Auctioneer)*`, inline: false },
+
+      { name: '__Records & setup__', value:
+        `\`${aucPfx}paylist\` — everyone outstanding · \`${aucPfx}paylog [user]\` — full history\n` +
+        `\`${aucPfx}purchases\` — past list payouts · \`${aucPfx}payticket <text>\` — your ticket wording\n` +
+        `\`${aucPfx}slc pay #channel\` — send payment logs to their own channel`, inline: false }
     );
 }
 
@@ -4609,8 +4620,8 @@ client.on('messageCreate', async (message) => {
 
     // Plain-name targets need the whole member list — the cache is partial until
     // it's fetched. Mentions and raw ids resolve without this.
-    const PAY_CMDS = ['pay','mypay','paylog','payadd','payremove','payrem','payset','payer','paydone','paypaid',
-                      'paydeny','payreject','payundo','payclear','payadmin','payshare','payshares','paycut','shares'];
+    const PAY_CMDS = ['pay','mypay','paylog','payadd','payremove','payrem','payer','paydone','paypaid',
+                      'paydeny','payreject','payundo','payadmin','payshare','payshares','paycut','shares'];
     if (PAY_CMDS.includes(cmd) && parts.length > 1 && !message.mentions.members.first()) {
       try { await message.guild.members.fetch(); } catch (_) {}
     }
@@ -4659,25 +4670,23 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // .payadd / .payremove / .payset @user <amount> [note]
-    if (cmd === 'payadd' || cmd === 'payremove' || cmd === 'payrem' || cmd === 'payset') {
+    // .payadd / .payremove <user> <amount> [note] — log a payment, or take one back
+    if (cmd === 'payadd' || cmd === 'payremove' || cmd === 'payrem') {
       if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
       const { target, amount, note } = parsePayArgs(message, gd, parts);
       if (!target || amount === null) { await message.channel.send(`❌ Usage: \`${aucPfx}${cmd} <@user|name> <amount> [note]\``); return; }
       if (amount < 0) { await message.channel.send('❌ Amount cannot be negative.'); return; }
       const e = payEntry(gd, target.id);
       const before = e.due;
-      if (cmd === 'payadd')      e.due = before + amount;
-      else if (cmd === 'payset') e.due = amount;
-      else                       e.due = Math.max(0, before - amount);
+      e.due = cmd === 'payadd' ? before + amount : Math.max(0, before - amount);
       const delta = e.due - before;
       // Nobody assigned yet → whoever logs the payment is the one they collect from
       if (!e.payer && !payerFor(gd, target.id)) e.payer = userId;
-      payLog(e, cmd === 'payset' ? 'set' : (cmd === 'payadd' ? 'add' : 'remove'), delta, userId, note);
+      payLog(e, cmd === 'payadd' ? 'add' : 'remove', delta, userId, note);
       scheduleAuctionSave();
 
       const embed = new EmbedBuilder()
-        .setTitle(cmd === 'payadd' ? '💵 Payment Added' : (cmd === 'payset' ? '💵 Payment Set' : '💵 Payment Reduced'))
+        .setTitle(cmd === 'payadd' ? '💵 Payment Logged' : '💵 Payment Removed')
         .setColor(delta >= 0 ? 0x2ECC71 : 0xE67E22)
         .setDescription(`**${target.displayName}** — ${formatAmount(before)} → **${formatAmount(e.due)}**${delta ? ` (${delta > 0 ? '+' : '−'}${formatAmount(Math.abs(delta))})` : ''}`)
         .addFields({ name: 'Claim from', value: payerMention(gd, target.id) || `*not assigned — \`${aucPfx}payer @user @admin\`*`, inline: true })
@@ -4735,19 +4744,6 @@ client.on('messageCreate', async (message) => {
       }
       gd.payTicket = text.slice(0, 400); scheduleAuctionSave();
       await message.channel.send(`🎫 Claim instructions set:\n> ${gd.payTicket}`); return;
-    }
-
-    // .payclear @user — drop a staff member from the ledger entirely
-    if (cmd === 'payclear') {
-      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
-      const target = message.mentions.members.first() || resolvePayMember(message.guild, gd, parts.slice(1).join(' '));
-      if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}payclear <@user|name>\``); return; }
-      if (!gd.staffPay || !gd.staffPay[target.id]) { await message.channel.send(`❌ **${target.displayName}** isn't in the payment ledger.`); return; }
-      const owed = gd.staffPay[target.id].due || 0;
-      delete gd.staffPay[target.id];
-      scheduleAuctionSave();
-      await message.channel.send(`🗑️ **${target.displayName}** removed from the payment ledger${owed > 0 ? ` (had **${formatAmount(owed)}** outstanding)` : ''}.`);
-      return;
     }
 
     // .pay [<@user|name>] — what's still owed and who to claim it from
@@ -5024,7 +5020,9 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // .purchase <amount> <list> [note] — pay a total out through a percentage list
+    // .purchase <amount> <list> [pending] [note] — pay a total out through a
+    // percentage list. `pending` skips the claim step: each cut goes straight to
+    // waiting-for-transfer instead of sitting on their balance.
     if (cmd === 'purchase' || cmd === 'payrun' || cmd === 'paysplit' || cmd === 'split' || cmd === 'sale') {
       if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
       const lists  = payLists(gd);
@@ -5036,17 +5034,28 @@ client.on('messageCreate', async (message) => {
       const found = payListFind(gd, parts[2]) || (names.length === 1 && !parts[2] ? { key: names[0], list: lists[names[0]] } : null);
       if (!found) { await message.channel.send(`❌ Which list? Available: **${names.join('**, **')}** — \`${aucPfx}purchase ${parts[1]} ${names[0]}\``); return; }
       if (payShareTotal(found.list) <= 0) { await message.channel.send(`❌ **${found.key}** is empty — add people with \`${aucPfx}payshare ${found.key} add <@user|name> <percent>\`.`); return; }
-      const note = parts.slice(parts[2] ? 3 : 2).join(' ').trim();
+      const tail     = parts.slice(parts[2] ? 3 : 2);
+      const straight = ['pending', 'pend', 'now', 'claimed'].includes((tail[0] || '').toLowerCase());
+      const note     = (straight ? tail.slice(1) : tail).join(' ').trim();
       const { splits, paidOut, leftover } = recordPurchase(gd, found.key, amount, userId, note);
+      if (straight) {
+        // Nobody has to run payclaim — move each cut straight into pending
+        for (const s of splits) {
+          const e = payEntry(gd, s.uid);
+          e.due -= s.cut;
+          e.claims.push({ amount: s.cut, note: `${found.key}${note ? ` — ${note}` : ''}`, ts: Date.now() });
+          payLog(e, 'claim', -s.cut, userId, `auto-claimed from ${found.key}`);
+        }
+      }
       scheduleAuctionSave();
       await flushAuction();   // several balances changed at once
 
       const embed = new EmbedBuilder()
-        .setTitle('🧾 Payout Logged')
+        .setTitle(straight ? '🧾 Payout Logged — Pending Transfer' : '🧾 Payout Logged')
         .setColor(0x1ABC9C)
-        .setDescription(`**${formatAmount(amount)}** through **${found.key}**${note ? ` — ${note}` : ''}`)
+        .setDescription(`**${formatAmount(amount)}** through **${found.key}**${note ? ` — ${note}` : ''}${straight ? '\nStraight to **pending transfer** — no claim needed.' : ''}`)
         .addFields(
-          { name: 'Split', value: splits.map(s => `• **${displayNameOf(message.guild, s.uid)}** — ${s.pct}% = **${formatAmount(s.cut)}** *(now owed ${formatAmount(payEntry(gd, s.uid).due)})*`).join('\n').slice(0, 1024), inline: false },
+          { name: 'Split', value: splits.map(s => `• **${displayNameOf(message.guild, s.uid)}** — ${s.pct}% = **${formatAmount(s.cut)}** *(${straight ? `${formatAmount(payPending(payEntry(gd, s.uid)))} pending` : `now owed ${formatAmount(payEntry(gd, s.uid).due)}`})*`).join('\n').slice(0, 1024), inline: false },
           { name: 'Paid out', value: formatAmount(paidOut), inline: true },
           { name: leftover >= 0 ? 'Kept' : 'Over-committed', value: formatAmount(Math.abs(leftover)), inline: true }
         )
