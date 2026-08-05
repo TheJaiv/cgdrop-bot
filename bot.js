@@ -15,6 +15,10 @@ const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
 // Default prefixes — configurable per guild
 const DEFAULT_CGDROP_PREFIX  = '!';
 const DEFAULT_AUCTION_PREFIX = '.';
+// Open auction (the days-long, everyone-bids-at-once mode) has its own prefix so
+// it can never clash with the live auction. Change it here, or per server with
+// `$setopenprefix` / the /setopenprefix slash command.
+const DEFAULT_OPEN_PREFIX    = '$';
 
 // ── Server approval checks ─────────────────────────────────────────────────
 function isAuctionApproved(guildId) {
@@ -181,6 +185,7 @@ function startFlushInterval() {
 // ══════════════════════════════════════════════════════════════════════════════
 function getCgPrefix(guildId)      { return (cgData.guildPrefixes     && cgData.guildPrefixes[guildId])      || DEFAULT_CGDROP_PREFIX; }
 function getAuctionPrefix(guildId) { return (auctionData.guildPrefixes && auctionData.guildPrefixes[guildId]) || DEFAULT_AUCTION_PREFIX; }
+function getOpenPrefix(guildId)    { return (auctionData.openPrefixes  && auctionData.openPrefixes[guildId])  || DEFAULT_OPEN_PREFIX; }
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  AUCTION DATA HELPERS
@@ -213,6 +218,13 @@ function getGuildData(guildId) {
       draftAuto: false,  // false = pause after each round until the host runs nextround
       draftPrefs: {},    // userId -> preferred player order, auto-drafted on timeout
       setorderEnabled: false, // preset orders are off until a manager runs autodraft on
+      payChannel: null,  // optional override for staff payment logs
+      payAdmins: {},     // userId -> tag — may add/remove dues and settle claims
+      payDefaultAdmin: null, // fallback payer when a staff member has none set
+      staffPay: {},      // userId -> { due, payer, history, claim } — staff payment ledger
+      payTicket: null,   // custom "how to open a ticket" line shown on a claim
+      payShares: {},     // userId -> % cut of every recorded purchase
+      payPurchases: [],  // recent purchases and how they were split
     };
   }
   return auctionData.guilds[gid];
@@ -470,11 +482,11 @@ async function restoreReminders() {
 // ══════════════════════════════════════════════════════════════════════════════
 //  AUCTION HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
-// type: 'sold' | 'unsold' | 'trade' | undefined — routes to the type-specific
-// channel if set, otherwise falls back to the general log channel.
+// type: 'sold' | 'unsold' | 'trade' | 'pay' | undefined — routes to the
+// type-specific channel if set, otherwise falls back to the general log channel.
 async function sendLog(guild, embed, type) {
   const gd = getGuildData(guild.id);
-  const byType = { sold: gd.soldChannel, unsold: gd.unsoldChannel, trade: gd.tradeChannel };
+  const byType = { sold: gd.soldChannel, unsold: gd.unsoldChannel, trade: gd.tradeChannel, pay: gd.payChannel };
   const chId = (type && byType[type]) || gd.logChannel;
   if (!chId) return;
   const ch = guild.channels.cache.get(chId);
@@ -552,12 +564,12 @@ function pickOrdinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-// Draft/skip-channel log, falling back to general. Accepts a plain string or a
-// full payload — pings must go in `content` (embeds never ping), the pretty part
-// in the embed.
+// Draft/skip/pay-channel log, falling back to general. Accepts a plain string or
+// a full payload — pings must go in `content` (embeds never ping), the pretty
+// part in the embed.
 async function sendLogText(guild, payload, type) {
   const gd = getGuildData(guild.id);
-  const byType = { draft: gd.draftChannel, skip: gd.skipChannel };
+  const byType = { draft: gd.draftChannel, skip: gd.skipChannel, pay: gd.payChannel };
   const chId = (type && byType[type]) || gd.logChannel;
   if (!chId) return;
   const ch = guild.channels.cache.get(chId);
@@ -818,6 +830,232 @@ async function handleDraftPickAttempt(message, gd) {
   await commitDraftPick(message.guild, gd, slot, player, false);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  STAFF PAYMENT HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+// A per-server ledger of what each staff member is still owed, who they collect
+// it from, and every add/remove/claim in between. This bot only keeps the
+// record — the currency itself is transferred with another bot. Claiming takes
+// the amount straight off the balance and leaves a claim awaiting transfer.
+const PAY_HISTORY_MAX = 40;   // keep the log short enough to fit in one embed
+
+function payEntry(gd, uid) {
+  if (!gd.staffPay) gd.staffPay = {};
+  if (!gd.staffPay[uid]) gd.staffPay[uid] = { due: 0, payer: null, history: [], claims: [] };
+  const e = gd.staffPay[uid];
+  if (!Array.isArray(e.history)) e.history = [];
+  if (!Array.isArray(e.claims)) e.claims = e.claim ? [e.claim] : [];   // older single-claim shape
+  delete e.claim;
+  if (typeof e.due !== 'number') e.due = 0;
+  return e;
+}
+
+// Claimed but not yet handed over in the other bot.
+function payPending(e) {
+  return ((e && e.claims) || []).reduce((s, c) => s + (c.amount || 0), 0);
+}
+
+// Pay admins add/remove dues and settle claims. Admins/Auctioneers always
+// qualify, otherwise a fresh server would have nobody able to appoint the first
+// pay admin.
+function isPayAdmin(gd, member) {
+  if (!member) return false;
+  if (gd.payAdmins && gd.payAdmins[member.id]) return true;
+  return hasAuctionPermission(member);
+}
+
+// Who this staff member collects from: their own payer, else the server
+// default, else the single pay admin if there's exactly one.
+function payerFor(gd, uid) {
+  const e = gd.staffPay && gd.staffPay[uid];
+  if (e && e.payer) return e.payer;
+  if (gd.payDefaultAdmin) return gd.payDefaultAdmin;
+  const ids = Object.keys(gd.payAdmins || {});
+  return ids.length === 1 ? ids[0] : null;
+}
+
+function payerMention(gd, uid) {
+  const pid = payerFor(gd, uid);
+  return pid ? `<@${pid}>` : null;
+}
+
+function payTicketLine(gd) {
+  return gd.payTicket || 'Open a ticket in the server\'s ticket/support channel to collect it.';
+}
+
+// type: 'add' | 'remove' | 'set' | 'paid' | 'claim' | 'note'
+function payLog(entry, type, delta, byId, note) {
+  entry.history.push({ ts: Date.now(), type, delta, by: byId, note: (note || '').slice(0, 120) });
+  if (entry.history.length > PAY_HISTORY_MAX) entry.history.splice(0, entry.history.length - PAY_HISTORY_MAX);
+}
+
+// Most recent first — `limit` 0/undefined means everything we kept.
+function payHistoryLines(entry, limit) {
+  const icons = { add: '➕', remove: '➖', set: '📝', paid: '✅', claim: '📨', note: '•' };
+  const rows  = [...(entry.history || [])].reverse();
+  const shown = limit ? rows.slice(0, limit) : rows;
+  return shown.map(h => {
+    const when  = `<t:${Math.floor(h.ts / 1000)}:d>`;
+    const amt   = h.delta ? ` **${h.delta > 0 ? '+' : '−'}${formatAmount(Math.abs(h.delta))}**` : '';
+    const by    = h.by ? ` by <@${h.by}>` : '';
+    const note  = h.note ? ` — *${h.note}*` : '';
+    return `${icons[h.type] || '•'} ${when}${amt}${by}${note}`;
+  });
+}
+
+function payStatusEmbed(gd, guild, uid, aucPfx) {
+  const e       = payEntry(gd, uid);
+  const payer   = payerMention(gd, uid);
+  const pending = payPending(e);
+  const embed = new EmbedBuilder()
+    .setTitle(`💵 Payment — ${displayNameOf(guild, uid)}`)
+    .setColor(e.due > 0 ? 0xFFA500 : 0x00FF00)
+    .setDescription(`**Unclaimed:** ${formatAmount(e.due)}`)
+    .addFields({ name: 'Claim from', value: payer || '*Not assigned yet — an admin must run `' + aucPfx + 'payer @staff @admin`*', inline: false })
+    .setTimestamp();
+  const m = guild.members.cache.get(uid);
+  if (m) embed.setThumbnail(m.user.displayAvatarURL());
+  if (pending > 0) {
+    embed.addFields({ name: `📨 Claimed — waiting for transfer (${formatAmount(pending)})`, value: e.claims.map(c =>
+      `• **${formatAmount(c.amount)}** <t:${Math.floor(c.ts / 1000)}:R>${c.note ? ` — *${c.note}*` : ''}`).join('\n').slice(0, 1024), inline: false });
+  }
+  const lines = payHistoryLines(e, 6);
+  if (lines.length) embed.addFields({ name: 'Recent log', value: lines.join('\n').slice(0, 1024), inline: false });
+  if (e.due > 0) embed.setFooter({ text: `Run ${aucPfx}payclaim to claim it` });
+  return embed;
+}
+
+// Find a member without needing a ping: mention, raw id, username, tag, team
+// name, or display name (exact, else a unique prefix like "jai" → "jaiv").
+function resolvePayMember(guild, gd, q) {
+  const raw = (q || '').trim();
+  if (!raw) return null;
+  const m  = raw.match(/^<@!?(\d+)>$/);
+  const id = m ? m[1] : (/^\d{5,}$/.test(raw) ? raw : null);
+  if (id) return guild.members.cache.get(id) || null;
+  const low   = raw.toLowerCase();
+  const cache = guild.members.cache;
+  const team  = gd && gd.teams && Object.entries(gd.teams).find(([, name]) => name.toLowerCase() === low);
+  if (team) return cache.get(team[0]) || null;
+  const exact = cache.find(mem => mem.user.username.toLowerCase() === low)
+             || cache.find(mem => mem.displayName.toLowerCase() === low)
+             || cache.find(mem => (mem.user.tag || '').toLowerCase() === low);
+  if (exact) return exact;
+  // Fall back to a prefix match, but only when it points at exactly one person
+  const starts = cache.filter(mem => mem.displayName.toLowerCase().startsWith(low) || mem.user.username.toLowerCase().startsWith(low));
+  return starts.size === 1 ? starts.first() : null;
+}
+
+// Payments are typed in shorthand as often as not — 200k, 1.5l, 2cr, 3m.
+function parsePayAmount(value) {
+  if (!value) return null;
+  const s = String(value).trim().replace(/,/g, '').toLowerCase();
+  const m = s.match(/^(\d+(?:\.\d+)?)(k|m|l|lakh|lac|cr|crore)$/);
+  if (!m) return parseAmount(value);
+  const mult = { k: 1e3, m: 1e6, l: 1e5, lakh: 1e5, lac: 1e5, cr: 1e7, crore: 1e7 };
+  return parseFloat(m[1]) * mult[m[2]];
+}
+
+// `<cmd> <@user|username|id|team> <amount> [note]` — the ping is optional, the
+// target and the amount can be typed in either order, and a multi-word name is
+// matched greedily (3 words, then 2, then 1). Everything left over is the note.
+function parsePayArgs(message, gd, parts) {
+  const rest = parts.slice(1).filter(p => !/^<@[!&]?\d+>$/.test(p));
+  let target = message.mentions.members.first() || null;
+  let from   = 0, take = 0;
+  if (!target) {
+    // Try a name at the front; if the front is the amount, try just after it
+    for (const start of [0, 1]) {
+      if (start === 1 && parsePayAmount(rest[0]) === null) break;
+      for (let n = Math.min(3, rest.length - start); n >= 1 && !target; n--) {
+        const found = resolvePayMember(message.guild, gd, rest.slice(start, start + n).join(' '));
+        if (found) { target = found; from = start; take = n; }
+      }
+      if (target) break;
+    }
+  }
+  const left   = rest.filter((_, i) => i < from || i >= from + take);
+  const amount = left.length ? parsePayAmount(left[0]) : null;
+  const note   = (amount === null ? left : left.slice(1)).join(' ').trim();
+  return { target, amount, note };
+}
+
+// ── Percentage lists ───────────────────────────────────────────────────────
+// Named lists of "who gets what % of a total" — one per kind of payout
+// (tournament, sponsorship, …). Running a total against a list credits every
+// member's cut onto what they're owed.
+const PAY_PURCHASE_MAX = 40;
+
+function payLists(gd) {
+  if (!gd.payLists) gd.payLists = {};
+  // Older single-list shape kept everything in gd.payShares
+  if (gd.payShares && Object.keys(gd.payShares).length && !gd.payLists.default) {
+    gd.payLists.default = gd.payShares;
+    delete gd.payShares;
+  }
+  return gd.payLists;
+}
+
+// Case-insensitive lookup — returns { key, list } or null.
+function payListFind(gd, name) {
+  const lists = payLists(gd);
+  const low   = (name || '').trim().toLowerCase();
+  if (!low) return null;
+  const key = Object.keys(lists).find(k => k.toLowerCase() === low);
+  return key ? { key, list: lists[key] } : null;
+}
+
+function payShareTotal(list) {
+  return Object.values(list || {}).reduce((s, p) => s + (Number(p) || 0), 0);
+}
+
+// Split `amount` by a list's percentages, credit everyone and record it.
+// Returns { splits: [{ uid, pct, cut }], paidOut, leftover }.
+function recordPurchase(gd, listKey, amount, byId, note) {
+  const list   = payLists(gd)[listKey] || {};
+  const splits = Object.entries(list).filter(([, p]) => (Number(p) || 0) > 0)
+    .map(([uid, pct]) => ({ uid, pct: Number(pct), cut: Math.round(amount * Number(pct)) / 100 }))
+    .sort((a, b) => b.pct - a.pct);
+  for (const s of splits) {
+    const e = payEntry(gd, s.uid);
+    e.due += s.cut;
+    payLog(e, 'add', s.cut, byId, `${s.pct}% of ${formatAmount(amount)} [${listKey}]${note ? ` — ${note}` : ''}`);
+  }
+  const paidOut = splits.reduce((t, s) => t + s.cut, 0);
+  if (!Array.isArray(gd.payPurchases)) gd.payPurchases = [];
+  gd.payPurchases.push({ ts: Date.now(), amount, by: byId, list: listKey, note: (note || '').slice(0, 120), splits });
+  if (gd.payPurchases.length > PAY_PURCHASE_MAX) gd.payPurchases.splice(0, gd.payPurchases.length - PAY_PURCHASE_MAX);
+  return { splits, paidOut, leftover: amount - paidOut };
+}
+
+function payHelpEmbed(aucPfx) {
+  return new EmbedBuilder()
+    .setTitle('💵 Staff Payments')
+    .setColor(0x2ECC71)
+    .setDescription(`A record only — the currency itself is transferred with your other bot. Claiming takes the amount off the staff member's balance straight away and leaves it **pending transfer** until an admin confirms it.\nPrefix: \`${aucPfx}\` · a ping is optional everywhere (a username, nickname or team name works) · amounts accept \`200k\` / \`1.5l\` / \`2cr\``)
+    .addFields(
+      { name: `\`${aucPfx}pay [@user]\``,            value: 'Your unclaimed balance, anything awaiting transfer, who to claim from, and your recent log *(staff see only themselves)*', inline: false },
+      { name: `\`${aucPfx}payclaim [amount] [note]\``, value: 'Claim it — comes off your balance immediately and the bot DMs you the ticket instructions (no amount = everything)', inline: false },
+      { name: `\`${aucPfx}paylog [@user]\``,          value: 'Full payment history', inline: true },
+      { name: `\`${aucPfx}paylist\``,                 value: 'Everyone with an unclaimed balance or a pending claim *(pay admin)*', inline: true },
+      { name: `\`${aucPfx}payclaims\``,               value: 'Current pending payments — claimed, not yet transferred *(pay admin)*', inline: true },
+      { name: `\`${aucPfx}purchase <amount> <list> [note]\``, value: 'Run a total through a percentage list — everyone\'s cut is added to what they\'re owed *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}payshare\` / \`${aucPfx}payshare <list>\``, value: 'See all percentage lists, or one list\'s members and their %', inline: false },
+      { name: `\`${aucPfx}payshare <list> add <@user|name> <pct>\``, value: 'Add or edit someone in a list (creates the list) · `rem <user>` · `rename <new name>` · `delete` *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}purchases\``,                   value: 'Recent payouts and how each one was split', inline: true },
+      { name: `\`${aucPfx}payadd @user <amt> [note]\``,   value: 'Add to what a staff member is owed *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}payremove @user <amt> [note]\``, value: 'Reduce what they are owed *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}payset @user <amt> [note]\``,   value: 'Overwrite the remaining amount *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}paydone @user [all] [note]\``,  value: 'Currency sent in the other bot → removes the pending claim (`all` clears every one) *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}paydeny @user [reason]\``,      value: 'Cancel a pending claim and put the amount back on their balance *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}payer @user @admin\``,          value: 'Set who that staff member claims from — `payer default @admin` sets the fallback for everyone *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}payadmin add|remove @user\``,   value: 'Grant/revoke pay-admin rights; no args lists them *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}payticket <text|clear>\``,      value: 'Set the ticket instructions staff get when they claim *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}payclear @user\``,              value: 'Remove a staff member from the ledger entirely *(pay admin)*', inline: false },
+      { name: `\`${aucPfx}slc pay #channel\``,            value: 'Route payment logs to their own channel', inline: false }
+    );
+}
+
 // ── Auction help pages (shared by !help auction and .ahelp) ────────────────
 function auctionHelpPage1(aucPfx, navHint) {
   return new EmbedBuilder()
@@ -847,7 +1085,9 @@ function auctionHelpPage1(aucPfx, navHint) {
       { name: `\`${aucPfx}draftteams/dt\``,               value: 'Teams in the (next) draft', inline: true },
       { name: `\`${aucPfx}owners/o\``,                    value: 'All owners with their squad sizes', inline: true },
       { name: `\`${aucPfx}setorder/so\``,                    value: 'Set your preset draft order **privately in DMs** — timeouts auto-draft your top available player (`myorder` views it, `setorder clear` removes; needs `autodraft on`)', inline: false },
-      { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem <player>`, `trade cash <amount>`, `view/accept/cancel` — both sides must total the same value (players + cash)', inline: false }
+      { name: `\`${aucPfx}pay\` / \`${aucPfx}payclaim\``, value: 'Staff: what you\'re still owed, who to claim it from, and raising a claim — full list in `' + aucPfx + 'payhelp`', inline: false },
+      { name: `\`${aucPfx}trade @user\``,                 value: 'Start a squad trade, then `trade add/rem <player>`, `trade cash <amount>`, `view/accept/cancel` — both sides must total the same value (players + cash)', inline: false },
+      { name: `💸 Open auction — \`${DEFAULT_OPEN_PREFIX}ohelp\``, value: `A separate mode on the \`${DEFAULT_OPEN_PREFIX}\` prefix: the whole player list open at once for days, proxy bids, priority order and one big settlement at the end.`, inline: false }
     )
     .setFooter({ text: navHint });
 }
@@ -874,6 +1114,7 @@ function auctionHelpPage2(aucPfx, navHint) {
       { name: `\`${aucPfx}delete @user <index|name|all>\``,  value: 'Remove player from squad by index or name — also frees them for the draft *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}swap @userA @userB\``,             value: 'Swap two members\' purse, squad & team name *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}setauctioneer @user\``,            value: 'Grant/revoke Auctioneer role *(Admin/Auctioneer)*', inline: false },
+      { name: `\`${aucPfx}payhelp\``,                        value: 'Staff payment ledger — what each staff member is owed, who they claim it from, and claims via ticket', inline: false },
       { name: `\`${aucPfx}sync [pull]\``,                    value: 'Force push to JSONBin (or `sync pull` to reload from it) *(Admin/Auctioneer)*', inline: false },
       { name: `\`${aucPfx}dm @role|@user|username <msg>\``,  value: 'DM a user (mention or username), or everyone with a role *(Owner or users granted via `dmallow`)*', inline: false },
       { name: `\`${aucPfx}gdm @role|@user|username <msg>\``, value: 'Ghost DM — sends just the message, no sender/server info *(same permission as `dm`)*', inline: false },
@@ -1160,6 +1401,669 @@ async function doSold(guild, channel, gd) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  OPEN AUCTION HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+// A completely separate mode from the live auction: the whole player list is open
+// at once for days, everyone bids whenever they like, proxy (max) bids fight it
+// out automatically, and everything is settled in one go when the clock runs out.
+//
+// Money rules: only the bids you are CURRENTLY LEADING lock funds. Get outbid and
+// that money is instantly free again. You may lead more players than your squad
+// has slots — your priority order decides which ones you keep at settlement, and
+// the rest cascade down to the next highest bidder.
+
+const OPEN_MAX_POOL = 2000;   // hard cap on pool size (JSONBin payload sanity)
+const OPEN_HIST     = 5;      // per-player bid history kept for `search`
+const OPEN_FEED     = 40;     // server-wide recent-bid feed length
+// History is display-only and there is one array per player, so it is stored as
+// packed [userId, amount, unixSeconds] triples rather than named fields — with a
+// 1000-player pool the key names alone cost well over a hundred KB per save.
+function histEntry(uid, amount, at) { return [uid, amount, Math.floor(at / 1000)]; }
+
+function openDefaults() {
+  return {
+    active: false, paused: false, startedAt: 0, endsAt: 0, settledAt: 0,
+    channelId: null,          // where the bot announces closes/settlement
+    cfg: {
+      maxSquad:    30,        // squad slots — you may lead more, priority decides
+      defaultBase: 100000,    // base price for pool entries with no price given
+      minInc:      100000,    // smallest raise; the ladder scales up from this
+      ladder:      true,      // raise size grows as a player gets expensive
+      antiSnipe:   10,        // minutes — a late bid pushes that player's close back
+      overcommit:  false,     // may leading bids exceed the purse? (settlement trims)
+      dm:          true,      // outbid DMs
+      days:        3          // default auction length
+    },
+    players:  {},   // key -> { n, set, base, bid, uid, at, closesAt, closed, fl, best, hist, count, sniped }
+    autobids: {},   // key -> { userId: maxBid }
+    priority: {},   // userId -> [key, ...] most wanted first
+    watch:    {},   // userId -> [key, ...]
+    noDm:     {},   // userId -> true (opted out of DMs)
+    feed:     [],   // recent bids, newest first
+    results:  null, // filled in by settlement
+    warned:   {}
+  };
+}
+
+// Existing servers were saved before this mode existed — fill in anything missing.
+function ensureOpen(gd) {
+  if (!gd.open) gd.open = openDefaults();
+  const d = openDefaults();
+  for (const k of Object.keys(d))     if (gd.open[k]     === undefined) gd.open[k]     = d[k];
+  for (const k of Object.keys(d.cfg)) if (gd.open.cfg[k] === undefined) gd.open.cfg[k] = d.cfg[k];
+  return gd.open;
+}
+
+// Money with the shorthand people actually type: 2m, 500k, 1.5cr, 20l.
+function parseMoney(value) {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim().toLowerCase().replace(/,/g, '').replace(/\s+/g, '');
+  const m = s.match(/^(\d+(?:\.\d+)?)(k|m|b|l|lakh|lac|cr|crore)?$/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (isNaN(n)) return null;
+  const mult = { k: 1e3, m: 1e6, b: 1e9, l: 1e5, lakh: 1e5, lac: 1e5, cr: 1e7, crore: 1e7 }[m[2]] || 1;
+  return Math.round(n * mult);
+}
+
+// Raise size grows with the price so a 50m player isn't nudged up in 100k steps.
+function bidIncrement(cfg, current) {
+  const base = cfg.minInc || 100000;
+  if (!cfg.ladder) return base;
+  if (current < base * 10)  return base;
+  if (current < base * 50)  return base * 2;
+  if (current < base * 100) return base * 5;
+  return base * 10;
+}
+
+function openKey(name) { return normPlayer(name); }
+
+function fmtLeft(ms) {
+  if (ms <= 0) return 'closed';
+  const d = Math.floor(ms / 86400000), h = Math.floor(ms % 86400000 / 3600000);
+  const mi = Math.floor(ms % 3600000 / 60000), s = Math.floor(ms % 60000 / 1000);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${mi}m`;
+  if (mi) return `${mi}m`;
+  return `${s}s`;
+}
+
+// Discord renders this in every reader's own timezone.
+function ts(msEpoch, style) { return `<t:${Math.floor(msEpoch / 1000)}:${style || 'R'}>`; }
+
+// Name -> player, the same way the draft resolves names: exact, then a unique
+// substring ("kohli" -> Virat Kohli), else the ambiguous list.
+function openResolve(o, raw) {
+  const clean = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!clean) return null;
+  const q = openKey(clean);
+  if (o.players[q]) return { key: q, p: o.players[q] };
+  const subs = Object.keys(o.players).filter(k => k.includes(q));
+  if (subs.length === 1) return { key: subs[0], p: o.players[subs[0]] };
+  if (subs.length > 1)   return { ambiguous: subs.slice(0, 6).map(k => o.players[k].n) };
+  return null;
+}
+
+// ── Balance management ─────────────────────────────────────────────────────
+// Committed = every bid you are currently leading. Nothing else is locked.
+// Settled players are already paid for out of the purse, so they stop counting.
+function openCommitted(o, uid) {
+  let total = 0;
+  for (const p of Object.values(o.players)) if (p.uid === uid && !p.settled) total += p.bid || 0;
+  return total;
+}
+function openAvailable(gd, uid) {
+  const o = ensureOpen(gd);
+  return Math.max(0, (gd.purses[uid] || 0) - openCommitted(o, uid));
+}
+
+// The most this user could put on THIS player right now — raising your own
+// leading bid only costs the difference, since that money is already locked.
+function openSpendRoom(gd, uid, key) {
+  const o = ensureOpen(gd);
+  const purse = gd.purses[uid] || 0;
+  if (o.cfg.overcommit) return purse;   // settlement trims by priority instead
+  const p = o.players[key];
+  const mine = (p && p.uid === uid) ? (p.bid || 0) : 0;
+  return Math.max(0, purse - openCommitted(o, uid) + mine);
+}
+
+function openLeads(o, uid) {
+  return Object.entries(o.players)
+    .filter(([, p]) => p.uid === uid && !p.settled)
+    .map(([k, p]) => ({ k, p, a: p.bid || 0 }));
+}
+
+// Players you bid on but no longer lead — "bids that got overtaken".
+function openOutbid(o, uid) {
+  return Object.entries(o.players)
+    .filter(([, p]) => p.uid !== uid && p.best && p.best[uid])
+    .map(([k, p]) => ({ k, p, mine: p.best[uid] }));
+}
+
+function openSlotsUsed(gd, uid) { return (gd.squads[uid] || []).length; }
+
+function openPriorityIndex(o, uid, key) {
+  const list = (o.priority && o.priority[uid]) || [];
+  const i = list.indexOf(key);
+  return i === -1 ? Infinity : i;
+}
+
+// Most wanted first. With no priority set, the pricier lead is protected first —
+// dropping your 12m star to keep a 200k punt would be nonsense.
+function sortByOpenPriority(o, uid, list) {
+  list.sort((x, y) => {
+    const px = openPriorityIndex(o, uid, x.k), py = openPriorityIndex(o, uid, y.k);
+    if (px !== py) return px - py;
+    return (y.a || 0) - (x.a || 0);
+  });
+  return list;
+}
+
+// ── Proxy bidding ──────────────────────────────────────────────────────────
+// Everyone's ceiling on a player = their highest explicit bid, or their max bid
+// if it's higher, capped by what they can actually afford. Highest ceiling wins
+// and pays just enough to beat the runner-up — so a max never overpays.
+function resolveOpenProxies(gd, key) {
+  const o = ensureOpen(gd), p = o.players[key];
+  if (!p) return null;
+  const ceilings = {};
+  for (const [uid, a] of Object.entries(p.fl || {}))            ceilings[uid] = Math.max(ceilings[uid] || 0, a);
+  for (const [uid, a] of Object.entries(o.autobids[key] || {})) ceilings[uid] = Math.max(ceilings[uid] || 0, a);
+
+  const cands = Object.entries(ceilings)
+    .map(([uid, mx]) => ({ uid, mx: Math.min(mx, openSpendRoom(gd, uid, key)) }))
+    .filter(c => c.mx >= p.base)
+    .sort((a, b) => b.mx - a.mx);
+  if (!cands.length) return null;
+
+  const win = cands[0], second = cands[1];
+  let price = p.base;
+  if (second) price = Math.min(win.mx, second.mx + bidIncrement(o.cfg, second.mx));
+  price = Math.max(price, p.base, (p.fl && p.fl[win.uid]) || 0);
+  if (p.uid === win.uid) price = Math.max(price, p.bid || 0);   // a standing price never drops
+
+  // Runners-up stay on record at their ceiling — that's what settlement falls
+  // back to if the winner has to release the player.
+  p.best = {};
+  for (const c of cands) p.best[c.uid] = (c.uid === win.uid) ? price : c.mx;
+  p.uid = win.uid;
+  p.bid = price;
+  return { leader: win.uid, price };
+}
+
+// Place an explicit bid or set a max, then run the proxies.
+// kind: 'bid' (I am standing at this amount) | 'max' (bid for me up to this)
+function applyOpenBid(gd, uid, key, amount, kind) {
+  const o = ensureOpen(gd), p = o.players[key];
+  const now = Date.now();
+  if (!p) return { ok: false, err: 'That player is not in the pool.' };
+  if (p.closed) return { ok: false, err: 'Bidding on that player has closed.' };
+
+  const inc       = bidIncrement(o.cfg, p.bid || p.base);
+  const nextValid = p.uid ? p.bid + inc : p.base;
+  const prevUid   = p.uid || null, prevPrice = p.bid || 0;
+
+  if (p.uid === uid && kind === 'bid' && amount <= p.bid) {
+    return { ok: false, err: `You already lead at **${formatAmount(p.bid)}** — bid **${formatAmount(nextValid)}** or more to raise yourself.` };
+  }
+  if (amount < nextValid) {
+    return { ok: false, err: `Minimum ${kind === 'max' ? 'max' : 'bid'} is **${formatAmount(nextValid)}** — current ${p.uid ? `bid **${formatAmount(p.bid)}**` : `base **${formatAmount(p.base)}**`}, increment **${formatAmount(inc)}**.` };
+  }
+  const room = openSpendRoom(gd, uid, key);
+  if (amount > room) {
+    return { ok: false, err: `Over your available balance for this player (**${formatAmount(room)}**). Your leading bids lock funds — get outbid somewhere and it frees up.` };
+  }
+
+  if (kind === 'max') {
+    o.autobids[key] = o.autobids[key] || {};
+    o.autobids[key][uid] = amount;
+  } else {
+    p.fl = p.fl || {};
+    p.fl[uid] = Math.max(p.fl[uid] || 0, amount);
+  }
+
+  const res = resolveOpenProxies(gd, key);
+  p.at    = now;
+  p.count = (p.count || 0) + 1;
+  p.hist  = [histEntry(p.uid, p.bid, now), ...(p.hist || [])].slice(0, OPEN_HIST);
+  o.feed  = [{ k: key, u: p.uid, a: p.bid, t: now }, ...(o.feed || [])].slice(0, OPEN_FEED);
+
+  // Anti-snipe: a bid in the dying minutes pushes that player's close back, so
+  // nobody wins a 3-day auction by turning up in the last second.
+  const ext = (o.cfg.antiSnipe || 0) * 60000;
+  let extended = false;
+  if (ext && p.closesAt && p.closesAt - now < ext) {
+    p.closesAt = now + ext;
+    p.sniped = (p.sniped || 0) + 1;
+    extended = true;
+  }
+
+  scheduleAuctionSave();
+  return {
+    ok: true, leader: res.leader, price: p.bid, prevUid, prevPrice, extended,
+    youLead: res.leader === uid,
+    inc: bidIncrement(o.cfg, p.bid)
+  };
+}
+
+// ── DM alerts (queued so a busy minute can't hit the DM rate limit) ─────────
+const openDmQueue = [];
+let openDmRunning = false;
+
+function openDm(o, userId, payload) {
+  if (!o.cfg.dm || (o.noDm && o.noDm[userId])) return;
+  openDmQueue.push({ userId, payload });
+  runOpenDmQueue();
+}
+
+async function runOpenDmQueue() {
+  if (openDmRunning) return;
+  openDmRunning = true;
+  while (openDmQueue.length) {
+    const { userId, payload } = openDmQueue.shift();
+    try {
+      const u = await client.users.fetch(userId);
+      await u.send(payload);
+    } catch (_) {}                                   // DMs closed — nothing to do
+    await new Promise(r => setTimeout(r, 400));
+  }
+  openDmRunning = false;
+}
+
+async function openAnnounce(guild, gd, payload) {
+  const o = ensureOpen(gd);
+  const chId = o.channelId || gd.logChannel;
+  if (!chId) return;
+  const ch = guild.channels.cache.get(chId);
+  if (ch) await ch.send(typeof payload === 'string' ? { content: payload } : payload).catch(() => {});
+}
+
+// ── Settlement ─────────────────────────────────────────────────────────────
+// Every player is awarded in one pass at the end. A team that leads more players
+// than it can fit or fund keeps them in priority order; whatever it releases
+// cascades to the next highest bidder, who may in turn have to release someone —
+// so this loops until nothing changes.
+function computeOpenSettlement(gd) {
+  const o = ensureOpen(gd), cfg = o.cfg;
+  const stacks = {};
+  for (const [k, p] of Object.entries(o.players)) {
+    const st = Object.entries(p.best || {}).map(([uid, a]) => ({ uid, a })).sort((x, y) => y.a - x.a);
+    if (st.length) stacks[k] = st;
+  }
+  const maxS = cfg.maxSquad || 0;
+  const released = [];
+  let changed = true, guard = 0;
+
+  while (changed && guard++ < 5000) {
+    changed = false;
+    const lead = {};
+    for (const [k, st] of Object.entries(stacks)) {
+      if (!st.length) continue;
+      (lead[st[0].uid] = lead[st[0].uid] || []).push({ k, a: st[0].a });
+    }
+    for (const [uid, list] of Object.entries(lead)) {
+      const purse = gd.purses[uid] || 0;
+      let slots = openSlotsUsed(gd, uid), spend = 0;
+      sortByOpenPriority(o, uid, list);
+      for (const it of list) {
+        const hasRoom = !maxS || slots < maxS;
+        const hasCash = spend + it.a <= purse;
+        if (hasRoom && hasCash) { slots++; spend += it.a; continue; }
+        stacks[it.k].shift();                       // released — next bidder inherits
+        released.push({ k: it.k, uid, a: it.a, why: !hasRoom ? 'slots' : 'funds' });
+        changed = true;
+      }
+    }
+  }
+
+  const awards = [], unsold = [];
+  for (const [k, p] of Object.entries(o.players)) {
+    if (p.settled) continue;    // already owned before this auction started
+    const st = stacks[k];
+    if (st && st.length) awards.push({ k, n: p.n, uid: st[0].uid, a: st[0].a });
+    else unsold.push({ k, n: p.n, base: p.base });
+  }
+  return { awards, unsold, released };
+}
+
+// Apply the settlement: purses are debited and players land in the same squads
+// the rest of the bot already uses, so squad/trade/delete all keep working.
+async function settleOpenAuction(guild, gd, byTag) {
+  const o = ensureOpen(gd);
+  const { awards, unsold, released } = computeOpenSettlement(gd);
+  const byTeam = {};
+
+  for (const a of awards) {
+    gd.purses[a.uid] = Math.max(0, (gd.purses[a.uid] || 0) - a.a);
+    gd.squads[a.uid] = gd.squads[a.uid] || [];
+    gd.squads[a.uid].push({ player: a.n, price: a.a });
+    (byTeam[a.uid] = byTeam[a.uid] || []).push(a);
+    const p = o.players[a.k];
+    if (p) { p.closed = true; p.settled = true; }
+  }
+  for (const u of unsold) { const p = o.players[u.k]; if (p) { p.closed = true; p.settled = true; } }
+
+  o.active   = false;
+  o.settledAt = Date.now();
+  // Bid bookkeeping is dead weight once everything is awarded, and on a big pool
+  // it is most of the saved payload. Delete rather than blank the fields — empty
+  // objects still cost bytes on every save, and every reader already guards for
+  // them being missing. The final price and winner stay for display.
+  for (const p of Object.values(o.players)) {
+    delete p.fl; delete p.best; delete p.hist;
+    delete p.at; delete p.count; delete p.sniped; delete p.closesAt;
+  }
+  o.autobids = {};
+  o.feed = [];
+  o.results  = {
+    at: o.settledAt,
+    awards: awards.map(a => ({ k: a.k, n: a.n, uid: a.uid, a: a.a })),
+    unsold: unsold.map(u => u.n),
+    released: released.length,
+    spend: awards.reduce((s, a) => s + a.a, 0)
+  };
+  scheduleAuctionSave();
+  await flushAuction();
+
+  const teamLines = Object.entries(byTeam)
+    .sort((x, y) => y[1].reduce((s, a) => s + a.a, 0) - x[1].reduce((s, a) => s + a.a, 0))
+    .map(([uid, list]) => `**${teamOnly(gd, guild, uid)}** — ${list.length} player(s), ${formatAmount(list.reduce((s, a) => s + a.a, 0))} spent · ${formatAmount(gd.purses[uid] || 0)} left`);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🏁 Open Auction Settled')
+    .setColor(0xFFD700)
+    .setDescription(
+      `**${awards.length}** players sold for **${formatAmount(o.results.spend)}** total.\n` +
+      `**${unsold.length}** went unsold${released.length ? ` · **${released.length}** bid(s) released and cascaded to the next bidder` : ''}.`
+    )
+    .addFields({ name: 'Squads', value: (teamLines.join('\n') || '*nobody won anything*').slice(0, 1024) })
+    .setFooter({ text: byTag ? `Settled by ${byTag}` : 'Auction clock ran out' })
+    .setTimestamp();
+
+  await openAnnounce(guild, gd, { embeds: [embed] });
+
+  // Everyone gets their own result sheet.
+  for (const [uid, list] of Object.entries(byTeam)) {
+    sortByOpenPriority(o, uid, list.map(a => ({ k: a.k, a: a.a })));
+    openDm(o, uid, {
+      embeds: [new EmbedBuilder().setTitle(`🏁 ${guild.name} — your open auction results`).setColor(0x57F287)
+        .setDescription(list.map(a => `• **${a.n}** — ${formatAmount(a.a)}`).join('\n').slice(0, 4000))
+        .setFooter({ text: `${list.length} player(s) · ${formatAmount(list.reduce((s, a) => s + a.a, 0))} spent · ${formatAmount(gd.purses[uid] || 0)} left` })]
+    });
+  }
+  // Tell anyone who had a lead pulled out from under them why.
+  const lost = {};
+  for (const r of released) (lost[r.uid] = lost[r.uid] || []).push(r);
+  for (const [uid, list] of Object.entries(lost)) {
+    const slots = list.filter(r => r.why === 'slots').length;
+    openDm(o, uid, `⚠️ **${guild.name}** — ${list.length} of your leading bid(s) were released at settlement (${slots} over your squad limit, ${list.length - slots} over your purse): ${list.map(r => (o.players[r.k] || {}).n).filter(Boolean).slice(0, 20).join(', ')}`.slice(0, 1900));
+  }
+  return { awards, unsold, released };
+}
+
+// ── Clock ──────────────────────────────────────────────────────────────────
+// One minute tick per guild: close players whose time is up, warn about the
+// deadline, and settle once everything has closed.
+async function openTickGuild(guild, gd) {
+  const o = ensureOpen(gd);
+  const now = Date.now();
+  if (!o.active || o.paused) return;
+
+  const justClosed = [];
+  for (const [k, p] of Object.entries(o.players)) {
+    if (p.closed || !p.closesAt || p.closesAt > now) continue;
+    p.closed = true;
+    justClosed.push({ k, p });
+  }
+
+  if (justClosed.length) {
+    const sold = justClosed.filter(x => x.p.uid);
+    const embed = new EmbedBuilder().setTitle(`🔒 ${justClosed.length} player(s) closed`).setColor(0x9B59B6)
+      .setDescription(sold.slice(0, 25).map(x => `• **${x.p.n}** — ${formatAmount(x.p.bid)} to **${teamOnly(gd, guild, x.p.uid)}**`).join('\n').slice(0, 4000) || '*no bids on any of them*')
+      .setFooter({ text: `${sold.length} with bids · ${justClosed.length - sold.length} without · final results at settlement` })
+      .setTimestamp();
+    await openAnnounce(guild, gd, { embeds: [embed] });
+
+    const perLeader = {};
+    for (const x of sold) (perLeader[x.p.uid] = perLeader[x.p.uid] || []).push(x);
+    for (const [uid, list] of Object.entries(perLeader)) {
+      openDm(o, uid, `🔒 **${guild.name}** — bidding closed on ${list.length} player(s) you lead: ${list.map(x => `${x.p.n} (${formatAmount(x.p.bid)})`).slice(0, 25).join(', ')}\nThey're yours unless your squad limit or purse forces a release at settlement — check \`${getOpenPrefix(guild.id)}priority\`.`.slice(0, 1900));
+    }
+    scheduleAuctionSave();
+  }
+
+  // Deadline warnings
+  const left = o.endsAt - now;
+  for (const mark of [86400000, 21600000, 3600000, 600000]) {
+    if (left > 0 && left <= mark && !o.warned[mark]) {
+      o.warned[mark] = true;
+      scheduleAuctionSave();
+      await openAnnounce(guild, gd, { embeds: [new EmbedBuilder().setColor(0xFFA500)
+        .setTitle(`⏳ ${fmtLeft(mark)} left in the open auction`)
+        .setDescription(`Closes ${ts(o.endsAt, 'R')}. Late bids extend that player by **${o.cfg.antiSnipe}m**, so don't count on sniping.`)] });
+      break;
+    }
+  }
+
+  // Closing-soon alerts for watched players
+  for (const [uid, keys] of Object.entries(o.watch || {})) {
+    const soon = (keys || []).map(k => o.players[k]).filter(p => p && !p.closed && p.closesAt - now > 0 && p.closesAt - now <= 1800000);
+    const flag = o.warned[`w${uid}`] || 0;
+    if (soon.length && flag < now - 1800000) {
+      o.warned[`w${uid}`] = now;
+      openDm(o, uid, `👀 **${guild.name}** — closing within 30m on your watchlist: ${soon.map(p => `**${p.n}** (${formatAmount(p.bid || p.base)}${p.uid === uid ? ', you lead' : ''})`).slice(0, 15).join(', ')}`.slice(0, 1900));
+    }
+  }
+
+  const anyOpen = Object.values(o.players).some(p => !p.closed);
+  if (!anyOpen && now >= o.endsAt) await settleOpenAuction(guild, gd, null);
+}
+
+async function openTick() {
+  for (const [gid, gd] of Object.entries(auctionData.guilds || {})) {
+    if (!gd || !gd.open || !gd.open.active) continue;
+    const guild = client.guilds.cache.get(gid);
+    if (!guild) continue;
+    try { await openTickGuild(guild, gd); }
+    catch (e) { console.error(`Open auction tick error (${gid}):`, e.message); }
+  }
+}
+
+function startOpenTicker() {
+  setInterval(() => { openTick().catch(e => console.error('Open tick error:', e.message)); }, 60_000);
+  console.log('⏱️  Open auction clock started (1 min tick)');
+}
+
+// ── Pool parsing ───────────────────────────────────────────────────────────
+// Understands three shapes:
+//   • the CricVerse `cv pl` export — "── 👑 LEGENDS (18) ──" tier rows followed
+//     by one name per line; the tier becomes the set (cleaned to just "LEGENDS")
+//   • the `cv pl` RATINGS table — "  1  Don Bradman  99  20  99  Batter  Anchor",
+//     from which the name, OVR and role are pulled out
+//   • plain lists — "Name", "Name 2m", comma-separated, with "Set: X" headers
+// Banner/decoration rows and the Generated footer are ignored in all three.
+function parseOpenPool(text, defaultBase) {
+  const lines = String(text || '').split(/\r?\n/);
+  // The ratings table is columnar, so it has to be read a row at a time rather
+  // than word-split — otherwise every stat lands in the player's name.
+  const isRatings = lines.some(l => /^\s*#?\s*NAME\s+BAT\s+BOWL\s+OVR\b/i.test(l));
+  const out = [];
+  let set = null;
+
+  // "👑  LEGENDS (18)" -> "LEGENDS"; pure decoration -> null.
+  const cleanSet = (raw) => {
+    let s = String(raw || '').replace(/\(\s*\d+\s*\)\s*$/, '').trim();
+    s = s.replace(/^[^A-Za-z0-9]+/, '').replace(/[^A-Za-z0-9]+$/, '').trim();
+    return s || null;
+  };
+
+  for (let line of lines) {
+    if (!line.trim()) continue;
+    if (/player database|generated:/i.test(line)) continue;
+
+    if (isRatings) {
+      if (/^\s*#?\s*NAME\s+BAT\s+BOWL/i.test(line)) continue;      // column header
+      const m = line.match(/^\s*\d+\s+(.+?)\s{2,}(\d+)\s+(\d+)\s+(\d+)\s+(\S+)/);
+      if (!m) continue;                                            // banner or divider
+      const name = m[1].replace(/\s+/g, ' ').trim();
+      if (!name || name.length > 80) continue;
+      out.push({ name, base: defaultBase, set: null, ovr: parseInt(m[4], 10), role: m[5] });
+      continue;
+    }
+
+    // Tier / set header. A row that is nothing but decoration cleans to null and
+    // is simply skipped, so it can never become a set name.
+    const head = line.match(/^\s*(?:set\s*[:\-]\s*(.+)|[─═]{2,}\s*(.*?)\s*[─═]{2,})\s*$/i);
+    if (head) {
+      const s = cleanSet(head[1] || head[2]);
+      if (s) set = s;
+      continue;
+    }
+    if (/^[═─=—_*#·\s-]+$/.test(line)) continue;                   // any other divider
+
+    for (const part of line.split(',')) {
+      const entry = part.replace(/\s+/g, ' ').trim();
+      if (!entry) continue;
+      const words = entry.split(' ');
+      let base = null, name = entry;
+      if (words.length > 1) {
+        const maybe = parseMoney(words[words.length - 1]);
+        if (maybe !== null && maybe > 0) { base = maybe; name = words.slice(0, -1).join(' '); }
+      }
+      name = name.replace(/^\d+[.)]\s*/, '').trim();   // strip "12." list numbering
+      if (!name || name.length > 80) continue;
+      out.push({ name, base: base || defaultBase, set });
+    }
+  }
+  return out;
+}
+
+// Optional tiered base prices: stars shouldn't open at the same price as filler.
+// Uses OVR when the ratings list supplied it, otherwise the tier's position in
+// the file (CricVerse lists them best-first).
+const OPEN_TIER_MULT = [10, 6, 4, 2.5, 1.5, 1];
+
+function applyTieredBases(items, defaultBase) {
+  const tiers = [];
+  for (const it of items) if (it.set && !tiers.includes(it.set)) tiers.push(it.set);
+  const bands = {};
+  for (const it of items) {
+    let mult;
+    if (it.ovr) {
+      mult = it.ovr >= 90 ? 10 : it.ovr >= 85 ? 6 : it.ovr >= 80 ? 4 : it.ovr >= 75 ? 2.5 : it.ovr >= 70 ? 1.5 : 1;
+    } else {
+      const i = tiers.indexOf(it.set);
+      mult = (i === -1 || OPEN_TIER_MULT[i] === undefined) ? 1 : OPEN_TIER_MULT[i];
+    }
+    it.base = Math.round(defaultBase * mult);
+    const label = it.set || (it.ovr ? `OVR ${it.ovr >= 90 ? '90+' : it.ovr >= 85 ? '85-89' : it.ovr >= 80 ? '80-84' : it.ovr >= 75 ? '75-79' : it.ovr >= 70 ? '70-74' : '<70'}` : 'Ungrouped');
+    bands[label] = it.base;
+  }
+  return bands;
+}
+
+// ── Embeds ─────────────────────────────────────────────────────────────────
+function openPlayerCard(gd, guild, key, viewerId, pfx) {
+  const o = ensureOpen(gd), p = o.players[key];
+  const now = Date.now();
+  const mine = (p.best && p.best[viewerId]) || 0;
+  const leading = p.uid === viewerId;
+  const myMax = (o.autobids[key] || {})[viewerId] || 0;
+  const inc = bidIncrement(o.cfg, p.bid || p.base);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🔎 ${p.n}`)
+    .setColor(p.closed ? 0x95A5A6 : leading ? 0x57F287 : mine ? 0xED4245 : 0x00B2FF)
+    .addFields(
+      { name: 'Base',        value: formatAmount(p.base), inline: true },
+      { name: 'Current bid', value: p.uid ? `**${formatAmount(p.bid)}**` : '*no bids*', inline: true },
+      { name: 'Leader',      value: p.uid ? teamOnly(gd, guild, p.uid) : '—', inline: true },
+      { name: 'Next bid',    value: p.closed ? '*closed*' : formatAmount(p.uid ? p.bid + inc : p.base), inline: true },
+      { name: 'Bids',        value: String(p.count || 0), inline: true },
+      { name: 'Closes',      value: p.closed ? '*closed*' : p.closesAt ? ts(p.closesAt, 'R') : '*not started*', inline: true }
+    );
+  if (p.set) embed.addFields({ name: 'Set', value: p.set, inline: true });
+  if (p.ovr) embed.addFields({ name: 'OVR', value: `${p.ovr}${p.role ? ` · ${String(p.role).replace(/_/g, ' ')}` : ''}`, inline: true });
+  if (p.sniped) embed.addFields({ name: 'Extended', value: `${p.sniped}× by late bids`, inline: true });
+
+  let you = leading ? `✅ **You lead** at ${formatAmount(p.bid)}` : mine ? `❌ **Outbid** — your ceiling was ${formatAmount(mine)}` : '—';
+  if (myMax) you += `\n🤖 Your max: **${formatAmount(myMax)}**`;
+  embed.addFields({ name: 'You', value: you, inline: false });
+
+  const hist = (p.hist || []).slice(0, 6)
+    .map(h => `• ${formatAmount(h[1])} — ${teamOnly(gd, guild, h[0])} ${ts(h[2] * 1000, 'R')}`).join('\n');
+  if (hist) embed.addFields({ name: 'Recent activity', value: hist.slice(0, 1024), inline: false });
+  embed.setFooter({ text: `${pfx}bid ${p.n} <amount> · ${pfx}max ${p.n} <ceiling> · ${pfx}watch ${p.n}` });
+  return embed;
+}
+
+async function openPaginate(message, pages) {
+  if (!pages.length) return;
+  let page = 0;
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('open_prev').setLabel('◀').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('open_next').setLabel('▶').setStyle(ButtonStyle.Secondary)
+  );
+  const sent = await message.channel.send({ embeds: [pages[0]], components: pages.length > 1 ? [row] : [] });
+  if (pages.length < 2) return;
+  const col = sent.createMessageComponentCollector({ filter: i => i.user.id === message.author.id, time: 120_000 });
+  col.on('collect', async i => {
+    page = i.customId === 'open_next' ? (page + 1) % pages.length : (page - 1 + pages.length) % pages.length;
+    await i.update({ embeds: [pages[page]], components: [row] }).catch(() => {});
+  });
+  col.on('end', () => { sent.edit({ components: [] }).catch(() => {}); });
+}
+
+function openHelpPage1(pfx) {
+  return new EmbedBuilder()
+    .setTitle('💸 Open Auction — Bidding')
+    .setColor(0x00B2FF)
+    .setDescription(`Prefix \`${pfx}\` · every player is open at once for days. Only the bids you're **leading** lock money — get outbid and it frees up instantly.`)
+    .addFields(
+      { name: `\`${pfx}bid <player> <amount>\` / \`${pfx}b\``, value: 'Bid. Short names work ("kohli"). Amounts take `2m`, `500k`, `1.5cr`.', inline: false },
+      { name: `\`${pfx}max <player> <amount>\``, value: 'Proxy bid — I bid the minimum needed for you, up to this ceiling, and re-bid automatically when someone outbids you. `max <player> clear` cancels.', inline: false },
+      { name: `\`${pfx}search <player>\` / \`${pfx}s\``, value: 'Player card — current bid, leader, next valid bid, close time, recent bid history and where you stand.', inline: false },
+      { name: `\`${pfx}mybids\` / \`${pfx}mb\``, value: 'Everything you lead, everything you were **outbid** on, your maxes and your balance — sent to your DMs (`mybids here` posts it in channel).', inline: false },
+      { name: `\`${pfx}priority\` / \`${pfx}pr\``, value: 'Your keep-order for when you lead more players than you have slots or money for. `pr <name1, name2…>` sets it, `pr top <player>` promotes one, `pr clear` resets.', inline: false },
+      { name: `\`${pfx}bal\``, value: 'Purse, committed, available, slots used.', inline: true },
+      { name: `\`${pfx}squad [@user]\``, value: 'Squad + provisional wins.', inline: true },
+      { name: `\`${pfx}team <name>\``, value: 'Name your team.', inline: true },
+      { name: `\`${pfx}watch <player>\``, value: 'Watchlist + closing alerts.', inline: true },
+      { name: `\`${pfx}players [open|mine|nobids|set]\``, value: 'Browse the pool with live prices.', inline: true },
+      { name: `\`${pfx}hot\``, value: 'Most contested players.', inline: true },
+      { name: `\`${pfx}feed\``, value: 'Latest bids server-wide.', inline: true },
+      { name: `\`${pfx}status\``, value: 'Clock, pool progress, top spenders.', inline: true },
+      { name: `\`${pfx}lb\``, value: 'Spending leaderboard.', inline: true },
+      { name: `\`${pfx}notify off\``, value: 'Stop outbid DMs.', inline: true },
+      { name: `\`${pfx}results\` · \`${pfx}unsold\``, value: 'After settlement — who got whom, and who nobody wanted.', inline: false }
+    )
+    .setFooter({ text: `Page 1/2 — ${pfx}ohelp2 for host commands` });
+}
+
+function openHelpPage2(pfx) {
+  return new EmbedBuilder()
+    .setTitle('💸 Open Auction — Host Commands')
+    .setColor(0xFF6600)
+    .setDescription(`Prefix \`${pfx}\` — Admin or Auctioneer role required.`)
+    .addFields(
+      { name: `\`${pfx}openpool <paste or .txt>\``, value: 'Load the player list. Reads the CricVerse `cv pl` export as-is (tiers become sets) and the ratings table (keeps OVR + role), plus plain `Name` / `Name 2m` / comma-separated lists with `Set: X` headers. `openpool clear` wipes it, plain `openpool` shows status.', inline: false },
+      { name: `\`${pfx}openpool tiered <list>\``, value: 'Same, but base prices scale by tier (or OVR): top tier ×10 down to ×1 off the default base — so Legends don\'t open at the same price as Iron.', inline: false },
+      { name: `\`${pfx}openstart [3d|72h]\``, value: 'Open bidding on everything for that long (default 3 days).', inline: false },
+      { name: `\`${pfx}openpurse @user <amt>\``, value: 'Set a purse — `openpurse all <amt>` gives everyone in the auction the same one.', inline: false },
+      { name: `\`${pfx}ocfg <key> <value>\``, value: '`maxsquad` (30) · `inc` min raise · `ladder on|off` · `antisnipe` mins · `overcommit on|off` · `base` default base · `dm on|off`. Plain `ocfg` shows all.', inline: false },
+      { name: `\`${pfx}openextend <hours>\``, value: 'Push the deadline back for every player still open.', inline: true },
+      { name: `\`${pfx}openpause\` / \`${pfx}openresume\``, value: 'Freeze/unfreeze bidding without losing anything.', inline: true },
+      { name: `\`${pfx}openend confirm\``, value: 'Close everything and settle right now.', inline: true },
+      { name: `\`${pfx}openlog #channel\``, value: 'Where closes, warnings and results are posted.', inline: true },
+      { name: `\`${pfx}openreset confirm\``, value: 'Wipe the open auction (pool, bids, results). `full` also clears squads bought here.', inline: true },
+      { name: `\`${pfx}setopenprefix <p>\``, value: 'Change this mode\'s prefix for the server.', inline: true },
+      { name: 'How settlement works', value: 'Nothing is awarded until the clock ends. Then every team keeps its leading bids in **priority order** while slots and purse allow; anything released cascades to the next highest bidder, who may release in turn — repeated until stable. Purses are debited and players land in the normal squads.', inline: false }
+    )
+    .setFooter({ text: `Page 2/2 — ${pfx}ohelp for bidding` });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  CLIENT
 // ══════════════════════════════════════════════════════════════════════════════
 const client = new Client({
@@ -1232,6 +2136,8 @@ client.once('ready', async () => {
 
   await restoreReminders();
   startFlushInterval();
+  startOpenTicker();
+  openTick().catch(e => console.error('Open tick error:', e.message));   // catch up on anything that closed while we were down
 
   // Register slash commands
   const commands = [
@@ -1249,6 +2155,10 @@ client.once('ready', async () => {
       .setName('setcgprefix')
       .setDescription('Change the cgdrop command prefix for this server')
       .addStringOption(o => o.setName('prefix').setDescription('New prefix (e.g. !)').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('setopenprefix')
+      .setDescription('Change the open auction command prefix for this server')
+      .addStringOption(o => o.setName('prefix').setDescription('New prefix (e.g. $)').setRequired(true)),
   ].map(c => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -1309,6 +2219,16 @@ client.on('interactionCreate', async interaction => {
     return interaction.reply({ content: `✅ Auction prefix changed to \`${np}\``, ephemeral: true });
   }
 
+  if (interaction.commandName === 'setopenprefix') {
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
+      return interaction.reply({ content: '❌ Admin only!', ephemeral: true });
+    const np = interaction.options.getString('prefix');
+    auctionData.openPrefixes = auctionData.openPrefixes || {};
+    auctionData.openPrefixes[guildId] = np;
+    scheduleAuctionSave();
+    return interaction.reply({ content: `✅ Open auction prefix changed to \`${np}\` — try \`${np}ohelp\``, ephemeral: true });
+  }
+
   if (interaction.commandName === 'setcgprefix') {
     if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
       return interaction.reply({ content: '❌ Admin only!', ephemeral: true });
@@ -1357,8 +2277,11 @@ client.on('messageCreate', async (message) => {
   if (!message.guild) return;
 
   // ── Determine which prefix was used ──────────────────────────────────────
-  const usesCg  = content.startsWith(cgPfx);
-  const usesAuc = content.startsWith(aucPfx);
+  const openPfx = guildId ? getOpenPrefix(guildId) : DEFAULT_OPEN_PREFIX;
+  const usesCg   = content.startsWith(cgPfx);
+  const usesOpen = content.startsWith(openPfx);
+  // Open auction wins a prefix clash — the live auction has the older, shorter one.
+  const usesAuc  = content.startsWith(aucPfx) && !usesOpen;
 
   // Strip prefix and get command + args
   const cgCmd  = usesCg  ? lower.slice(cgPfx.length).trim()      : null;
@@ -1366,6 +2289,7 @@ client.on('messageCreate', async (message) => {
   const cgArgs  = usesCg  ? content.slice(cgPfx.length).trim().split(/\s+/).slice(1)  : [];
   const aucArgs = usesAuc ? content.slice(aucPfx.length).trim().split(/\s+/).slice(1) : [];
   const aucRaw  = usesAuc ? content.slice(aucPfx.length).trim()   : null;
+  const openRaw = usesOpen ? content.slice(openPfx.length).trim() : null;
 
   // ════════════════════════════════════════════════════════════════════════
   //  CGDROP COMMANDS  (! prefix)
@@ -1702,6 +2626,771 @@ client.on('messageCreate', async (message) => {
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  //  OPEN AUCTION COMMANDS  ($ prefix)
+  // ════════════════════════════════════════════════════════════════════════
+
+  if (usesOpen && guildId) {
+    const gd    = getGuildData(guildId);
+    const o     = ensureOpen(gd);
+    const parts = openRaw.split(/\s+/).filter(Boolean);
+    const cmd   = (parts[0] || '').toLowerCase();
+    const rest  = openRaw.slice((parts[0] || '').length).trim();
+    const host  = () => hasAuctionPermission(message.member);
+    const noPerm = async () => { await message.channel.send('❌ You need **Administrator** or the **Auctioneer** role.'); };
+
+    if (!cmd) return;
+
+    // Split "<player name> <amount>" — the amount is always the last word.
+    const splitNameAmount = (text) => {
+      const w = String(text || '').split(/\s+/).filter(Boolean);
+      if (w.length < 2) return { name: w.join(' '), amount: null };
+      const amount = parseMoney(w[w.length - 1]);
+      if (amount === null) return { name: w.join(' '), amount: null };
+      return { name: w.slice(0, -1).join(' '), amount };
+    };
+
+    // "3d" / "72h" / "90m" / plain number = days
+    const parseDuration = (text) => {
+      const m = String(text || '').toLowerCase().trim().match(/^(\d+(?:\.\d+)?)\s*(d|day|days|h|hr|hrs|hour|hours|m|min|mins|minutes)?$/);
+      if (!m) return null;
+      const n = parseFloat(m[1]);
+      if (isNaN(n) || n <= 0) return null;
+      const unit = m[2] || 'd';
+      if (/^m/.test(unit)) return n * 60000;
+      if (/^h/.test(unit)) return n * 3600000;
+      return n * 86400000;
+    };
+
+    // Resolve a typed player name, replying with the problem if it doesn't land.
+    const resolveOrTell = async (raw) => {
+      const r = openResolve(o, raw);
+      if (!r) { await message.channel.send(`❌ No player called **${raw}** in the pool. Try \`${openPfx}players\` or a shorter name.`); return null; }
+      if (r.ambiguous) { await message.channel.send(`❓ **${raw}** matches several: ${r.ambiguous.join(', ')} — be more specific.`); return null; }
+      return r;
+    };
+
+    // ── Help — always available, even before approval ──────────────────────
+    if (cmd === 'ohelp' || cmd === 'openhelp' || cmd === 'ohelp2') {
+      const p1 = () => openHelpPage1(openPfx), p2 = () => openHelpPage2(openPfx);
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('ohelp_p1').setLabel('💸 Bidding').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('ohelp_p2').setLabel('🔧 Host').setStyle(ButtonStyle.Secondary),
+      );
+      const sent = await message.channel.send({ embeds: [cmd === 'ohelp2' ? p2() : p1()], components: [row] });
+      const col = sent.createMessageComponentCollector({ filter: i => i.user.id === userId, time: 120_000 });
+      col.on('collect', async i => { await i.update({ embeds: [i.customId === 'ohelp_p2' ? p2() : p1()], components: [row] }).catch(() => {}); });
+      col.on('end', () => sent.edit({ components: [] }).catch(() => {}));
+      return;
+    }
+
+    if (!isAuctionApproved(guildId)) {
+      await message.channel.send('⛔ This server is not approved for auction commands.\nContact **frenzy_guy** to get access.');
+      return;
+    }
+
+    // ── Host: prefix ───────────────────────────────────────────────────────
+    if (cmd === 'setopenprefix') {
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) { await message.channel.send('❌ Admin only!'); return; }
+      const np = (parts[1] || '').trim();
+      if (!np || np.length > 3) { await message.channel.send(`❌ Usage: \`${openPfx}setopenprefix <prefix>\` (1-3 characters)`); return; }
+      auctionData.openPrefixes = auctionData.openPrefixes || {};
+      auctionData.openPrefixes[guildId] = np;
+      scheduleAuctionSave();
+      await message.channel.send(`✅ Open auction prefix is now \`${np}\` — e.g. \`${np}bid kohli 5m\``);
+      return;
+    }
+
+    // ── Host: pool ─────────────────────────────────────────────────────────
+    if (cmd === 'openpool' || cmd === 'opool' || cmd === 'op') {
+      if (!host()) return noPerm();
+      const sub = (parts[1] || '').toLowerCase();
+      const att = message.attachments.first();
+
+      if (sub === 'clear') {
+        if (o.active) { await message.channel.send('❌ Auction is running — `openend` or `openreset` first.'); return; }
+        o.players = {}; o.autobids = {}; o.priority = {}; o.watch = {}; o.feed = []; o.results = null;
+        scheduleAuctionSave();
+        await message.channel.send('🗑️ Open auction pool cleared.');
+        return;
+      }
+
+      if (!att && !rest) {
+        const list = Object.values(o.players);
+        if (!list.length) {
+          await message.channel.send(`📋 No open auction pool loaded.\nLoad one with \`${openPfx}openpool <pasted list>\` or attach a .txt to \`${openPfx}openpool\`.\nLines can be \`Name\`, \`Name 2m\`, or comma-separated. \`Set: X\` / \`── X ──\` rows tag a set.`);
+          return;
+        }
+        const sets = {};
+        for (const p of list) sets[p.set || 'Ungrouped'] = (sets[p.set || 'Ungrouped'] || 0) + 1;
+        const embed = new EmbedBuilder().setTitle('📋 Open Auction Pool').setColor(0x00B2FF)
+          .setDescription(`**${list.length}** players loaded${o.active ? ' — auction is LIVE' : ''}.`)
+          .addFields(
+            { name: 'Sets', value: Object.entries(sets).map(([s, n]) => `• ${s} — ${n}`).join('\n').slice(0, 1024) || '—', inline: false },
+            { name: 'Base prices', value: `${formatAmount(Math.min(...list.map(p => p.base)))} – ${formatAmount(Math.max(...list.map(p => p.base)))}`, inline: true },
+            { name: 'With bids', value: String(list.filter(p => p.uid).length), inline: true }
+          )
+          .setFooter({ text: `${openPfx}openpool <paste|.txt> appends · ${openPfx}openpool clear resets` });
+        await message.channel.send({ embeds: [embed] });
+        return;
+      }
+
+      if (o.active) { await message.channel.send('❌ Auction is running — you can\'t change the pool mid-auction.'); return; }
+
+      const tiered = sub === 'tiered';
+      let text = tiered ? rest.replace(/^\S+\s*/, '') : rest;
+      if (att) {
+        if (att.size > 2 * 1024 * 1024) { await message.channel.send('❌ File too big (max 2 MB).'); return; }
+        try { text = await (await fetch(att.url)).text(); }
+        catch (_) { await message.channel.send('❌ Could not read the attached file — try again.'); return; }
+      }
+      if (!text.trim()) { await message.channel.send(`❌ Nothing to load — paste the list after \`${openPfx}openpool${tiered ? ' tiered' : ''}\` or attach the \`cv pl\` .txt to it.`); return; }
+      const parsed = parseOpenPool(text, o.cfg.defaultBase);
+      if (!parsed.length) { await message.channel.send('❌ No player names found in that.'); return; }
+      const bands = tiered ? applyTieredBases(parsed, o.cfg.defaultBase) : null;
+
+      let added = 0, dupes = 0;
+      for (const item of parsed) {
+        const k = openKey(item.name);
+        if (o.players[k]) { dupes++; continue; }
+        if (Object.keys(o.players).length >= OPEN_MAX_POOL) break;
+        const p = { n: item.name, set: item.set || null, base: item.base, bid: 0, uid: null, at: 0,
+                    closesAt: 0, closed: false, fl: {}, best: {}, hist: [], count: 0 };
+        if (item.ovr)  p.ovr  = item.ovr;
+        if (item.role) p.role = item.role;
+        o.players[k] = p;
+        added++;
+      }
+      scheduleAuctionSave();
+
+      const sets = {};
+      for (const it of parsed) sets[it.set || (it.ovr ? 'Rated list' : 'Ungrouped')] = (sets[it.set || (it.ovr ? 'Rated list' : 'Ungrouped')] || 0) + 1;
+      const embed = new EmbedBuilder().setTitle('✅ Pool loaded').setColor(0x57F287)
+        .setDescription(`Added **${added}** player(s)${dupes ? ` · ${dupes} duplicate(s) skipped` : ''} — pool is now **${Object.keys(o.players).length}**${Object.keys(o.players).length >= OPEN_MAX_POOL ? ` (cap ${OPEN_MAX_POOL} reached)` : ''}.`)
+        .addFields({ name: 'Sets', value: Object.entries(sets).map(([s, n]) => `• **${s}** — ${n}`).join('\n').slice(0, 1024) || '—' });
+      if (bands) {
+        embed.addFields({ name: 'Tiered base prices',
+          value: Object.entries(bands).map(([s, b]) => `• **${s}** — ${formatAmount(b)}`).join('\n').slice(0, 1024) });
+      } else {
+        embed.setFooter({ text: `All bases ${formatAmount(o.cfg.defaultBase)} — use ${openPfx}openpool tiered to scale them by tier/OVR instead.` });
+      }
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    // ── Host: start ────────────────────────────────────────────────────────
+    if (cmd === 'openstart' || cmd === 'ostart') {
+      if (!host()) return noPerm();
+      if (o.active) { await message.channel.send(`❌ An open auction is already running — closes ${ts(o.endsAt, 'R')}.`); return; }
+      const count = Object.keys(o.players).length;
+      if (!count) { await message.channel.send(`❌ Load a pool first: \`${openPfx}openpool <list>\``); return; }
+      const withPurse = Object.keys(gd.purses || {}).filter(u => gd.purses[u] > 0).length;
+      if (!withPurse) { await message.channel.send(`❌ Nobody has a purse yet — set them with \`${openPfx}openpurse all <amount>\`.`); return; }
+
+      const dur = rest ? parseDuration(rest) : o.cfg.days * 86400000;
+      if (!dur) { await message.channel.send(`❌ Usage: \`${openPfx}openstart 3d\` (also accepts \`72h\`, \`90m\`)`); return; }
+      const now = Date.now();
+      o.active = true; o.paused = false; o.startedAt = now; o.endsAt = now + dur;
+      o.settledAt = 0; o.results = null; o.warned = {}; o.pausedAt = 0;
+      o.autobids = {}; o.feed = [];        // stale maxes from a previous run must never fire
+      o.channelId = o.channelId || message.channel.id;
+
+      // Anyone already in a squad (retained, drafted or won in an earlier round)
+      // is not up for auction — everything else starts from a clean slate.
+      let owned = 0, live = 0;
+      for (const p of Object.values(o.players)) {
+        if (findTakenPlayer(gd, p.n)) {
+          p.closed = true; p.settled = true; owned++;
+          continue;
+        }
+        p.bid = 0; p.uid = null; p.at = 0; p.fl = {}; p.best = {};
+        p.hist = []; p.count = 0; p.sniped = 0; p.settled = false;
+        p.closed = false; p.closesAt = o.endsAt;
+        live++;
+      }
+      scheduleAuctionSave();
+      await flushAuction();
+
+      const embed = new EmbedBuilder().setTitle('💸 OPEN AUCTION IS LIVE')
+        .setColor(0x00FF00)
+        .setDescription(`**${live}** players are open for bidding right now. Bid on as many as you like, whenever you like.` +
+          (owned ? `\n*(${owned} already in a squad — not up for auction.)*` : ''))
+        .addFields(
+          { name: 'Closes',      value: `${ts(o.endsAt, 'F')}\n${ts(o.endsAt, 'R')}`, inline: true },
+          { name: 'Squad slots', value: String(o.cfg.maxSquad), inline: true },
+          { name: 'Min raise',   value: `${formatAmount(o.cfg.minInc)}${o.cfg.ladder ? ' (scales with price)' : ''}`, inline: true },
+          { name: 'How to bid',  value: `\`${openPfx}bid <player> <amount>\` — or \`${openPfx}max <player> <ceiling>\` and I'll bid for you automatically.`, inline: false },
+          { name: 'Money',       value: `Only the bids you're **leading** lock funds. Get outbid and it's free again. Check with \`${openPfx}bal\`.`, inline: false },
+          { name: 'Over-bidding', value: `You may lead more than ${o.cfg.maxSquad} players — set \`${openPfx}priority\` and the extras are released to the next bidder at settlement.`, inline: false },
+          { name: 'Anti-snipe',  value: `A bid in the last **${o.cfg.antiSnipe}m** pushes that player's close back by the same, so late sniping doesn't work.`, inline: false }
+        )
+        .setFooter({ text: `Started by ${message.author.tag} · ${openPfx}ohelp for everything` })
+        .setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      if (o.channelId !== message.channel.id) await openAnnounce(message.guild, gd, { embeds: [embed] });
+      if (live > 600) {
+        await message.channel.send(`ℹ️ Heads up: a **${live}**-player auction is a lot of state to back up. It all saves locally either way, but if the JSONBin upload ever starts failing in the logs, a smaller pool (or splitting the auction into rounds) is the fix.`);
+      }
+      return;
+    }
+
+    // ── Host: clock control ────────────────────────────────────────────────
+    if (cmd === 'openextend' || cmd === 'oextend') {
+      if (!host()) return noPerm();
+      if (!o.active) { await message.channel.send('❌ No open auction is running.'); return; }
+      const dur = parseDuration(rest || '');
+      if (!dur) { await message.channel.send(`❌ Usage: \`${openPfx}openextend 12h\``); return; }
+      o.endsAt += dur;
+      let moved = 0;
+      for (const p of Object.values(o.players)) if (!p.closed) { p.closesAt += dur; moved++; }
+      o.warned = {};
+      scheduleAuctionSave();
+      await message.channel.send(`⏰ Deadline pushed by **${fmtLeft(dur)}** — ${moved} player(s) still open, now closing ${ts(o.endsAt, 'R')}.`);
+      await openAnnounce(message.guild, gd, `⏰ The open auction was extended — it now closes ${ts(o.endsAt, 'R')}.`);
+      return;
+    }
+
+    if (cmd === 'openpause' || cmd === 'openresume') {
+      if (!host()) return noPerm();
+      if (!o.active) { await message.channel.send('❌ No open auction is running.'); return; }
+      const pausing = cmd === 'openpause';
+      if (pausing === !!o.paused) { await message.channel.send(pausing ? '⏸️ Already paused.' : '▶️ Not paused.'); return; }
+
+      if (pausing) {
+        o.paused = true;
+        o.pausedAt = Date.now();
+      } else {
+        // Paused time shouldn't eat anyone's bidding window — push every clock back by it.
+        const frozen = Math.max(0, Date.now() - (o.pausedAt || Date.now()));
+        o.paused = false; o.pausedAt = 0;
+        o.endsAt += frozen;
+        for (const p of Object.values(o.players)) if (!p.closed) p.closesAt += frozen;
+        o.warned = {};
+      }
+      scheduleAuctionSave();
+      await message.channel.send(pausing
+        ? `⏸️ Bidding **paused** — every clock is frozen. \`${openPfx}openresume\` to continue.`
+        : `▶️ Bidding **resumed** — clocks pushed back by the paused time, closing ${ts(o.endsAt, 'R')}.`);
+      await openAnnounce(message.guild, gd, pausing ? '⏸️ The open auction is paused by the host.' : `▶️ The open auction is back on — closes ${ts(o.endsAt, 'R')}.`);
+      return;
+    }
+
+    if (cmd === 'openend' || cmd === 'oend') {
+      if (!host()) return noPerm();
+      if (!o.active) { await message.channel.send('❌ No open auction is running.'); return; }
+      if ((parts[1] || '').toLowerCase() !== 'confirm') {
+        const open = Object.values(o.players).filter(p => !p.closed).length;
+        await message.channel.send(`⚠️ This closes **${open}** still-open player(s) and settles everything immediately.\nRun \`${openPfx}openend confirm\` to go ahead.`);
+        return;
+      }
+      for (const p of Object.values(o.players)) p.closed = true;
+      const status = await message.channel.send('⚙️ Settling the auction — working out who keeps whom...');
+      const res = await settleOpenAuction(message.guild, gd, message.author.tag);
+      await status.edit(`✅ Settled — **${res.awards.length}** sold, **${res.unsold.length}** unsold. \`${openPfx}results\` for the full list.`).catch(() => {});
+      return;
+    }
+
+    if (cmd === 'openreset') {
+      if (!host()) return noPerm();
+      const full = (parts[1] || '').toLowerCase() === 'full';
+      const confirmWord = full ? (parts[2] || '') : (parts[1] || '');
+      if (confirmWord.toLowerCase() !== 'confirm') {
+        await message.channel.send(`⚠️ This wipes the open auction pool, every bid, all maxes and priorities${full ? ' **and empties every squad**' : ''}.\nRun \`${openPfx}openreset ${full ? 'full ' : ''}confirm\` to go ahead.`);
+        return;
+      }
+      if (full) for (const uid of Object.keys(gd.squads || {})) gd.squads[uid] = [];
+      gd.open = openDefaults();
+      scheduleAuctionSave();
+      await flushAuction();
+      await message.channel.send(`🗑️ Open auction reset${full ? ' — squads emptied too' : ''}. Load a pool with \`${openPfx}openpool\`.`);
+      return;
+    }
+
+    // ── Host: config ───────────────────────────────────────────────────────
+    if (cmd === 'ocfg' || cmd === 'openconfig') {
+      if (!host()) return noPerm();
+      const key = (parts[1] || '').toLowerCase(), val = (parts[2] || '').toLowerCase();
+      if (!key) {
+        const embed = new EmbedBuilder().setTitle('⚙️ Open Auction Config').setColor(0x5865F2)
+          .addFields(
+            { name: 'maxsquad',   value: `${o.cfg.maxSquad} slots`, inline: true },
+            { name: 'inc',        value: formatAmount(o.cfg.minInc), inline: true },
+            { name: 'ladder',     value: o.cfg.ladder ? 'on — raises grow with price' : 'off — flat raises', inline: true },
+            { name: 'antisnipe',  value: `${o.cfg.antiSnipe} min`, inline: true },
+            { name: 'overcommit', value: o.cfg.overcommit ? 'on — may lead beyond the purse' : 'off — leads can never exceed the purse', inline: true },
+            { name: 'base',       value: formatAmount(o.cfg.defaultBase), inline: true },
+            { name: 'dm',         value: o.cfg.dm ? 'on' : 'off', inline: true },
+            { name: 'days',       value: `${o.cfg.days} (default length)`, inline: true }
+          )
+          .setFooter({ text: `${openPfx}ocfg <key> <value>` });
+        await message.channel.send({ embeds: [embed] });
+        return;
+      }
+      const onOff = (v) => v === 'on' || v === 'true' || v === 'yes';
+      let msg = null;
+      if (key === 'maxsquad')        { const n = parseInt(val); if (isNaN(n) || n < 0 || n > 200) { await message.channel.send('❌ 0-200 (0 = no limit).'); return; } o.cfg.maxSquad = n; msg = `Squad limit: **${n || 'none'}**`; }
+      else if (key === 'inc')        { const n = parseMoney(val); if (!n) { await message.channel.send('❌ Invalid amount.'); return; } o.cfg.minInc = n; msg = `Min raise: **${formatAmount(n)}**`; }
+      else if (key === 'base')       { const n = parseMoney(val); if (!n) { await message.channel.send('❌ Invalid amount.'); return; } o.cfg.defaultBase = n; msg = `Default base: **${formatAmount(n)}**`; }
+      else if (key === 'ladder')     { o.cfg.ladder = onOff(val); msg = `Increment ladder: **${o.cfg.ladder ? 'on' : 'off'}**`; }
+      else if (key === 'antisnipe')  { const n = parseInt(val); if (isNaN(n) || n < 0 || n > 180) { await message.channel.send('❌ 0-180 minutes.'); return; } o.cfg.antiSnipe = n; msg = `Anti-snipe: **${n}m**`; }
+      else if (key === 'overcommit') { o.cfg.overcommit = onOff(val); msg = `Over-commit: **${o.cfg.overcommit ? 'on — leads may exceed the purse, settlement trims by priority' : 'off — leads can never exceed the purse'}**`; }
+      else if (key === 'dm')         { o.cfg.dm = onOff(val); msg = `Outbid DMs: **${o.cfg.dm ? 'on' : 'off'}**`; }
+      else if (key === 'days')       { const n = parseFloat(val); if (isNaN(n) || n <= 0) { await message.channel.send('❌ Invalid.'); return; } o.cfg.days = n; msg = `Default length: **${n} day(s)**`; }
+      else { await message.channel.send('❌ Keys: `maxsquad` `inc` `base` `ladder` `antisnipe` `overcommit` `dm` `days`'); return; }
+      scheduleAuctionSave();
+      await message.channel.send(`✅ ${msg}`);
+      return;
+    }
+
+    if (cmd === 'openpurse' || cmd === 'osp') {
+      if (!host()) return noPerm();
+      const amt = parseMoney(parts[parts.length - 1]);
+      if (amt === null) { await message.channel.send(`❌ Usage: \`${openPfx}openpurse @user 100m\` or \`${openPfx}openpurse all 100m\``); return; }
+      if ((parts[1] || '').toLowerCase() === 'all') {
+        const ids = new Set([...Object.keys(gd.teams || {}), ...Object.keys(gd.purses || {})]);
+        if (!ids.size) { await message.channel.send('❌ Nobody has a team name or purse yet — set team names first (`.team @user <name>`).'); return; }
+        for (const uid of ids) gd.purses[uid] = amt;
+        scheduleAuctionSave();
+        await message.channel.send(`💰 Every team (**${ids.size}**) now has a purse of **${formatAmount(amt)}**.`);
+        return;
+      }
+      const target = resolveMemberTarget(gd, message, parts.slice(1, -1).join(' '));
+      if (!target) { await message.channel.send('❌ Could not find that member.'); return; }
+      gd.purses[target.id] = amt;
+      scheduleAuctionSave();
+      await message.channel.send(`💰 **${teamLabel(gd, message.guild, target.id)}** purse set to **${formatAmount(amt)}**.`);
+      return;
+    }
+
+    if (cmd === 'openlog') {
+      if (!host()) return noPerm();
+      const ch = message.mentions.channels.first();
+      if (!ch) { await message.channel.send(o.channelId ? `📋 Open auction announcements go to <#${o.channelId}>.` : `❌ Usage: \`${openPfx}openlog #channel\``); return; }
+      o.channelId = ch.id;
+      scheduleAuctionSave();
+      await message.channel.send(`✅ Open auction announcements → ${ch}`);
+      return;
+    }
+
+    // ── Team names ─────────────────────────────────────────────────────────
+    // Same store the live auction uses, so a server can run open auctions
+    // without ever touching the other prefix.
+    if (cmd === 'team' || cmd === 'setteam') {
+      if (!gd.teams) gd.teams = {};
+      const mentioned = message.mentions.members.first();
+      const target = mentioned || message.member;
+      if (target.id !== userId && !host()) {
+        await message.channel.send("❌ You need **Administrator** or **Auctioneer** role to set someone else's team name."); return;
+      }
+      let nameRaw = rest.replace(/<@!?\d+>/g, '').trim();
+      if (!nameRaw) {
+        const cur = gd.teams[target.id];
+        await message.channel.send(cur
+          ? `🏷️ **${target.displayName}**'s team name is **${cur}**.`
+          : `🏷️ **${target.displayName}** has no team name yet. Set with \`${openPfx}team ${target.id === userId ? '' : '@user '}<name>\`.`);
+        return;
+      }
+      if (['clear', 'remove', 'none', 'reset'].includes(nameRaw.toLowerCase())) {
+        delete gd.teams[target.id]; scheduleAuctionSave();
+        await message.channel.send(`🏷️ Cleared **${target.displayName}**'s team name.`); return;
+      }
+      gd.teams[target.id] = nameRaw.slice(0, 50); scheduleAuctionSave();
+      await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🏷️ Team Name Set').setColor(0x00B0F4)
+        .setDescription(`${target} is now **${gd.teams[target.id]}**.`)
+        .setFooter({ text: `Set by ${message.author.tag}` })] });
+      return;
+    }
+
+    // ── Bidding ────────────────────────────────────────────────────────────
+    if (cmd === 'bid' || cmd === 'b' || cmd === 'max' || cmd === 'autobid' || cmd === 'ab') {
+      const isMax = cmd !== 'bid' && cmd !== 'b';
+      if (!o.active) { await message.channel.send('❌ No open auction is running.'); return; }
+      if (o.paused)  { await message.channel.send('⏸️ Bidding is paused by the host.'); return; }
+
+      const { name, amount } = splitNameAmount(rest);
+      if (!name) { await message.channel.send(`❌ Usage: \`${openPfx}${cmd} <player> <amount>\` — e.g. \`${openPfx}${cmd} kohli 5m\``); return; }
+
+      // `max <player> clear` cancels a proxy
+      if (isMax && /^(clear|off|cancel|remove)$/i.test(rest.split(/\s+/).pop() || '')) {
+        const target = await resolveOrTell(rest.split(/\s+/).slice(0, -1).join(' '));
+        if (!target) return;
+        if (o.autobids[target.key]) delete o.autobids[target.key][userId];
+        scheduleAuctionSave();
+        await message.channel.send(`🤖 Max bid cleared for **${target.p.n}**. Your standing bid of ${target.p.fl && target.p.fl[userId] ? `**${formatAmount(target.p.fl[userId])}**` : 'nothing'} remains.`);
+        return;
+      }
+
+      if (amount === null || amount <= 0) { await message.channel.send(`❌ Invalid amount. Try \`${openPfx}${cmd} ${name} 5m\` (also \`500k\`, \`1.5cr\`, or plain numbers).`); return; }
+      if (!gd.purses[userId]) { await message.channel.send('❌ You have no purse in this auction — ask a host to set one.'); return; }
+
+      const target = await resolveOrTell(name);
+      if (!target) return;
+      const { key, p } = target;
+
+      const before = p.uid;
+      const res = applyOpenBid(gd, userId, key, amount, isMax ? 'max' : 'bid');
+      if (!res.ok) { await message.channel.send(`❌ ${res.err}`); return; }
+
+      const leads = openLeads(o, userId);
+      const slotsFree = (o.cfg.maxSquad || 0) ? o.cfg.maxSquad - openSlotsUsed(gd, userId) : Infinity;
+      const over = leads.length - slotsFree;
+
+      const embed = new EmbedBuilder()
+        .setTitle(res.youLead ? '✅ You are the highest bidder' : '❌ Outbid instantly')
+        .setColor(res.youLead ? 0x57F287 : 0xED4245)
+        .setDescription(`**${p.n}** — **${formatAmount(res.price)}** to **${teamOnly(gd, message.guild, res.leader)}**` +
+          (res.youLead ? '' : `\nSomeone's max bid beat you. Next valid bid: **${formatAmount(res.price + res.inc)}**.`))
+        .addFields(
+          { name: 'Available', value: formatAmount(openAvailable(gd, userId)), inline: true },
+          { name: 'Leading',   value: `${leads.length}${(o.cfg.maxSquad || 0) ? ` / ${o.cfg.maxSquad} slots` : ''}`, inline: true },
+          { name: 'Closes',    value: ts(p.closesAt, 'R'), inline: true }
+        );
+      if (isMax) embed.addFields({ name: '🤖 Max set', value: `I'll bid up to **${formatAmount(amount)}** for you automatically.`, inline: false });
+      if (res.extended) embed.addFields({ name: '⏱️ Extended', value: `Late bid — **${p.n}** now closes ${ts(p.closesAt, 'R')}.`, inline: false });
+      if (over > 0) embed.addFields({ name: '⚠️ Over your slots', value: `You lead **${over}** more player(s) than you can fit. Set \`${openPfx}priority\` or the bot decides which to release at settlement.`, inline: false });
+      embed.setFooter({ text: `${message.author.tag}` }).setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+
+      // Whoever just lost the lead hears about it straight away.
+      if (before && before !== res.leader && before !== userId) {
+        openDm(o, before, {
+          embeds: [new EmbedBuilder().setTitle('❌ You have been outbid').setColor(0xED4245)
+            .setDescription(`**${p.n}** in **${message.guild.name}** is now **${formatAmount(res.price)}** to **${teamOnly(gd, message.guild, res.leader)}**.`)
+            .addFields(
+              { name: 'Your bid was', value: formatAmount(res.prevPrice), inline: true },
+              { name: 'Next valid bid', value: formatAmount(res.price + res.inc), inline: true },
+              { name: 'Closes', value: ts(p.closesAt, 'R'), inline: true },
+              { name: 'Freed up', value: `${formatAmount(openAvailable(gd, before))} available again`, inline: false }
+            )
+            .setFooter({ text: `${openPfx}bid ${p.n} <amount> · ${openPfx}max ${p.n} <ceiling> · ${openPfx}notify off to stop these` })]
+        });
+      }
+      // Watchlist pings for everyone else following this player.
+      for (const [wid, keys] of Object.entries(o.watch || {})) {
+        if (wid === userId || wid === before || !(keys || []).includes(key)) continue;
+        openDm(o, wid, `👀 **${p.n}** (${message.guild.name}) is now **${formatAmount(res.price)}** — ${teamOnly(gd, message.guild, res.leader)}. Closes ${ts(p.closesAt, 'R')}.`);
+      }
+      return;
+    }
+
+    // ── Search ─────────────────────────────────────────────────────────────
+    if (cmd === 'search' || cmd === 's' || cmd === 'player' || cmd === 'p' || cmd === 'find') {
+      if (!rest) { await message.channel.send(`❌ Usage: \`${openPfx}search <player>\``); return; }
+      if (!Object.keys(o.players).length) { await message.channel.send('❌ No open auction pool loaded.'); return; }
+      const target = await resolveOrTell(rest);
+      if (!target) return;
+      await message.channel.send({ embeds: [openPlayerCard(gd, message.guild, target.key, userId, openPfx)] });
+      return;
+    }
+
+    // ── My bids ────────────────────────────────────────────────────────────
+    if (cmd === 'mybids' || cmd === 'mb' || cmd === 'bids') {
+      const here = /^(here|channel)$/i.test(parts[1] || '');
+      const leads = sortByOpenPriority(o, userId, openLeads(o, userId));
+      const lost  = openOutbid(o, userId).sort((a, b) => (b.mine || 0) - (a.mine || 0));
+      const maxes = Object.entries(o.autobids || {})
+        .filter(([k, m]) => m[userId] && o.players[k] && !o.players[k].closed)
+        .map(([k, m]) => ({ k, p: o.players[k], max: m[userId] }));
+      const purse = gd.purses[userId] || 0, committed = openCommitted(o, userId);
+      const used = openSlotsUsed(gd, userId), maxS = o.cfg.maxSquad || 0;
+
+      const embed = new EmbedBuilder()
+        .setTitle(`💸 Your open auction — ${message.guild.name}`)
+        .setColor(0x00B2FF)
+        .addFields(
+          { name: 'Purse',     value: formatAmount(purse), inline: true },
+          { name: 'Committed', value: `${formatAmount(committed)} *(leading bids)*`, inline: true },
+          { name: 'Available', value: `**${formatAmount(Math.max(0, purse - committed))}**`, inline: true },
+          { name: 'Squad',     value: maxS ? `${used}/${maxS} filled` : String(used), inline: true },
+          { name: 'Leading',   value: String(leads.length), inline: true },
+          { name: 'Outbid on', value: String(lost.length), inline: true }
+        );
+
+      const slotsFree = maxS ? maxS - used : Infinity;
+      if (leads.length > slotsFree) {
+        embed.addFields({ name: '⚠️ More leads than slots',
+          value: `You lead **${leads.length}** for **${slotsFree}** slot(s). At settlement the bottom **${leads.length - slotsFree}** of your priority order are released to the next bidder. Fix the order with \`${openPfx}priority\`.`, inline: false });
+      }
+      const leadTxt = leads.map((l, i) => `\`${i + 1}.\` **${l.p.n}** — ${formatAmount(l.a)}${maxS && i >= slotsFree ? ' ⚠️' : ''} · ${l.p.closed ? 'closed' : ts(l.p.closesAt, 'R')}`).join('\n');
+      embed.addFields({ name: `✅ Leading (priority order)`, value: (leadTxt || '*nothing yet*').slice(0, 1024), inline: false });
+      if (lost.length) {
+        embed.addFields({ name: '❌ Outbid', value: lost.slice(0, 12)
+          .map(l => `• **${l.p.n}** — yours ${formatAmount(l.mine)}, now **${formatAmount(l.p.bid)}** (${teamOnly(gd, message.guild, l.p.uid)})${l.p.closed ? ' — closed' : ''}`)
+          .join('\n').slice(0, 1024), inline: false });
+      }
+      if (maxes.length) {
+        embed.addFields({ name: '🤖 Active maxes', value: maxes.slice(0, 12)
+          .map(m => `• **${m.p.n}** — up to ${formatAmount(m.max)}${m.p.uid === userId ? ' *(leading)*' : ''}`)
+          .join('\n').slice(0, 1024), inline: false });
+      }
+      embed.setFooter({ text: `${openPfx}priority to reorder · ${openPfx}search <player> for details` }).setTimestamp();
+
+      if (here) { await message.channel.send({ embeds: [embed] }); return; }
+      try {
+        await message.author.send({ embeds: [embed] });
+        await message.channel.send('📬 Sent to your DMs — your maxes stay private that way. (`mybids here` posts it in channel.)');
+      } catch (_) {
+        await message.channel.send({ embeds: [embed] });
+      }
+      return;
+    }
+
+    // ── Priority ───────────────────────────────────────────────────────────
+    if (cmd === 'priority' || cmd === 'pr' || cmd === 'po') {
+      o.priority = o.priority || {};
+      const sub = (parts[1] || '').toLowerCase();
+
+      if (sub === 'clear') {
+        delete o.priority[userId]; scheduleAuctionSave();
+        await message.channel.send('🗑️ Priority cleared — your most expensive leads are protected first by default.');
+        return;
+      }
+
+      if (sub === 'top' || sub === 'up' || sub === 'down') {
+        const target = await resolveOrTell(parts.slice(2).join(' '));
+        if (!target) return;
+        const list = (o.priority[userId] || sortByOpenPriority(o, userId, openLeads(o, userId)).map(l => l.k)).filter(k => k !== target.key);
+        const cur  = (o.priority[userId] || []).indexOf(target.key);
+        if (sub === 'top') list.unshift(target.key);
+        else {
+          const at = cur === -1 ? list.length : cur;
+          list.splice(Math.max(0, sub === 'up' ? at - 1 : at + 1), 0, target.key);
+        }
+        o.priority[userId] = list;
+        scheduleAuctionSave();
+        await message.channel.send(`✅ **${target.p.n}** moved — now #${list.indexOf(target.key) + 1} in your priority.`);
+        return;
+      }
+
+      if (rest) {
+        const names = rest.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+        const keys = [], missed = [];
+        for (const n of names) {
+          const r = openResolve(o, n);
+          if (!r || r.ambiguous) { missed.push(n); continue; }
+          if (!keys.includes(r.key)) keys.push(r.key);
+        }
+        if (!keys.length) { await message.channel.send(`❌ None of those matched the pool.${missed.length ? ` Unknown: ${missed.slice(0, 8).join(', ')}` : ''}`); return; }
+        o.priority[userId] = keys;
+        scheduleAuctionSave();
+        await message.channel.send(`✅ Priority set — **${keys.length}** player(s), top choice **${o.players[keys[0]].n}**.${missed.length ? `\n⚠️ Not found: ${missed.slice(0, 8).join(', ')}` : ''}`);
+        return;
+      }
+
+      const leads = sortByOpenPriority(o, userId, openLeads(o, userId));
+      const maxS = o.cfg.maxSquad || 0, free = maxS ? maxS - openSlotsUsed(gd, userId) : Infinity;
+      const setList = o.priority[userId] || [];
+      const embed = new EmbedBuilder().setTitle('🎯 Your priority order').setColor(0xF1C40F)
+        .setDescription(setList.length
+          ? `**${setList.length}** player(s) explicitly ranked. Anything you lead that isn't ranked sits below them, priciest first.`
+          : `You haven't ranked anyone — your **most expensive** leads are protected first.\nSet one with \`${openPfx}priority <player1, player2, …>\`.`)
+        .addFields({ name: `Leading now (${leads.length}${maxS ? ` for ${free} slot(s)` : ''})`,
+          value: (leads.map((l, i) => `\`${i + 1}.\` **${l.p.n}** — ${formatAmount(l.a)}${i >= free ? ' ⚠️ released first' : ''}`).join('\n') || '*nothing yet*').slice(0, 1024) })
+        .setFooter({ text: `${openPfx}pr top <player> · ${openPfx}pr up/down <player> · ${openPfx}pr clear` });
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    // ── Balance / squad / leaderboard ──────────────────────────────────────
+    if (cmd === 'bal' || cmd === 'balance' || cmd === 'wallet') {
+      const target = resolveMemberTarget(gd, message, rest);
+      if (!target) { await message.channel.send('❌ Could not find that member.'); return; }
+      const uid = target.id;
+      const purse = gd.purses[uid] || 0, committed = openCommitted(o, uid);
+      const leads = openLeads(o, uid), maxS = o.cfg.maxSquad || 0, used = openSlotsUsed(gd, uid);
+      const embed = new EmbedBuilder().setTitle(`💰 ${teamLabel(gd, message.guild, uid)}`).setColor(0x00B2FF)
+        .addFields(
+          { name: 'Purse',     value: formatAmount(purse), inline: true },
+          { name: 'Committed', value: formatAmount(committed), inline: true },
+          { name: 'Available', value: `**${formatAmount(Math.max(0, purse - committed))}**`, inline: true },
+          { name: 'Leading',   value: String(leads.length), inline: true },
+          { name: 'Squad',     value: maxS ? `${used}/${maxS}` : String(used), inline: true },
+          { name: 'Avg lead',  value: leads.length ? formatAmount(committed / leads.length) : '—', inline: true }
+        ).setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    if (cmd === 'squad') {
+      const target = resolveMemberTarget(gd, message, rest);
+      if (!target) { await message.channel.send('❌ Could not find that member.'); return; }
+      const uid = target.id;
+      const bought = gd.squads[uid] || [];
+      const leads = sortByOpenPriority(o, uid, openLeads(o, uid));
+      const maxS = o.cfg.maxSquad || 0;
+      const embed = new EmbedBuilder().setTitle(`🏏 ${teamLabel(gd, message.guild, uid)}`).setColor(0x5865F2)
+        .addFields({ name: `Squad (${bought.length}${maxS ? `/${maxS}` : ''})`,
+          value: (bought.map((s, i) => `\`${i + 1}.\` **${s.player}** — ${formatAmount(s.price)}`).join('\n') || '*empty*').slice(0, 1024) });
+      if (leads.length) {
+        embed.addFields({ name: `⏳ Provisionally winning (${leads.length})`,
+          value: leads.map(l => `• **${l.p.n}** — ${formatAmount(l.a)}`).join('\n').slice(0, 1024) });
+      }
+      embed.setFooter({ text: `Purse ${formatAmount(gd.purses[uid] || 0)} · available ${formatAmount(openAvailable(gd, uid))}` });
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    if (cmd === 'lb' || cmd === 'leaderboard') {
+      const ids = new Set([...Object.keys(gd.purses || {}), ...Object.keys(gd.teams || {})]);
+      const rows = [...ids].map(uid => ({
+        uid, committed: openCommitted(o, uid), leads: openLeads(o, uid).length,
+        squad: openSlotsUsed(gd, uid), avail: openAvailable(gd, uid)
+      })).sort((a, b) => b.committed - a.committed);
+      if (!rows.length) { await message.channel.send('❌ No teams yet.'); return; }
+      const embed = new EmbedBuilder().setTitle('🏆 Open Auction — Spending').setColor(0xFFD700)
+        .setDescription(rows.slice(0, 20).map((r, i) =>
+          `\`${String(i + 1).padStart(2)}.\` **${teamOnly(gd, message.guild, r.uid)}** — ${formatAmount(r.committed)} on ${r.leads} lead(s) · ${formatAmount(r.avail)} left`).join('\n').slice(0, 4000))
+        .setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    // ── Browse the pool ────────────────────────────────────────────────────
+    if (cmd === 'players' || cmd === 'pool' || cmd === 'available' || cmd === 'list') {
+      const all = Object.entries(o.players);
+      if (!all.length) { await message.channel.send('❌ No open auction pool loaded.'); return; }
+      const filterArg = rest.toLowerCase();
+      let rows = all;
+      if (filterArg === 'open')       rows = all.filter(([, p]) => !p.closed);
+      else if (filterArg === 'nobids') rows = all.filter(([, p]) => !p.uid);
+      else if (filterArg === 'mine')   rows = all.filter(([, p]) => p.uid === userId);
+      else if (filterArg)              rows = all.filter(([, p]) => (p.set || '').toLowerCase() === filterArg);
+      if (!rows.length) { await message.channel.send(`❌ Nothing matches **${rest}**. Try \`open\`, \`nobids\`, \`mine\` or a set name.`); return; }
+
+      rows.sort((a, b) => (b[1].bid || b[1].base) - (a[1].bid || a[1].base));
+      const per = 15, pages = [];
+      for (let i = 0; i < rows.length; i += per) {
+        const chunk = rows.slice(i, i + per);
+        pages.push(new EmbedBuilder().setTitle('📋 Open Auction Players').setColor(0x00B2FF)
+          .setDescription(chunk.map(([, p]) =>
+            `${p.closed ? '🔒' : p.uid === userId ? '✅' : p.best && p.best[userId] ? '❌' : '•'} **${p.n}**${p.ovr ? ` \`${p.ovr}\`` : ''}${p.set ? ` *(${p.set})*` : ''} — ${p.uid ? `${formatAmount(p.bid)} · ${teamOnly(gd, message.guild, p.uid)}` : `base ${formatAmount(p.base)}, no bids`}`
+          ).join('\n').slice(0, 4000))
+          .setFooter({ text: `Page ${pages.length + 1}/${Math.ceil(rows.length / per)} · ${rows.length} player(s) · ✅ you lead, ❌ outbid, 🔒 closed` }));
+      }
+      await openPaginate(message, pages.slice(0, 40));
+      return;
+    }
+
+    if (cmd === 'hot' || cmd === 'contested') {
+      const rows = Object.values(o.players).filter(p => (p.count || 0) > 0)
+        .sort((a, b) => (b.count || 0) - (a.count || 0) || b.bid - a.bid).slice(0, 15);
+      if (!rows.length) { await message.channel.send('📭 No bids yet.'); return; }
+      await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🔥 Most contested').setColor(0xE67E22)
+        .setDescription(rows.map((p, i) => `\`${i + 1}.\` **${p.n}** — ${p.count} bid(s), now **${formatAmount(p.bid)}** (${teamOnly(gd, message.guild, p.uid)})`).join('\n').slice(0, 4000))
+        .setTimestamp()] });
+      return;
+    }
+
+    if (cmd === 'feed' || cmd === 'activity' || cmd === 'recent') {
+      const feed = (o.feed || []).slice(0, 15);
+      if (!feed.length) { await message.channel.send('📭 No bids yet.'); return; }
+      await message.channel.send({ embeds: [new EmbedBuilder().setTitle('📡 Latest bids').setColor(0x5865F2)
+        .setDescription(feed.map(f => `• **${(o.players[f.k] || {}).n || f.k}** — ${formatAmount(f.a)} · ${teamOnly(gd, message.guild, f.u)} ${ts(f.t, 'R')}`).join('\n').slice(0, 4000))
+        .setTimestamp()] });
+      return;
+    }
+
+    // ── Watchlist & notifications ──────────────────────────────────────────
+    if (cmd === 'watch' || cmd === 'w' || cmd === 'unwatch' || cmd === 'watchlist') {
+      o.watch = o.watch || {};
+      o.watch[userId] = o.watch[userId] || [];
+      const sub = (parts[1] || '').toLowerCase();
+      if (cmd === 'watchlist' || (!rest && cmd !== 'unwatch')) {
+        const list = o.watch[userId].map(k => o.players[k]).filter(Boolean);
+        await message.channel.send({ embeds: [new EmbedBuilder().setTitle('👀 Your watchlist').setColor(0x9B59B6)
+          .setDescription((list.map(p => `• **${p.n}** — ${p.uid ? `${formatAmount(p.bid)} (${teamOnly(gd, message.guild, p.uid)})` : `base ${formatAmount(p.base)}`}${p.closed ? ' 🔒' : ` · ${ts(p.closesAt, 'R')}`}`).join('\n') || `*empty* — add with \`${openPfx}watch <player>\``).slice(0, 4000))
+          .setFooter({ text: 'I DM you when a watched player is bid on, and 30m before it closes.' })] });
+        return;
+      }
+      if (sub === 'clear') { o.watch[userId] = []; scheduleAuctionSave(); await message.channel.send('🗑️ Watchlist cleared.'); return; }
+      const target = await resolveOrTell(rest.replace(/^(add|rem|remove)\s+/i, ''));
+      if (!target) return;
+      const i = o.watch[userId].indexOf(target.key);
+      if (cmd === 'unwatch' || i !== -1) {
+        if (i !== -1) o.watch[userId].splice(i, 1);
+        scheduleAuctionSave();
+        await message.channel.send(`👀 Removed **${target.p.n}** from your watchlist.`);
+      } else {
+        o.watch[userId].push(target.key);
+        scheduleAuctionSave();
+        await message.channel.send(`👀 Watching **${target.p.n}** — I'll DM you on every bid and 30m before it closes.`);
+      }
+      return;
+    }
+
+    if (cmd === 'notify') {
+      const on = /^(on|yes|true)$/i.test(parts[1] || '');
+      const off = /^(off|no|false)$/i.test(parts[1] || '');
+      if (!on && !off) { await message.channel.send(`❌ Usage: \`${openPfx}notify on\` / \`${openPfx}notify off\``); return; }
+      o.noDm = o.noDm || {};
+      if (on) delete o.noDm[userId]; else o.noDm[userId] = true;
+      scheduleAuctionSave();
+      await message.channel.send(on ? '🔔 Outbid DMs **on**.' : '🔕 Outbid DMs **off** — you\'ll have to check `mybids` yourself.');
+      return;
+    }
+
+    // ── Status & results ───────────────────────────────────────────────────
+    if (cmd === 'status' || cmd === 'ostatus' || cmd === 'open') {
+      const all = Object.values(o.players);
+      if (!all.length) { await message.channel.send(`📭 No open auction pool loaded — a host can add one with \`${openPfx}openpool\`.`); return; }
+      const openNow = all.filter(p => !p.closed).length;
+      const withBids = all.filter(p => p.uid).length;
+      const money = all.reduce((s, p) => s + (p.bid || 0), 0);
+      const embed = new EmbedBuilder()
+        .setTitle(o.active ? (o.paused ? '⏸️ Open Auction — paused' : '💸 Open Auction — live') : o.settledAt ? '🏁 Open Auction — settled' : '📋 Open Auction — not started')
+        .setColor(o.active ? (o.paused ? 0xFFA500 : 0x00FF00) : 0x95A5A6)
+        .addFields(
+          { name: 'Players',  value: `${all.length} total · ${openNow} open · ${all.length - openNow} closed`, inline: false },
+          { name: 'Bid on',   value: `${withBids} (${all.length - withBids} untouched)`, inline: true },
+          { name: 'On the table', value: formatAmount(money), inline: true },
+          { name: 'Teams',    value: String(new Set([...Object.keys(gd.purses || {}), ...Object.keys(gd.teams || {})]).size), inline: true }
+        );
+      if (o.active) embed.addFields(
+        { name: 'Closes', value: `${ts(o.endsAt, 'F')} · ${ts(o.endsAt, 'R')}`, inline: false },
+        { name: 'Rules',  value: `${o.cfg.maxSquad} slots · min raise ${formatAmount(o.cfg.minInc)} · anti-snipe ${o.cfg.antiSnipe}m · over-commit ${o.cfg.overcommit ? 'on' : 'off'}`, inline: false }
+      );
+      if (o.settledAt) embed.addFields({ name: 'Settled', value: `${ts(o.settledAt, 'R')} — \`${openPfx}results\``, inline: false });
+      const spenders = [...new Set([...Object.keys(gd.purses || {})])]
+        .map(uid => ({ uid, c: openCommitted(o, uid) })).filter(r => r.c > 0)
+        .sort((a, b) => b.c - a.c).slice(0, 5);
+      if (spenders.length) embed.addFields({ name: 'Top committed', value: spenders.map(r => `**${teamOnly(gd, message.guild, r.uid)}** — ${formatAmount(r.c)}`).join('\n').slice(0, 1024), inline: false });
+      embed.setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    if (cmd === 'results') {
+      if (!o.results) { await message.channel.send('❌ Nothing settled yet.'); return; }
+      const byTeam = {};
+      for (const a of o.results.awards) (byTeam[a.uid] = byTeam[a.uid] || []).push(a);
+      const pages = [];
+      for (const [uid, list] of Object.entries(byTeam).sort((x, y) => y[1].reduce((s, a) => s + a.a, 0) - x[1].reduce((s, a) => s + a.a, 0))) {
+        pages.push(new EmbedBuilder().setTitle(`🏁 ${teamLabel(gd, message.guild, uid)}`).setColor(0xFFD700)
+          .setDescription(list.map((a, i) => `\`${i + 1}.\` **${a.n}** — ${formatAmount(a.a)}`).join('\n').slice(0, 4000))
+          .setFooter({ text: `${list.length} player(s) · ${formatAmount(list.reduce((s, a) => s + a.a, 0))} spent · settled ${new Date(o.results.at).toLocaleString()}` }));
+      }
+      if (!pages.length) pages.push(new EmbedBuilder().setTitle('🏁 Results').setColor(0xFFD700).setDescription('Nobody won anything.'));
+      await openPaginate(message, pages);
+      return;
+    }
+
+    if (cmd === 'unsold') {
+      const list = o.results ? o.results.unsold : Object.values(o.players).filter(p => p.closed && !p.uid).map(p => p.n);
+      if (!list.length) { await message.channel.send('✅ Nothing unsold.'); return; }
+      await message.channel.send({ embeds: [new EmbedBuilder().setTitle(`📭 Unsold (${list.length})`).setColor(0x95A5A6)
+        .setDescription(list.slice(0, 100).join(', ').slice(0, 4000))] });
+      return;
+    }
+
+    // Unknown command under this prefix. Stay quiet by default — the prefix is a
+    // normal character and "$5 each" in chat must not get a reply — but answer
+    // anything that is clearly someone looking for the command list.
+    if (['help', 'h', 'commands', 'cmds', 'auction', 'openauction', 'ohelp1'].includes(cmd)) {
+      await message.channel.send(`❓ Open auction help is \`${openPfx}ohelp\` (bidding) and \`${openPfx}ohelp2\` (host commands).`);
+    }
+    return;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
   //  AUCTION COMMANDS  (. prefix)
   // ════════════════════════════════════════════════════════════════════════
 
@@ -1863,13 +3552,14 @@ client.on('messageCreate', async (message) => {
             { name: '🔨 Unsold', value: chMention(gd.unsoldChannel), inline: true },
             { name: '🔄 Trade',  value: chMention(gd.tradeChannel),  inline: true },
             { name: '🏏 Draft',  value: chMention(gd.draftChannel),  inline: true },
-            { name: '⏭️ Skip',   value: chMention(gd.skipChannel),   inline: true }
-          ).setFooter({ text: `${aucPfx}slc [sold|unsold|trade|draft|skip|all] #channel` });
+            { name: '⏭️ Skip',   value: chMention(gd.skipChannel),   inline: true },
+            { name: '💵 Pay',    value: chMention(gd.payChannel),    inline: true }
+          ).setFooter({ text: `${aucPfx}slc [sold|unsold|trade|draft|skip|pay|all] #channel` });
         await message.channel.send({ embeds: [embed] }); return;
       }
 
       const ch    = message.mentions.channels.first();
-      const types = ['sold', 'unsold', 'trade', 'draft', 'skip', 'all', 'default', 'general'];
+      const types = ['sold', 'unsold', 'trade', 'draft', 'skip', 'pay', 'all', 'default', 'general'];
       const type  = types.includes((parts[1] || '').toLowerCase()) ? parts[1].toLowerCase() : 'all';
       let label;
       if (type === 'sold')        { gd.soldChannel   = ch.id; label = '🔨 SOLD logs'; }
@@ -1877,6 +3567,7 @@ client.on('messageCreate', async (message) => {
       else if (type === 'trade')  { gd.tradeChannel  = ch.id; label = '🔄 Trade logs'; }
       else if (type === 'draft')  { gd.draftChannel  = ch.id; label = '🏏 Draft pick logs'; }
       else if (type === 'skip')   { gd.skipChannel   = ch.id; label = '⏭️ Draft skip logs'; }
+      else if (type === 'pay')    { gd.payChannel    = ch.id; label = '💵 Staff payment logs'; }
       else                        { gd.logChannel    = ch.id; label = 'General logs (default for all types)'; }
       scheduleAuctionSave();
       const embed = new EmbedBuilder().setTitle('📋 Log Channel Set').setColor(0x0099FF)
@@ -2909,6 +4600,478 @@ client.on('messageCreate', async (message) => {
         ).setFooter({ text: `By ${message.author.tag}` }).setTimestamp();
       await message.channel.send({ embeds: [embed] });
       await sendLog(message.guild, embed);
+      return;
+    }
+
+    // ── STAFF PAYMENTS ─────────────────────────────────────────────────────
+    // A ledger only — the bot never moves money. It tracks what each staff
+    // member is still owed, who they collect it from, and every change to it.
+
+    // Plain-name targets need the whole member list — the cache is partial until
+    // it's fetched. Mentions and raw ids resolve without this.
+    const PAY_CMDS = ['pay','mypay','paylog','payadd','payremove','payrem','payset','payer','paydone','paypaid',
+                      'paydeny','payreject','payundo','payclear','payadmin','payshare','payshares','paycut','shares'];
+    if (PAY_CMDS.includes(cmd) && parts.length > 1 && !message.mentions.members.first()) {
+      try { await message.guild.members.fetch(); } catch (_) {}
+    }
+
+    // .payhelp — the whole system on one page
+    if (cmd === 'payhelp') {
+      await message.channel.send({ embeds: [payHelpEmbed(aucPfx)] }); return;
+    }
+
+    // .payadmin [add|remove|default] @user — who may run the pay commands
+    if (cmd === 'payadmin') {
+      gd.payAdmins = gd.payAdmins || {};
+      const sub = (parts[1] || '').toLowerCase();
+      if (!sub || sub === 'list') {
+        const entries = Object.entries(gd.payAdmins);
+        const def = gd.payDefaultAdmin ? `\n**Default payer:** <@${gd.payDefaultAdmin}>` : '';
+        await message.channel.send(entries.length
+          ? `💵 **Pay admins:**\n${entries.map(([id, tag]) => `• <@${id}> (${tag})`).join('\n')}${def}`
+          : `💵 No pay admins set yet — Admins/Auctioneers can run everything. Add one with \`${aucPfx}payadmin add @user\`.`);
+        return;
+      }
+      if (!hasAuctionPermission(message.member)) {
+        await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return;
+      }
+      const target = message.mentions.members.first() || resolvePayMember(message.guild, gd, parts.slice(2).join(' '));
+      if (!['add', 'remove', 'default'].includes(sub) || !target) {
+        await message.channel.send(`❌ Usage: \`${aucPfx}payadmin add|remove|default <@user|name>\``); return;
+      }
+      if (sub === 'add') {
+        gd.payAdmins[target.id] = target.user.tag;
+        if (!gd.payDefaultAdmin) gd.payDefaultAdmin = target.id;   // first one becomes the fallback payer
+        scheduleAuctionSave();
+        await message.channel.send(`✅ **${target.user.tag}** can now manage staff payments.${gd.payDefaultAdmin === target.id ? ' They are also the default payer.' : ''}`);
+      } else if (sub === 'remove') {
+        if (!gd.payAdmins[target.id]) { await message.channel.send(`❌ **${target.user.tag}** isn't a pay admin.`); return; }
+        delete gd.payAdmins[target.id];
+        if (gd.payDefaultAdmin === target.id) gd.payDefaultAdmin = Object.keys(gd.payAdmins)[0] || null;
+        scheduleAuctionSave();
+        await message.channel.send(`✅ Pay-admin rights removed from **${target.user.tag}**.`);
+      } else {
+        gd.payAdmins[target.id] = gd.payAdmins[target.id] || target.user.tag;
+        gd.payDefaultAdmin = target.id;
+        scheduleAuctionSave();
+        await message.channel.send(`✅ **${target.user.tag}** is now the default payer — staff without their own payer claim from them.`);
+      }
+      return;
+    }
+
+    // .payadd / .payremove / .payset @user <amount> [note]
+    if (cmd === 'payadd' || cmd === 'payremove' || cmd === 'payrem' || cmd === 'payset') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const { target, amount, note } = parsePayArgs(message, gd, parts);
+      if (!target || amount === null) { await message.channel.send(`❌ Usage: \`${aucPfx}${cmd} <@user|name> <amount> [note]\``); return; }
+      if (amount < 0) { await message.channel.send('❌ Amount cannot be negative.'); return; }
+      const e = payEntry(gd, target.id);
+      const before = e.due;
+      if (cmd === 'payadd')      e.due = before + amount;
+      else if (cmd === 'payset') e.due = amount;
+      else                       e.due = Math.max(0, before - amount);
+      const delta = e.due - before;
+      // Nobody assigned yet → whoever logs the payment is the one they collect from
+      if (!e.payer && !payerFor(gd, target.id)) e.payer = userId;
+      payLog(e, cmd === 'payset' ? 'set' : (cmd === 'payadd' ? 'add' : 'remove'), delta, userId, note);
+      scheduleAuctionSave();
+
+      const embed = new EmbedBuilder()
+        .setTitle(cmd === 'payadd' ? '💵 Payment Added' : (cmd === 'payset' ? '💵 Payment Set' : '💵 Payment Reduced'))
+        .setColor(delta >= 0 ? 0x2ECC71 : 0xE67E22)
+        .setDescription(`**${target.displayName}** — ${formatAmount(before)} → **${formatAmount(e.due)}**${delta ? ` (${delta > 0 ? '+' : '−'}${formatAmount(Math.abs(delta))})` : ''}`)
+        .addFields({ name: 'Claim from', value: payerMention(gd, target.id) || `*not assigned — \`${aucPfx}payer @user @admin\`*`, inline: true })
+        .setFooter({ text: `By ${message.author.tag}${note ? ` • ${note}` : ''}` })
+        .setTimestamp();
+      // Never ping — mentions inside an embed render as names without notifying
+      await message.channel.send({ embeds: [embed] });
+      await sendLogText(message.guild, { embeds: [embed] }, 'pay');
+      return;
+    }
+
+    // .payer <staff> <admin> — who that staff member collects from
+    // .payer default <admin> — fallback for everyone without their own
+    if (cmd === 'payer') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      gd.payAdmins = gd.payAdmins || {};
+      // Walk the tokens in the order they were typed so mentions and plain
+      // names can be mixed freely
+      const isDefault = (parts[1] || '').toLowerCase() === 'default';
+      const found = [];
+      for (const tok of parts.slice(isDefault ? 2 : 1)) {
+        if (found.length === 2) break;
+        const m   = tok.match(/^<@!?(\d+)>$/);
+        const mem = m ? message.guild.members.cache.get(m[1]) : resolvePayMember(message.guild, gd, tok);
+        if (mem) found.push(mem);
+      }
+      if (isDefault) {
+        const admin = found[0];
+        if (!admin) { await message.channel.send(`❌ Usage: \`${aucPfx}payer default <@admin|name>\``); return; }
+        gd.payAdmins[admin.id] = gd.payAdmins[admin.id] || admin.user.tag;
+        gd.payDefaultAdmin = admin.id;
+        scheduleAuctionSave();
+        await message.channel.send(`✅ Staff without their own payer now claim from **${admin.displayName}**.`);
+        return;
+      }
+      if (found.length < 2) { await message.channel.send(`❌ Usage: \`${aucPfx}payer <@staff|name> <@admin|name>\` (or \`${aucPfx}payer default <@admin|name>\`)`); return; }
+      const [staff, admin] = found;
+      const e = payEntry(gd, staff.id);
+      e.payer = admin.id;
+      gd.payAdmins[admin.id] = gd.payAdmins[admin.id] || admin.user.tag;
+      payLog(e, 'note', 0, userId, `payer set to ${admin.user.tag}`);
+      scheduleAuctionSave();
+      await message.channel.send(`✅ **${staff.displayName}** now claims their payment from **${admin.displayName}**.`);
+      return;
+    }
+
+    // .payticket <text|clear> — the instructions staff get when they claim
+    if (cmd === 'payticket') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const text = aucRaw.slice(parts[0].length).trim();
+      if (!text) { await message.channel.send(`🎫 Current claim instructions:\n> ${payTicketLine(gd)}\nChange with \`${aucPfx}payticket <text>\` or reset with \`${aucPfx}payticket clear\`.`); return; }
+      if (text.toLowerCase() === 'clear') {
+        gd.payTicket = null; scheduleAuctionSave();
+        await message.channel.send('🎫 Claim instructions reset to the default.'); return;
+      }
+      gd.payTicket = text.slice(0, 400); scheduleAuctionSave();
+      await message.channel.send(`🎫 Claim instructions set:\n> ${gd.payTicket}`); return;
+    }
+
+    // .payclear @user — drop a staff member from the ledger entirely
+    if (cmd === 'payclear') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const target = message.mentions.members.first() || resolvePayMember(message.guild, gd, parts.slice(1).join(' '));
+      if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}payclear <@user|name>\``); return; }
+      if (!gd.staffPay || !gd.staffPay[target.id]) { await message.channel.send(`❌ **${target.displayName}** isn't in the payment ledger.`); return; }
+      const owed = gd.staffPay[target.id].due || 0;
+      delete gd.staffPay[target.id];
+      scheduleAuctionSave();
+      await message.channel.send(`🗑️ **${target.displayName}** removed from the payment ledger${owed > 0 ? ` (had **${formatAmount(owed)}** outstanding)` : ''}.`);
+      return;
+    }
+
+    // .pay [<@user|name>] — what's still owed and who to claim it from
+    if (cmd === 'pay' || cmd === 'mypay') {
+      const argText  = aucRaw.slice(parts[0].length).trim();
+      const resolved = argText ? resolvePayMember(message.guild, gd, argText) : message.member;
+      if (!resolved) { await message.channel.send(`❌ No member named "${argText}" found.`); return; }
+      if (resolved.id !== userId && !isPayAdmin(gd, message.member)) {
+        await message.channel.send('❌ You can only check your own payment — pay admins can check anyone.'); return;
+      }
+      if (!gd.staffPay || !gd.staffPay[resolved.id]) {
+        await message.channel.send(resolved.id === userId
+          ? '💵 Nothing logged for you — you have no pending payment.'
+          : `💵 **${displayNameOf(message.guild, resolved.id)}** has nothing logged in the payment ledger.`);
+        return;
+      }
+      await message.channel.send({ embeds: [payStatusEmbed(gd, message.guild, resolved.id, aucPfx)] });
+      return;
+    }
+
+    // .paylog [<@user|name>] — the full history we kept
+    if (cmd === 'paylog') {
+      const argText  = aucRaw.slice(parts[0].length).trim();
+      const resolved = argText ? resolvePayMember(message.guild, gd, argText) : message.member;
+      if (!resolved) { await message.channel.send(`❌ No member named "${argText}" found.`); return; }
+      if (resolved.id !== userId && !isPayAdmin(gd, message.member)) {
+        await message.channel.send('❌ You can only check your own log — pay admins can check anyone.'); return;
+      }
+      const e = gd.staffPay && gd.staffPay[resolved.id];
+      if (!e || !e.history || e.history.length === 0) { await message.channel.send('💵 No payment history logged yet.'); return; }
+      const lines = payHistoryLines(e);
+      const embed = new EmbedBuilder()
+        .setTitle(`📒 Payment Log — ${displayNameOf(message.guild, resolved.id)}`)
+        .setColor(0x9B59B6)
+        .setDescription(`**Remaining:** ${formatAmount(e.due)}  •  **Claim from:** ${payerMention(gd, resolved.id) || '*not assigned*'}`)
+        .setTimestamp();
+      // 1024 chars per field — spill into extra fields rather than truncating
+      let chunk = '';
+      for (const line of lines) {
+        if ((chunk + line).length > 1000) { embed.addFields({ name: '​', value: chunk, inline: false }); chunk = ''; }
+        chunk += line + '\n';
+      }
+      if (chunk) embed.addFields({ name: '​', value: chunk, inline: false });
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    // .paylist / .payall — everyone with an unclaimed balance or a pending claim
+    if (cmd === 'paylist' || cmd === 'payall') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const entries = Object.entries(gd.staffPay || {}).filter(([, e]) => (e.due || 0) > 0 || (e.claims || []).length);
+      const embed = new EmbedBuilder().setTitle('💵 Staff Payments Outstanding').setColor(0xFFA500).setTimestamp();
+      if (entries.length === 0) {
+        embed.setDescription('✅ Everyone is paid up — nothing outstanding.');
+      } else {
+        entries.sort((a, b) => ((b[1].due || 0) + payPending(b[1])) - ((a[1].due || 0) + payPending(a[1])));
+        const lines = entries.map(([uid, e]) => {
+          const pending = payPending(e);
+          const payer   = payerMention(gd, uid) || '*unassigned*';
+          return `${pending ? '📨' : '•'} **${displayNameOf(message.guild, uid)}** — ${formatAmount(e.due)} unclaimed${pending ? ` · **${formatAmount(pending)}** awaiting transfer` : ''} · from ${payer}`;
+        });
+        const totalDue = entries.reduce((s, [, e]) => s + (e.due || 0), 0);
+        const totalPen = entries.reduce((s, [, e]) => s + payPending(e), 0);
+        embed.setDescription(lines.join('\n').slice(0, 4000))
+          .setFooter({ text: `${entries.length} staff • ${formatAmount(totalDue)} unclaimed • ${formatAmount(totalPen)} awaiting transfer (${aucPfx}payclaims)` });
+      }
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    // .payclaim [amount] [note] — takes the amount off the balance right away and
+    // leaves it pending until an admin transfers the currency in the other bot
+    if (cmd === 'payclaim') {
+      const e = gd.staffPay && gd.staffPay[userId] ? payEntry(gd, userId) : null;
+      if (!e || (e.due || 0) <= 0) { await message.channel.send('💵 You have nothing to claim — your unclaimed balance is **0**.'); return; }
+      const rest    = parts.slice(1);
+      const asked   = rest.length ? parsePayAmount(rest[0]) : null;
+      const amount  = (asked === null || asked <= 0) ? e.due : Math.min(asked, e.due);
+      const note    = (asked === null ? rest : rest.slice(1)).join(' ').trim();
+      const payer   = payerFor(gd, userId);
+      e.due -= amount;                                   // claimed money leaves the balance immediately
+      e.claims.push({ amount, note, ts: Date.now() });
+      payLog(e, 'claim', -amount, userId, `claimed${note ? ` — ${note}` : ''}`);
+      scheduleAuctionSave();
+      await flushAuction();   // the balance moved — don't risk losing it to a restart
+
+      const embed = new EmbedBuilder()
+        .setTitle('📨 Payment Claimed')
+        .setColor(0x3498DB)
+        .setDescription(`**${message.member.displayName}** claimed **${formatAmount(amount)}** — taken off their balance, now waiting to be transferred.`)
+        .addFields(
+          { name: 'Claim from', value: payer ? `<@${payer}>` : `*Nobody assigned — an admin must run \`${aucPfx}payer @you @admin\`*`, inline: true },
+          { name: 'Unclaimed left', value: formatAmount(e.due), inline: true },
+          { name: '🎫 How to collect', value: payTicketLine(gd), inline: false }
+        )
+        .setTimestamp();
+      if (note) embed.addFields({ name: 'Note', value: note.slice(0, 1024), inline: false });
+      await message.channel.send({ embeds: [embed] });
+      await sendLogText(message.guild, { embeds: [embed] }, 'pay');
+      // The claimer gets the ticket instructions in DMs — nobody else is pinged
+      await message.author.send({ content:
+        `🎫 **Open a ticket to collect your ${formatAmount(amount)}** — ${message.guild.name}\n` +
+        `${payTicketLine(gd)}\n` +
+        (payer ? `Ask for **${displayNameOf(message.guild, payer)}** — they send the currency.\n` : '') +
+        `Unclaimed balance left: **${formatAmount(e.due)}**.`
+      }).catch(async () => {
+        await message.channel.send(`⚠️ ${message.member} your DMs are closed — 🎫 ${payTicketLine(gd)}`).catch(() => {});
+      });
+      return;
+    }
+
+    // .payclaims — everything claimed but not yet transferred
+    if (cmd === 'payclaims' || cmd === 'paypending') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const waiting = Object.entries(gd.staffPay || {}).filter(([, e]) => (e.claims || []).length);
+      const embed = new EmbedBuilder().setTitle('📨 Waiting To Be Transferred').setColor(0x3498DB).setTimestamp();
+      if (waiting.length === 0) {
+        embed.setDescription('Nothing pending — every claim has been transferred.');
+      } else {
+        waiting.sort((a, b) => a[1].claims[0].ts - b[1].claims[0].ts);
+        embed.setDescription(waiting.map(([uid, e]) => {
+          const rows = e.claims.map(c => `   • ${formatAmount(c.amount)} <t:${Math.floor(c.ts / 1000)}:R>${c.note ? ` — *${c.note}*` : ''}`).join('\n');
+          return `📨 **${displayNameOf(message.guild, uid)}** — **${formatAmount(payPending(e))}** · from ${payerMention(gd, uid) || '*unassigned*'}\n${rows}`;
+        }).join('\n').slice(0, 4000))
+          .setFooter({ text: `Total ${formatAmount(waiting.reduce((s, [, e]) => s + payPending(e), 0))} · ${aucPfx}paydone <user> [all] once transferred · ${aucPfx}paydeny <user> to put it back` });
+      }
+      await message.channel.send({ embeds: [embed] });
+      return;
+    }
+
+    // .paydone <user> [all] [note] — currency sent in the other bot, so drop the
+    // pending claim (the balance already came off when they claimed)
+    if (cmd === 'paydone' || cmd === 'paypaid') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const pinged = message.mentions.members.first();
+      const target = pinged || resolvePayMember(message.guild, gd, parts[1]);
+      if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}paydone <@user|name> [all] [note]\``); return; }
+      const e = payEntry(gd, target.id);
+      if (!e.claims.length) { await message.channel.send(`❌ **${target.displayName}** has nothing waiting to be transferred.`); return; }
+      const tail = parts.slice(1).filter((p, i) => !/^<@[!&]?\d+>$/.test(p) && !(!pinged && i === 0));
+      const all  = (tail[0] || '').toLowerCase() === 'all';
+      const note = (all ? tail.slice(1) : tail).join(' ').trim();
+      const cleared = all ? e.claims.splice(0) : [e.claims.shift()];
+      const total   = cleared.reduce((s, c) => s + c.amount, 0);
+      payLog(e, 'paid', 0, userId, `transferred ${formatAmount(total)}${note ? ` — ${note}` : ''}`);
+      scheduleAuctionSave();
+
+      const embed = new EmbedBuilder()
+        .setTitle('✅ Transfer Confirmed')
+        .setColor(0x2ECC71)
+        .setDescription(`**${formatAmount(total)}** transferred to **${target.displayName}** by ${message.author.tag}.`)
+        .addFields(
+          { name: 'Still waiting', value: formatAmount(payPending(e)), inline: true },
+          { name: 'Unclaimed balance', value: formatAmount(e.due), inline: true }
+        )
+        .setFooter({ text: note || `Cleared ${cleared.length} claim(s)` })
+        .setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      await sendLogText(message.guild, { embeds: [embed] }, 'pay');
+      return;
+    }
+
+    // .paydeny <user> [reason] — cancel a pending claim and put the money back
+    if (cmd === 'paydeny' || cmd === 'payreject' || cmd === 'payundo') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const pinged = message.mentions.members.first();
+      const target = pinged || resolvePayMember(message.guild, gd, parts[1]);
+      if (!target) { await message.channel.send(`❌ Usage: \`${aucPfx}paydeny <@user|name> [reason]\``); return; }
+      const e = payEntry(gd, target.id);
+      if (!e.claims.length) { await message.channel.send(`❌ **${target.displayName}** has no pending claim.`); return; }
+      const tail   = parts.slice(1).filter((p, i) => !/^<@[!&]?\d+>$/.test(p) && !(!pinged && i === 0));
+      const all    = (tail[0] || '').toLowerCase() === 'all';
+      const reason = (all ? tail.slice(1) : tail).join(' ').trim();
+      const undone = all ? e.claims.splice(0) : [e.claims.shift()];
+      const total  = undone.reduce((s, c) => s + c.amount, 0);
+      e.due += total;                                    // never transferred, so give it back
+      payLog(e, 'add', total, userId, `claim cancelled${reason ? `: ${reason}` : ''}`);
+      scheduleAuctionSave();
+      await message.channel.send({ embeds: [new EmbedBuilder()
+        .setTitle('🚫 Claim Cancelled')
+        .setColor(0xE74C3C)
+        .setDescription(`**${target.displayName}**'s claim of **${formatAmount(total)}** was cancelled and put back on their balance.`)
+        .addFields({ name: 'Unclaimed balance', value: `**${formatAmount(e.due)}**`, inline: true })
+        .setFooter({ text: `By ${message.author.tag}${reason ? ` • ${reason}` : ''}` })
+        .setTimestamp()] });
+      return;
+    }
+
+    // .payshare — named percentage lists
+    //   .payshare                              all lists
+    //   .payshare <list>                       one list
+    //   .payshare <list> add <user> <pct>      add/update a member (creates the list)
+    //   .payshare <list> rem <user>            drop a member
+    //   .payshare <list> delete                delete the list
+    if (cmd === 'payshare' || cmd === 'payshares' || cmd === 'paycut' || cmd === 'shares') {
+      const lists = payLists(gd);
+      const names = Object.keys(lists);
+
+      // No list named → show them all
+      if (parts.length === 1) {
+        const embed = new EmbedBuilder().setTitle('📊 Percentage Lists').setColor(0x1ABC9C).setTimestamp();
+        if (names.length === 0) {
+          embed.setDescription(`No lists yet. Make one with \`${aucPfx}payshare <list> add <@user|name> <percent>\` — e.g. \`${aucPfx}payshare tournament add jaiv 20\`.`);
+        } else {
+          embed.setDescription(names.map(n => {
+            const t = payShareTotal(lists[n]);
+            return `**${n}** — ${Object.keys(lists[n]).length} people, ${t}%${t > 100 ? ' ⚠️' : ''}`;
+          }).join('\n'))
+            .setFooter({ text: `${aucPfx}payshare <list> to see one · ${aucPfx}pay run <amount> <list> to pay it out` });
+        }
+        await message.channel.send({ embeds: [embed] });
+        return;
+      }
+
+      const listName = parts[1];
+      const sub      = (parts[2] || '').toLowerCase();
+      const found    = payListFind(gd, listName);
+
+      // Just the name → show that list
+      if (!sub) {
+        if (!found) { await message.channel.send(`❌ No list called **${listName}**. Existing: ${names.length ? names.join(', ') : 'none yet'}`); return; }
+        const rows  = Object.entries(found.list).sort((a, b) => b[1] - a[1]);
+        const total = payShareTotal(found.list);
+        const embed = new EmbedBuilder()
+          .setTitle(`📊 ${found.key}`)
+          .setColor(0x1ABC9C)
+          .setDescription(rows.length
+            ? rows.map(([uid, p]) => `• **${displayNameOf(message.guild, uid)}** — ${p}%  *(${formatAmount(1000 * p)} per 100,000)*`).join('\n')
+            : '*Empty — nobody in this list yet.*')
+          .setFooter({ text: `${total}% allocated${total > 100 ? ' — over 100%!' : total < 100 ? ` · ${100 - total}% kept` : ''}` })
+          .setTimestamp();
+        await message.channel.send({ embeds: [embed] });
+        return;
+      }
+
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+
+      if (sub === 'delete' || sub === 'del') {
+        if (!found) { await message.channel.send(`❌ No list called **${listName}**.`); return; }
+        delete lists[found.key]; scheduleAuctionSave();
+        await message.channel.send(`🗑️ List **${found.key}** deleted.`); return;
+      }
+
+      if (sub === 'rename') {
+        if (!found) { await message.channel.send(`❌ No list called **${listName}**.`); return; }
+        const newName = parts.slice(3).join(' ').trim();
+        if (!newName) { await message.channel.send(`❌ Usage: \`${aucPfx}payshare <list> rename <new name>\``); return; }
+        lists[newName] = found.list; delete lists[found.key]; scheduleAuctionSave();
+        await message.channel.send(`✏️ **${found.key}** renamed to **${newName}**.`); return;
+      }
+
+      if (sub !== 'add' && sub !== 'set' && sub !== 'rem' && sub !== 'remove') {
+        await message.channel.send(`❌ Usage: \`${aucPfx}payshare <list> add <@user|name> <percent>\` · \`rem <user>\` · \`delete\` · \`rename <new name>\``); return;
+      }
+
+      // add/rem read parts[3..] so the list name is never mistaken for the target
+      const { target, amount } = parsePayArgs(message, gd, ['x', ...parts.slice(3)]);
+      if (!target) { await message.channel.send(`❌ Who? Usage: \`${aucPfx}payshare ${listName} ${sub} <@user|name>${sub === 'add' || sub === 'set' ? ' <percent>' : ''}\``); return; }
+
+      if (sub === 'rem' || sub === 'remove') {
+        if (!found || !(target.id in found.list)) { await message.channel.send(`❌ **${target.displayName}** isn't in **${listName}**.`); return; }
+        delete found.list[target.id]; scheduleAuctionSave();
+        await message.channel.send(`✅ **${target.displayName}** removed from **${found.key}** — now ${payShareTotal(found.list)}% allocated.`); return;
+      }
+
+      if (amount === null) { await message.channel.send(`❌ Give a percentage: \`${aucPfx}payshare ${listName} add ${target.displayName} 20\``); return; }
+      if (amount <= 0 || amount > 100) { await message.channel.send('❌ Percentage must be between 0 and 100 (use `rem` to drop someone).'); return; }
+      const key = found ? found.key : listName;
+      if (!found) lists[key] = {};
+      lists[key][target.id] = amount;
+      scheduleAuctionSave();
+      const total = payShareTotal(lists[key]);
+      await message.channel.send(`✅ **${target.displayName}** gets **${amount}%** of **${key}** — ${formatAmount(1000 * amount)} per 100,000.\nList now totals **${total}%**${total > 100 ? ' ⚠️ over 100%' : ''}.`);
+      return;
+    }
+
+    // .purchase <amount> <list> [note] — pay a total out through a percentage list
+    if (cmd === 'purchase' || cmd === 'payrun' || cmd === 'paysplit' || cmd === 'split' || cmd === 'sale') {
+      if (!isPayAdmin(gd, message.member)) { await message.channel.send(`❌ Pay admins only — grant with \`${aucPfx}payadmin add @user\`.`); return; }
+      const lists  = payLists(gd);
+      const names  = Object.keys(lists);
+      const amount = parsePayAmount(parts[1]);
+      if (amount === null || amount <= 0) { await message.channel.send(`❌ Usage: \`${aucPfx}purchase <amount> <list> [note]\` — e.g. \`${aucPfx}purchase 200k tournament\``); return; }
+      if (names.length === 0) { await message.channel.send(`❌ No percentage lists yet — make one with \`${aucPfx}payshare <list> add <@user|name> <percent>\`.`); return; }
+      // One list on the server → the name is optional
+      const found = payListFind(gd, parts[2]) || (names.length === 1 && !parts[2] ? { key: names[0], list: lists[names[0]] } : null);
+      if (!found) { await message.channel.send(`❌ Which list? Available: **${names.join('**, **')}** — \`${aucPfx}purchase ${parts[1]} ${names[0]}\``); return; }
+      if (payShareTotal(found.list) <= 0) { await message.channel.send(`❌ **${found.key}** is empty — add people with \`${aucPfx}payshare ${found.key} add <@user|name> <percent>\`.`); return; }
+      const note = parts.slice(parts[2] ? 3 : 2).join(' ').trim();
+      const { splits, paidOut, leftover } = recordPurchase(gd, found.key, amount, userId, note);
+      scheduleAuctionSave();
+      await flushAuction();   // several balances changed at once
+
+      const embed = new EmbedBuilder()
+        .setTitle('🧾 Payout Logged')
+        .setColor(0x1ABC9C)
+        .setDescription(`**${formatAmount(amount)}** through **${found.key}**${note ? ` — ${note}` : ''}`)
+        .addFields(
+          { name: 'Split', value: splits.map(s => `• **${displayNameOf(message.guild, s.uid)}** — ${s.pct}% = **${formatAmount(s.cut)}** *(now owed ${formatAmount(payEntry(gd, s.uid).due)})*`).join('\n').slice(0, 1024), inline: false },
+          { name: 'Paid out', value: formatAmount(paidOut), inline: true },
+          { name: leftover >= 0 ? 'Kept' : 'Over-committed', value: formatAmount(Math.abs(leftover)), inline: true }
+        )
+        .setFooter({ text: `Logged by ${message.author.tag}` })
+        .setTimestamp();
+      await message.channel.send({ embeds: [embed] });
+      await sendLogText(message.guild, { embeds: [embed] }, 'pay');
+      return;
+    }
+
+    // .purchases — recent payouts and how each was split
+    if (cmd === 'purchases' || cmd === 'purchaselog' || cmd === 'payruns' || cmd === 'sales') {
+      const log = Array.isArray(gd.payPurchases) ? gd.payPurchases : [];
+      const embed = new EmbedBuilder().setTitle('🧾 Payout Log').setColor(0x1ABC9C).setTimestamp();
+      if (log.length === 0) {
+        embed.setDescription(`Nothing logged yet — run one with \`${aucPfx}purchase <amount> <list> [note]\`.`);
+      } else {
+        const recent = [...log].reverse().slice(0, 10);
+        embed.setDescription(recent.map(p => {
+          const who = p.splits.map(s => `${displayNameOf(message.guild, s.uid)} ${s.pct}% = ${formatAmount(s.cut)}`).join(', ');
+          return `**${formatAmount(p.amount)}**${p.list ? ` · **${p.list}**` : ''} · <t:${Math.floor(p.ts / 1000)}:d>${p.note ? ` — *${p.note}*` : ''}\n   ${who || 'empty list at the time'}`;
+        }).join('\n').slice(0, 4000))
+          .setFooter({ text: `Showing ${recent.length} of ${log.length} kept · total logged ${formatAmount(log.reduce((s, p) => s + p.amount, 0))}` });
+      }
+      await message.channel.send({ embeds: [embed] });
       return;
     }
 
