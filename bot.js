@@ -240,10 +240,17 @@ function parseAmount(value) {
   return isNaN(n) ? null : n;
 }
 
+// Money in the units people actually speak: 10cr, 1.5cr, 40L. Below a lakh a
+// plain grouped number is clearer than "0.02L", so small change stays literal.
 function formatAmount(amount) {
   if (amount === null || amount === undefined) return '0';
-  // Show up to 2 decimal places, strip trailing zeros
-  return parseFloat(amount.toFixed(2)).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  const n = Number(amount);
+  if (!isFinite(n)) return '0';
+  const trim = (v) => parseFloat(v.toFixed(2)).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  const abs = Math.abs(n);
+  if (abs >= 1e7) return `${trim(n / 1e7)}cr`;
+  if (abs >= 1e5) return `${trim(n / 1e5)}L`;
+  return trim(n);
 }
 
 function fmt(n) { return Number(n || 0).toLocaleString(); }
@@ -499,6 +506,9 @@ async function sendLog(guild, embed, type) {
 const draftTimers = new Map();   // guildId -> pick-window timeout
 const draftLocks  = new Map();   // guildId -> promise chain serialising picks vs timeouts
 const pendingSetorders = new Map(); // userId -> { guildId, expiresAt } — waiting for a DM reply
+// Max bids are asked for in DMs so a ceiling is never visible in the channel.
+const pendingOpenMax   = new Map(); // userId -> { guildId, key, name, expiresAt }
+const OPEN_MAX_DM_MS   = 10 * 60000;
 const SETORDER_DM_MS = 10 * 60 * 1000;
 
 // A pick landing while the skip-timeout is mid-await (or vice versa) must not
@@ -1690,15 +1700,91 @@ async function openAnnounce(guild, gd, payload) {
   if (ch) await ch.send(typeof payload === 'string' ? { content: payload } : payload).catch(() => {});
 }
 
+// ── Private max bids ───────────────────────────────────────────────────────
+// A ceiling typed in the channel is a ceiling everyone can read. `max <player>`
+// with no number asks for it in DMs instead, and only the resulting public bid
+// ever reaches the channel.
+async function startPrivateMax(message, gd, target, pfx) {
+  const o = ensureOpen(gd);
+  const p = target.p;
+  const minimum = p.uid ? p.bid + bidIncrement(o.cfg, p.bid) : p.base;
+  try {
+    await message.author.send({ embeds: [new EmbedBuilder()
+      .setTitle(`🤖 Max bid — ${p.n}`)
+      .setColor(0x00B2FF)
+      .setDescription(`Reply here with your ceiling for **${p.n}** in **${message.guild.name}**.\nI bid the minimum needed to keep you in front, up to that number. Nobody else ever sees it.`)
+      .addFields(
+        { name: 'Current bid', value: p.uid ? formatAmount(p.bid) : `*no bids · base ${formatAmount(p.base)}*`, inline: true },
+        { name: 'Minimum',     value: formatAmount(minimum), inline: true }
+      )
+      .setFooter({ text: 'Just the amount — 12cr, 1.5cr, 40L. Say cancel to drop it. Expires in 10 minutes.' })] });
+  } catch (_) {
+    await message.channel.send(`❌ I can't DM you — allow direct messages from server members, or use \`${pfx}max ${p.n} <amount>\` here.`);
+    return;
+  }
+  pendingOpenMax.set(message.author.id, {
+    guildId: message.guild.id, key: target.key, name: p.n, expiresAt: Date.now() + OPEN_MAX_DM_MS
+  });
+  await message.channel.send(`📬 <@${message.author.id}> — check your DMs to set your max on **${p.n}** privately.`);
+}
+
+// The DM reply landed: place the max, then tell the channel only what is public.
+async function applyPrivateMax(uid, pending, amount, dmMessage) {
+  const guild = client.guilds.cache.get(pending.guildId);
+  if (!guild) { pendingOpenMax.delete(uid); await dmMessage.channel.send('❌ That server is not available any more.'); return; }
+  const gd = getGuildData(pending.guildId);
+  const o  = ensureOpen(gd);
+  const p  = o.players[pending.key];
+  if (!o.active || o.paused || !p || p.closed) {
+    pendingOpenMax.delete(uid);
+    await dmMessage.channel.send('❌ Bidding on that player is not open any more.');
+    return;
+  }
+
+  const before = p.uid, beforePrice = p.bid || 0;
+  const res = applyOpenBid(gd, uid, pending.key, amount, 'max');
+  if (!res.ok) { await dmMessage.channel.send(`❌ ${res.err}\nSend another amount, or \`cancel\`.`); return; }
+  pendingOpenMax.delete(uid);
+
+  await dmMessage.channel.send({ embeds: [new EmbedBuilder()
+    .setTitle(res.youLead ? `✅ You lead — ${p.n}` : `❌ Outbid already — ${p.n}`)
+    .setColor(res.youLead ? 0x57F287 : 0xED4245)
+    .setDescription(`Your max of **${formatAmount(amount)}** is set. Current bid is **${formatAmount(res.price)}** to **${teamOnly(gd, guild, res.leader)}**.`)
+    .addFields(
+      { name: 'Available', value: formatAmount(openAvailable(gd, uid)), inline: true },
+      { name: 'Closes',    value: ts(p.closesAt, 'R'), inline: true }
+    )
+    .setFooter({ text: 'Nothing in the server shows your ceiling.' })] });
+
+  // The price and the leader are public either way — the ceiling is not.
+  if (p.bid !== beforePrice || p.uid !== before) {
+    await openAnnounce(guild, gd, `💼 A max bid moved **${p.n}** — now **${formatAmount(p.bid)}** to **${teamOnly(gd, guild, p.uid)}**.`);
+  }
+  if (before && before !== res.leader && before !== uid) {
+    openDm(o, before, {
+      embeds: [new EmbedBuilder().setTitle('❌ You have been outbid').setColor(0xED4245)
+        .setDescription(`**${p.n}** in **${guild.name}** is now **${formatAmount(res.price)}** to **${teamOnly(gd, guild, res.leader)}**.`)
+        .addFields(
+          { name: 'Your bid was',   value: formatAmount(res.prevPrice), inline: true },
+          { name: 'Next valid bid', value: formatAmount(res.price + res.inc), inline: true },
+          { name: 'Freed up',       value: `${formatAmount(openAvailable(gd, before))} available again`, inline: false }
+        )]
+    });
+  }
+}
+
 // ── Settlement ─────────────────────────────────────────────────────────────
 // Every player is awarded in one pass at the end. A team that leads more players
 // than it can fit or fund keeps them in priority order; whatever it releases
 // cascades to the next highest bidder, who may in turn have to release someone —
 // so this loops until nothing changes.
-function computeOpenSettlement(gd) {
+// onlyKeys limits the pass to one set — the rest of the pool keeps bidding.
+function computeOpenSettlement(gd, onlyKeys) {
   const o = ensureOpen(gd), cfg = o.cfg;
   const stacks = {};
   for (const [k, p] of Object.entries(o.players)) {
+    if (p.settled) continue;                      // pre-owned, or won in an earlier set
+    if (onlyKeys && !onlyKeys.has(k)) continue;
     const st = Object.entries(p.best || {}).map(([uid, a]) => ({ uid, a })).sort((x, y) => y.a - x.a);
     if (st.length) stacks[k] = st;
   }
@@ -1731,6 +1817,7 @@ function computeOpenSettlement(gd) {
   const awards = [], unsold = [];
   for (const [k, p] of Object.entries(o.players)) {
     if (p.settled) continue;    // already owned before this auction started
+    if (onlyKeys && !onlyKeys.has(k)) continue;
     const st = stacks[k];
     if (st && st.length) awards.push({ k, n: p.n, uid: st[0].uid, a: st[0].a });
     else unsold.push({ k, n: p.n, base: p.base });
@@ -1740,9 +1827,12 @@ function computeOpenSettlement(gd) {
 
 // Apply the settlement: purses are debited and players land in the same squads
 // the rest of the bot already uses, so squad/trade/delete all keep working.
-async function settleOpenAuction(guild, gd, byTag) {
+// opts.onlyKeys settles just those players (one set); opts.label names the set.
+async function settleOpenAuction(guild, gd, byTag, opts = {}) {
   const o = ensureOpen(gd);
-  const { awards, unsold, released } = computeOpenSettlement(gd);
+  const onlyKeys = opts.onlyKeys || null;
+  const label    = opts.label || null;
+  const { awards, unsold, released } = computeOpenSettlement(gd, onlyKeys);
   const byTeam = {};
 
   for (const a of awards) {
@@ -1755,24 +1845,35 @@ async function settleOpenAuction(guild, gd, byTag) {
   }
   for (const u of unsold) { const p = o.players[u.k]; if (p) { p.closed = true; p.settled = true; } }
 
-  o.active   = false;
-  o.settledAt = Date.now();
-  // Bid bookkeeping is dead weight once everything is awarded, and on a big pool
+  const now   = Date.now();
+  const spend = awards.reduce((s, a) => s + a.a, 0);
+  if (!onlyKeys) { o.active = false; o.settledAt = now; }
+  // Bid bookkeeping is dead weight once a player is awarded, and on a big pool
   // it is most of the saved payload. Delete rather than blank the fields — empty
   // objects still cost bytes on every save, and every reader already guards for
   // them being missing. The final price and winner stay for display.
-  for (const p of Object.values(o.players)) {
+  const done = onlyKeys
+    ? [...onlyKeys].map(k => o.players[k]).filter(Boolean)
+    : Object.values(o.players);
+  for (const p of done) {
     delete p.fl; delete p.best; delete p.hist;
     delete p.at; delete p.count; delete p.sniped; delete p.closesAt;
   }
-  o.autobids = {};
-  o.feed = [];
+  if (onlyKeys) {
+    for (const k of onlyKeys) delete o.autobids[k];
+    o.feed = (o.feed || []).filter(f => !onlyKeys.has(f.k));
+  } else {
+    o.autobids = {};
+    o.feed = [];
+  }
+  // Settling set by set means results accumulate across several passes.
+  const prev = (onlyKeys && o.results) ? o.results : null;
   o.results  = {
-    at: o.settledAt,
-    awards: awards.map(a => ({ k: a.k, n: a.n, uid: a.uid, a: a.a })),
-    unsold: unsold.map(u => u.n),
-    released: released.length,
-    spend: awards.reduce((s, a) => s + a.a, 0)
+    at: now,
+    awards: [...(prev ? prev.awards : []), ...awards.map(a => ({ k: a.k, n: a.n, uid: a.uid, a: a.a }))],
+    unsold: [...(prev ? prev.unsold : []), ...unsold.map(u => u.n)],
+    released: (prev ? prev.released : 0) + released.length,
+    spend: (prev ? prev.spend : 0) + spend
   };
   scheduleAuctionSave();
   await flushAuction();
@@ -1782,11 +1883,12 @@ async function settleOpenAuction(guild, gd, byTag) {
     .map(([uid, list]) => `**${teamOnly(gd, guild, uid)}** — ${list.length} player(s), ${formatAmount(list.reduce((s, a) => s + a.a, 0))} spent · ${formatAmount(gd.purses[uid] || 0)} left`);
 
   const embed = new EmbedBuilder()
-    .setTitle('🏁 Open Auction Settled')
+    .setTitle(label ? `🏁 Set Sold — ${label}` : '🏁 Open Auction Settled')
     .setColor(0xFFD700)
     .setDescription(
-      `**${awards.length}** players sold for **${formatAmount(o.results.spend)}** total.\n` +
-      `**${unsold.length}** went unsold${released.length ? ` · **${released.length}** bid(s) released and cascaded to the next bidder` : ''}.`
+      `**${awards.length}** players sold for **${formatAmount(spend)}**${label ? ` in **${label}**` : ' total'}.\n` +
+      `**${unsold.length}** went unsold${released.length ? ` · **${released.length}** bid(s) released and cascaded to the next bidder` : ''}.` +
+      (label ? `\nThe rest of the pool is still open — that money has now left the winners' purses.` : '')
     )
     .addFields({ name: 'Squads', value: (teamLines.join('\n') || '*nobody won anything*').slice(0, 1024) })
     .setFooter({ text: byTag ? `Settled by ${byTag}` : 'Auction clock ran out' })
@@ -2005,7 +2107,7 @@ function openPlayerCard(gd, guild, key, viewerId, pfx) {
   const hist = (p.hist || []).slice(0, 6)
     .map(h => `• ${formatAmount(h[1])} — ${teamOnly(gd, guild, h[0])} ${ts(h[2] * 1000, 'R')}`).join('\n');
   if (hist) embed.addFields({ name: 'Recent activity', value: hist.slice(0, 1024), inline: false });
-  embed.setFooter({ text: `${pfx}bid ${p.n} <amount> · ${pfx}max ${p.n} <ceiling> · ${pfx}watch ${p.n}` });
+  embed.setFooter({ text: `${pfx}bn ${p.n} · ${pfx}bid ${p.n} <amount> · ${pfx}max ${p.n} (private) · ${pfx}watch ${p.n}` });
   return embed;
 }
 
@@ -2032,8 +2134,9 @@ function openHelpPage1(pfx) {
     .setColor(0x00B2FF)
     .setDescription(`Prefix \`${pfx}\` · every player is open at once for days. Only the bids you're **leading** lock money — get outbid and it frees up instantly.`)
     .addFields(
-      { name: `\`${pfx}bid <player> <amount>\` / \`${pfx}b\``, value: 'Bid. Short names work ("kohli"). Amounts take `2m`, `500k`, `1.5cr`.', inline: false },
-      { name: `\`${pfx}max <player> <amount>\``, value: 'Proxy bid — I bid the minimum needed for you, up to this ceiling, and re-bid automatically when someone outbids you. `max <player> clear` cancels.', inline: false },
+      { name: `\`${pfx}bid <player> <amount>\` / \`${pfx}b\``, value: 'Bid. Short names work ("kohli"). Amounts take `5cr`, `40L`, `500k`.', inline: false },
+      { name: `\`${pfx}bn <player>\` / \`${pfx}b next <player>\``, value: 'Bid the next valid step without typing a price — the fastest way to answer someone.', inline: false },
+      { name: `\`${pfx}max <player>\``, value: 'Proxy bid, asked for **in your DMs** so the channel never sees your ceiling. I bid the minimum needed for you, up to it, and re-bid when someone outbids you. `max <player> <amount>` still works inline if you don\'t mind people seeing it; `max <player> clear` cancels.', inline: false },
       { name: `\`${pfx}search <player>\` / \`${pfx}s\``, value: 'Player card — current bid, leader, next valid bid, close time, recent bid history and where you stand.', inline: false },
       { name: `\`${pfx}mybids\` / \`${pfx}mb\``, value: 'Everything you lead, everything you were **outbid** on, your maxes and your balance — sent to your DMs (`mybids here` posts it in channel).', inline: false },
       { name: `\`${pfx}priority\` / \`${pfx}pr\``, value: 'Your keep-order for when you lead more players than you have slots or money for. `pr <name1, name2…>` sets it, `pr top <player>` promotes one, `pr clear` resets.', inline: false },
@@ -2042,6 +2145,7 @@ function openHelpPage1(pfx) {
       { name: `\`${pfx}team <name>\``, value: 'Name your team.', inline: true },
       { name: `\`${pfx}watch <player>\``, value: 'Watchlist + closing alerts.', inline: true },
       { name: `\`${pfx}players [open|mine|nobids|set]\``, value: 'Browse the pool with live prices.', inline: true },
+      { name: `\`${pfx}sets\``, value: 'Every set, what is open, what sold.', inline: true },
       { name: `\`${pfx}hot\``, value: 'Most contested players.', inline: true },
       { name: `\`${pfx}feed\``, value: 'Latest bids server-wide.', inline: true },
       { name: `\`${pfx}status\``, value: 'Clock, pool progress, top spenders.', inline: true },
@@ -2065,6 +2169,7 @@ function openHelpPage2(pfx) {
       { name: `\`${pfx}ocfg <key> <value>\``, value: '`maxsquad` (30) · `inc` min raise · `ladder on|off` · `antisnipe` mins · `overcommit on|off` · `base` default base · `dm on|off`. Plain `ocfg` shows all.', inline: false },
       { name: `\`${pfx}openextend <hours>\``, value: 'Push the deadline back for every player still open.', inline: true },
       { name: `\`${pfx}openpause\` / \`${pfx}openresume\``, value: 'Freeze/unfreeze bidding without losing anything.', inline: true },
+      { name: `\`${pfx}closeset <set>\``, value: 'Sell one set now and leave the rest of the pool running. Preview first, then `closeset <set> confirm`. Winners pay immediately, so their leads elsewhere may not survive.', inline: false },
       { name: `\`${pfx}openend confirm\``, value: 'Close everything and settle right now.', inline: true },
       { name: `\`${pfx}openlog #channel\``, value: 'Where closes, warnings and results are posted.', inline: true },
       { name: `\`${pfx}openreset confirm\``, value: 'Wipe the open auction (pool, bids, results). `full` also clears squads bought here.', inline: true },
@@ -2262,6 +2367,28 @@ client.on('messageCreate', async (message) => {
   const cgPfx      = guildId ? getCgPrefix(guildId)      : DEFAULT_CGDROP_PREFIX;
   const aucPfx     = guildId ? getAuctionPrefix(guildId) : DEFAULT_AUCTION_PREFIX;
   const userId     = message.author.id;
+
+  // ── DM replies for a private max bid (ceiling never touches the channel) ─
+  if (!message.guild && pendingOpenMax.has(userId)) {
+    const pending = pendingOpenMax.get(userId);
+    if (Date.now() > pending.expiresAt) {
+      pendingOpenMax.delete(userId);
+      await message.channel.send('⌛ That max bid request expired — run the command in the server again.');
+      return;
+    }
+    if (/^(cancel|stop|no|nvm)$/i.test(content)) {
+      pendingOpenMax.delete(userId);
+      await message.channel.send(`🚫 Dropped — no max set on **${pending.name}**.`);
+      return;
+    }
+    const amt = parseMoney(content.split(/\s+/)[0]);
+    if (amt === null || amt <= 0) {
+      await message.channel.send('❌ Send just the amount — `12cr`, `1.5cr`, `40L`. Or `cancel`.');
+      return;
+    }
+    await applyPrivateMax(userId, pending, amt, message);
+    return;
+  }
 
   // ── DM replies for setorder (draft order arrives privately) ─────────────
   if (!message.guild && pendingSetorders.has(userId)) {
@@ -2680,6 +2807,21 @@ client.on('messageCreate', async (message) => {
       return r;
     };
 
+    // Sets are just the pool's tier headers; ungrouped players share one bucket.
+    const setNameOf = (pl) => pl.set || 'Ungrouped';
+    const setNames  = () => [...new Set(Object.values(o.players).map(setNameOf))];
+    const resolveSet = (raw) => {
+      const want = String(raw || '').trim().toLowerCase();
+      if (!want) return null;
+      const names = setNames();
+      const exact = names.find(n => n.toLowerCase() === want);
+      if (exact) return { name: exact };
+      const partial = names.filter(n => n.toLowerCase().startsWith(want));
+      if (partial.length === 1) return { name: partial[0] };
+      if (partial.length > 1)   return { ambiguous: partial };
+      return null;
+    };
+
     // ── Help — always available, even before approval ──────────────────────
     if (cmd === 'ohelp' || cmd === 'openhelp' || cmd === 'ohelp2') {
       const p1 = () => openHelpPage1(openPfx), p2 = () => openHelpPage2(openPfx);
@@ -2900,6 +3042,55 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // Sell one set at a time instead of settling the whole pool at the end.
+    if (cmd === 'closeset' || cmd === 'sellset' || cmd === 'cs') {
+      if (!host()) return noPerm();
+      if (!o.active) { await message.channel.send('❌ No open auction is running.'); return; }
+      const words     = rest.split(/\s+/).filter(Boolean);
+      const confirmed = words.length > 1 && /^(confirm|yes|y)$/i.test(words[words.length - 1]);
+      const wanted    = (confirmed ? words.slice(0, -1) : words).join(' ').trim();
+      if (!wanted) {
+        await message.channel.send(`❌ Usage: \`${openPfx}closeset <set>\` to preview, then \`${openPfx}closeset <set> confirm\`. Sets: ${setNames().join(', ') || '*none*'}`);
+        return;
+      }
+      const found = resolveSet(wanted);
+      if (!found)            { await message.channel.send(`❌ No set called **${wanted}**. Try: ${setNames().join(', ') || '*none*'}`); return; }
+      if (found.ambiguous)   { await message.channel.send(`❓ **${wanted}** matches several: ${found.ambiguous.join(', ')} — be more specific.`); return; }
+
+      const keys = Object.entries(o.players)
+        .filter(([, pl]) => setNameOf(pl) === found.name && !pl.settled)
+        .map(([k]) => k);
+      if (!keys.length) { await message.channel.send(`✅ **${found.name}** is already settled — nothing left in it.`); return; }
+
+      const onlyKeys = new Set(keys);
+      const preview  = computeOpenSettlement(gd, onlyKeys);
+
+      if (!confirmed) {
+        const byTeam = {};
+        for (const a of preview.awards) (byTeam[a.uid] = byTeam[a.uid] || []).push(a);
+        const lines = Object.entries(byTeam)
+          .sort((x, y) => y[1].reduce((s, a) => s + a.a, 0) - x[1].reduce((s, a) => s + a.a, 0))
+          .map(([uid, list]) => `**${teamOnly(gd, message.guild, uid)}** — ${list.length} player(s), ${formatAmount(list.reduce((s, a) => s + a.a, 0))}`);
+        const embed = new EmbedBuilder().setTitle(`⚠️ Close set — ${found.name}`).setColor(0xFFA500)
+          .setDescription(`This closes **${keys.length}** player(s) in **${found.name}** right now and awards them. The rest of the auction keeps running.`)
+          .addFields(
+            { name: 'Selling',  value: `${preview.awards.length} sold · ${preview.unsold.length} unsold${preview.released.length ? ` · ${preview.released.length} bid(s) released` : ''}`, inline: false },
+            { name: 'Squads',   value: (lines.join('\n') || '*no bids in this set*').slice(0, 1024), inline: false },
+            { name: 'Careful',  value: 'Winners pay now, so money they had committed elsewhere may no longer cover their other leads.', inline: false }
+          )
+          .setFooter({ text: `${openPfx}closeset ${found.name} confirm to go ahead` });
+        await message.channel.send({ embeds: [embed] });
+        return;
+      }
+
+      for (const k of keys) { o.players[k].closed = true; o.players[k].closesAt = Date.now(); }
+      const status = await message.channel.send(`⚙️ Selling **${found.name}** — working out who keeps whom...`);
+      const res = await settleOpenAuction(message.guild, gd, message.author.tag, { onlyKeys, label: found.name });
+      const left = Object.values(o.players).filter(pl => !pl.closed).length;
+      await status.edit(`✅ **${found.name}** sold — **${res.awards.length}** sold, **${res.unsold.length}** unsold. ${left} player(s) still open. \`${openPfx}results\` for the list.`).catch(() => {});
+      return;
+    }
+
     if (cmd === 'openreset') {
       if (!host()) return noPerm();
       const full = (parts[1] || '').toLowerCase() === 'full';
@@ -3012,13 +3203,22 @@ client.on('messageCreate', async (message) => {
     }
 
     // ── Bidding ────────────────────────────────────────────────────────────
-    if (cmd === 'bid' || cmd === 'b' || cmd === 'max' || cmd === 'autobid' || cmd === 'ab') {
-      const isMax = cmd !== 'bid' && cmd !== 'b';
+    if (cmd === 'bid' || cmd === 'b' || cmd === 'bn' || cmd === 'nextbid' || cmd === 'max' || cmd === 'autobid' || cmd === 'ab') {
+      const isMax = cmd === 'max' || cmd === 'autobid' || cmd === 'ab';
+      // `bn <player>` / `b next <player>` — take the next valid step, no price typed.
+      const quick = cmd === 'bn' || cmd === 'nextbid' || (!isMax && /^next\s+/i.test(rest));
       if (!o.active) { await message.channel.send('❌ No open auction is running.'); return; }
       if (o.paused)  { await message.channel.send('⏸️ Bidding is paused by the host.'); return; }
 
-      const { name, amount } = splitNameAmount(rest);
-      if (!name) { await message.channel.send(`❌ Usage: \`${openPfx}${cmd} <player> <amount>\` — e.g. \`${openPfx}${cmd} kohli 5m\``); return; }
+      const { name, amount } = quick
+        ? { name: rest.replace(/^next\s+/i, '').trim(), amount: null }
+        : splitNameAmount(rest);
+      if (!name) {
+        await message.channel.send(quick
+          ? `❌ Usage: \`${openPfx}${cmd === 'bn' || cmd === 'nextbid' ? 'bn' : 'b next'} <player>\` — e.g. \`${openPfx}bn kohli\``
+          : `❌ Usage: \`${openPfx}${cmd} <player> <amount>\` — e.g. \`${openPfx}${cmd} kohli 5cr\``);
+        return;
+      }
 
       // `max <player> clear` cancels a proxy
       if (isMax && /^(clear|off|cancel|remove)$/i.test(rest.split(/\s+/).pop() || '')) {
@@ -3030,15 +3230,33 @@ client.on('messageCreate', async (message) => {
         return;
       }
 
-      if (amount === null || amount <= 0) { await message.channel.send(`❌ Invalid amount. Try \`${openPfx}${cmd} ${name} 5m\` (also \`500k\`, \`1.5cr\`, or plain numbers).`); return; }
+      if (!quick && !isMax && (amount === null || amount <= 0)) { await message.channel.send(`❌ Invalid amount. Try \`${openPfx}${cmd} ${name} 5cr\` (also \`40L\`, \`500k\`, or plain numbers).`); return; }
       if (!gd.purses[userId]) { await message.channel.send('❌ You have no purse in this auction — ask a host to set one.'); return; }
+
+      // `max <player>` with no number: ask for the ceiling in DMs instead, so the
+      // channel never sees what you were willing to pay.
+      if (isMax && (amount === null || amount <= 0)) {
+        const t = await resolveOrTell(name);
+        if (!t) return;
+        await startPrivateMax(message, gd, t, openPfx);
+        return;
+      }
 
       const target = await resolveOrTell(name);
       if (!target) return;
       const { key, p } = target;
 
+      let bidAmount = amount;
+      if (quick) {
+        if (p.uid === userId) {
+          await message.channel.send(`✅ You already lead **${p.n}** at **${formatAmount(p.bid)}** — nothing to beat. Raise yourself with \`${openPfx}bid ${p.n} <amount>\` if you really want to.`);
+          return;
+        }
+        bidAmount = p.uid ? p.bid + bidIncrement(o.cfg, p.bid) : p.base;
+      }
+
       const before = p.uid;
-      const res = applyOpenBid(gd, userId, key, amount, isMax ? 'max' : 'bid');
+      const res = applyOpenBid(gd, userId, key, bidAmount, isMax ? 'max' : 'bid');
       if (!res.ok) { await message.channel.send(`❌ ${res.err}`); return; }
 
       const leads = openLeads(o, userId);
@@ -3336,6 +3554,27 @@ client.on('messageCreate', async (message) => {
       if (on) delete o.noDm[userId]; else o.noDm[userId] = true;
       scheduleAuctionSave();
       await message.channel.send(on ? '🔔 Outbid DMs **on**.' : '🔕 Outbid DMs **off** — you\'ll have to check `mybids` yourself.');
+      return;
+    }
+
+    if (cmd === 'sets' || cmd === 'setlist') {
+      const all = Object.values(o.players);
+      if (!all.length) { await message.channel.send(`📭 No open auction pool loaded — a host can add one with \`${openPfx}openpool\`.`); return; }
+      const rows = {};
+      for (const pl of all) {
+        const s = setNameOf(pl);
+        const e = rows[s] = rows[s] || { n: 0, open: 0, sold: 0, money: 0 };
+        e.n++;
+        if (!pl.closed) e.open++;
+        if (pl.settled) e.sold++;
+        e.money += pl.bid || 0;
+      }
+      const embed = new EmbedBuilder().setTitle('🗂️ Sets').setColor(0x00B2FF)
+        .setDescription(Object.entries(rows).map(([s, e]) =>
+          `**${s}** — ${e.n} player(s) · ${e.open ? `${e.open} open` : 'all closed'}${e.sold ? ` · ${e.sold} sold` : ''} · ${formatAmount(e.money)} bid`
+        ).join('\n').slice(0, 4000))
+        .setFooter({ text: `${openPfx}players <set> to browse one · hosts close a set with ${openPfx}closeset <set>` });
+      await message.channel.send({ embeds: [embed] });
       return;
     }
 
