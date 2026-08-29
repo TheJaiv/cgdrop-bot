@@ -58,12 +58,25 @@ const activeReminders = new Map();
 // ══════════════════════════════════════════════════════════════════════════════
 //  JSONBIN HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
+// Returns the record, or null if the bin could NOT be read. A failed read and an
+// empty bin used to look identical here: no res.ok check meant a 401/404/429 body
+// returned `undefined` while still logging success, the bot booted with empty
+// state, and the next upload wrote that emptiness over real data.
 async function loadBin(binId, label) {
   try {
     const res  = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
       headers: { 'X-Master-Key': JSONBIN_KEY }
     });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(`❌ Could not read ${label} bin ${binId}: HTTP ${res.status} ${body.slice(0, 200)}`);
+      return null;
+    }
     const json = await res.json();
+    if (!json || typeof json.record !== 'object' || json.record === null) {
+      console.error(`❌ ${label} bin ${binId} returned no usable record — treating as a FAILED read, not an empty bin.`);
+      return null;
+    }
     console.log(`✅ ${label} data loaded from JSONBin`);
     return json.record;
   } catch (e) {
@@ -100,6 +113,70 @@ async function saveBin(data, binIdRef, setFn, label, binName, envVarName) {
   } catch (e) {
     console.error(`Error saving ${label} to JSONBin:`, e.message);
   }
+}
+
+// ── Recovery ──────────────────────────────────────────────────────────────
+// There is no shell on the host, so everything needed to find and restore a
+// backup has to be reachable from Discord. All of this is read-only unless the
+// command name says otherwise.
+function summariseAuctionRecord(data) {
+  if (!data || typeof data !== 'object') return { ok: false, text: 'Not an object — nothing usable in there.' };
+  const guilds = data.guilds || {};
+  const lines = [];
+  let totalPlayers = 0, totalTeams = 0;
+  for (const [gid, gd] of Object.entries(guilds)) {
+    const squads = gd.squads || {}, purses = gd.purses || {}, teams = gd.teams || {};
+    const held = Object.values(squads).reduce((s, a) => s + ((a || []).length), 0);
+    const open = gd.open || {};
+    const pool = Object.keys(open.players || {}).length;
+    const bids = Object.values(open.players || {}).filter(pl => pl.uid).length;
+    totalPlayers += held; totalTeams += Object.keys(teams).length;
+    lines.push(`\`${gid}\` — ${Object.keys(teams).length} team(s) · ${Object.keys(purses).length} purse(s) · ${Object.keys(squads).length} squad(s) holding **${held}**` +
+      (pool ? `\n   open auction: ${open.active ? 'LIVE' : open.settledAt ? 'settled' : 'idle'} · pool ${pool} · ${bids} with bids` : ''));
+  }
+  return {
+    ok: Object.keys(guilds).length > 0,
+    savedAt: data._savedAt || 0,
+    guilds: Object.keys(guilds).length,
+    totalPlayers, totalTeams,
+    bytes: JSON.stringify(data).length,
+    text: lines.join('\n').slice(0, 3500) || '*no guilds in this copy*'
+  };
+}
+
+function recoveryEmbed(title, sum, colour) {
+  return new EmbedBuilder().setTitle(title).setColor(colour)
+    .setDescription(sum.text)
+    .addFields(
+      { name: 'Saved',   value: sum.savedAt ? `<t:${Math.floor(sum.savedAt / 1000)}:F>\n<t:${Math.floor(sum.savedAt / 1000)}:R>` : '*no timestamp*', inline: true },
+      { name: 'Guilds',  value: String(sum.guilds), inline: true },
+      { name: 'Players held', value: String(sum.totalPlayers), inline: true },
+      { name: 'Size',    value: `${(sum.bytes / 1024).toFixed(1)} KB`, inline: true }
+    );
+}
+
+// Read any bin (optionally an older version) without touching what is stored.
+async function fetchBin(binId, version) {
+  const path = version ? `/${version}` : '/latest';
+  const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}${path}`, { headers: { 'X-Master-Key': JSONBIN_KEY } });
+  const body = await res.text();
+  if (!res.ok) return { ok: false, err: `HTTP ${res.status} — ${body.slice(0, 300)}` };
+  try { return { ok: true, record: JSON.parse(body).record }; }
+  catch (e) { return { ok: false, err: 'Response was not JSON.' }; }
+}
+
+// Every bin on the account, so a bin id lost from env can be found again.
+async function listBins() {
+  const out = [];
+  for (const url of ['https://api.jsonbin.io/v3/c/uncategorized/bins', 'https://api.jsonbin.io/v3/c']) {
+    try {
+      const res = await fetch(url, { headers: { 'X-Master-Key': JSONBIN_KEY } });
+      if (!res.ok) { out.push({ err: `${url.split('/v3')[1]} → HTTP ${res.status}` }); continue; }
+      const json = await res.json();
+      if (Array.isArray(json)) for (const b of json) out.push({ id: b.record, name: (b.snippetMeta && b.snippetMeta.name) || '(unnamed)', at: b.createdAt });
+    } catch (e) { out.push({ err: e.message }); }
+  }
+  return out;
 }
 
 // ── Local file helpers ────────────────────────────────────────────────────
@@ -144,9 +221,19 @@ async function flushCg() {
 }
 
 // Coalesces concurrent calls and always writes the latest state.
+// Set when the bin exists but could not be read at boot. Uploading in that state
+// would overwrite live data with whatever little this process has in memory, so
+// local saves continue and JSONBin writes are refused until `.sync force`.
+let auctionUploadBlocked = false;
+
 async function flushAuction() {
   if (auctionSavingPromise) return auctionSavingPromise; // a write is already running; it'll see the dirty flag
   if (!auctionDirty) return;
+  if (auctionUploadBlocked) {
+    saveLocalAuction();
+    console.error('⛔ JSONBin upload refused — this process never managed to read the auction bin, so uploading could destroy it. Fix the key/quota and restart, or run `.sync force` if this memory state is the good one.');
+    return;
+  }
   auctionSavingPromise = (async () => {
     try {
       while (auctionDirty) {
@@ -507,7 +594,8 @@ const draftTimers = new Map();   // guildId -> pick-window timeout
 const draftLocks  = new Map();   // guildId -> promise chain serialising picks vs timeouts
 const pendingSetorders = new Map(); // userId -> { guildId, expiresAt } — waiting for a DM reply
 // Max bids are asked for in DMs so a ceiling is never visible in the channel.
-const pendingOpenMax   = new Map(); // userId -> { guildId, key, name, expiresAt }
+// The pending ask is stored in guild state (gd.open.pendingMax) rather than a
+// Map, so a redeploy mid-auction doesn't silently eat the reply.
 const OPEN_MAX_DM_MS   = 10 * 60000;
 const SETORDER_DM_MS = 10 * 60 * 1000;
 
@@ -1455,6 +1543,7 @@ function openDefaults() {
       dm:          true,      // outbid DMs
       days:        3          // default auction length
     },
+    pendingMax:   {},  // userId -> { key, name, expiresAt } — waiting for a ceiling in DMs
     setDeadlines: {},  // set name -> when that set closes, for sets sold on their own clock
     setWarned:    {},  // set name -> last "closing soon" announcement
     players:  {},   // key -> { n, set, base, bid, uid, at, closesAt, closed, fl, best, hist, count, sniped }
@@ -1724,21 +1813,36 @@ async function startPrivateMax(message, gd, target, pfx) {
     await message.channel.send(`❌ I can't DM you — allow direct messages from server members, or use \`${pfx}max ${p.n} <amount>\` here.`);
     return;
   }
-  pendingOpenMax.set(message.author.id, {
-    guildId: message.guild.id, key: target.key, name: p.n, expiresAt: Date.now() + OPEN_MAX_DM_MS
-  });
+  o.pendingMax[message.author.id] = { key: target.key, name: p.n, expiresAt: Date.now() + OPEN_MAX_DM_MS };
+  scheduleAuctionSave();
   await message.channel.send(`📬 <@${message.author.id}> — check your DMs to set your max on **${p.n}** privately.`);
+}
+
+// Which auction, if any, is waiting on this person for a ceiling. Scanning every
+// guild is fine — a bot in a handful of servers, checked only on a DM.
+function findPendingMax(uid) {
+  for (const [gid, gd] of Object.entries(auctionData.guilds || {})) {
+    const pend = gd && gd.open && gd.open.pendingMax && gd.open.pendingMax[uid];
+    if (pend) return { guildId: gid, ...pend };
+  }
+  return null;
+}
+
+function clearPendingMax(guildId, uid) {
+  const gd = getGuildData(guildId);
+  if (gd.open && gd.open.pendingMax) delete gd.open.pendingMax[uid];
+  scheduleAuctionSave();
 }
 
 // The DM reply landed: place the max, then tell the channel only what is public.
 async function applyPrivateMax(uid, pending, amount, dmMessage) {
   const guild = client.guilds.cache.get(pending.guildId);
-  if (!guild) { pendingOpenMax.delete(uid); await dmMessage.channel.send('❌ That server is not available any more.'); return; }
+  if (!guild) { clearPendingMax(pending.guildId, uid); await dmMessage.channel.send('❌ That server is not available any more.'); return; }
   const gd = getGuildData(pending.guildId);
   const o  = ensureOpen(gd);
   const p  = o.players[pending.key];
   if (!o.active || o.paused || !p || p.closed) {
-    pendingOpenMax.delete(uid);
+    clearPendingMax(pending.guildId, uid);
     await dmMessage.channel.send('❌ Bidding on that player is not open any more.');
     return;
   }
@@ -1746,7 +1850,7 @@ async function applyPrivateMax(uid, pending, amount, dmMessage) {
   const before = p.uid, beforePrice = p.bid || 0;
   const res = applyOpenBid(gd, uid, pending.key, amount, 'max');
   if (!res.ok) { await dmMessage.channel.send(`❌ ${res.err}\nSend another amount, or \`cancel\`.`); return; }
-  pendingOpenMax.delete(uid);
+  clearPendingMax(pending.guildId, uid);
 
   await dmMessage.channel.send({ embeds: [new EmbedBuilder()
     .setTitle(res.youLead ? `✅ You lead — ${p.n}` : `❌ Outbid already — ${p.n}`)
@@ -2255,7 +2359,19 @@ client.once('ready', async () => {
   let binAuction = null;
   if (auctionBinId) {
     const loaded = await loadBin(auctionBinId, 'auction');
-    if (loaded && Object.keys(loaded).length) binAuction = loaded;
+    if (loaded === null) {
+      // The bin is configured but unreadable. Assume the data is fine and ours is
+      // not, rather than the other way round.
+      auctionUploadBlocked = true;
+      console.error('──────────────────────────────────────────────');
+      console.error(`⛔ AUCTION BIN ${auctionBinId} COULD NOT BE READ.`);
+      console.error('   Starting with whatever the local file holds; JSONBin uploads are BLOCKED');
+      console.error('   so this process cannot overwrite the stored auction. Check JSONBIN_KEY,');
+      console.error('   the bin id, and your JSONBin quota, then restart.');
+      console.error('──────────────────────────────────────────────');
+    } else if (Object.keys(loaded).length) {
+      binAuction = loaded;
+    }
   }
   const localAuction = loadLocalAuction();
   let chosen = null, src = null;
@@ -2401,15 +2517,16 @@ client.on('messageCreate', async (message) => {
   const userId     = message.author.id;
 
   // ── DM replies for a private max bid (ceiling never touches the channel) ─
-  if (!message.guild && pendingOpenMax.has(userId)) {
-    const pending = pendingOpenMax.get(userId);
+  const pendingMax = !message.guild ? findPendingMax(userId) : null;
+  if (pendingMax) {
+    const pending = pendingMax;
     if (Date.now() > pending.expiresAt) {
-      pendingOpenMax.delete(userId);
+      clearPendingMax(pending.guildId, userId);
       await message.channel.send('⌛ That max bid request expired — run the command in the server again.');
       return;
     }
     if (/^(cancel|stop|no|nvm)$/i.test(content)) {
-      pendingOpenMax.delete(userId);
+      clearPendingMax(pending.guildId, userId);
       await message.channel.send(`🚫 Dropped — no max set on **${pending.name}**.`);
       return;
     }
@@ -2460,6 +2577,124 @@ client.on('messageCreate', async (message) => {
   const aucArgs = usesAuc ? content.slice(aucPfx.length).trim().split(/\s+/).slice(1) : [];
   const aucRaw  = usesAuc ? content.slice(aucPfx.length).trim()   : null;
   const openRaw = usesOpen ? content.slice(openPfx.length).trim() : null;
+
+  // ── Owner recovery ──────────────────────────────────────────────────────
+  // Deliberately matched on ANY of the three prefixes: when two modes share a
+  // prefix one of them is shadowed, and a data emergency is the worst time to
+  // discover that the command you need is the shadowed one.
+  const recoveryPfx = usesOpen ? openPfx : usesAuc ? aucPfx : usesCg ? cgPfx : null;
+  if (recoveryPfx && userId === OWNER_ID) {
+    const rw   = content.slice(recoveryPfx.length).trim().split(/\s+/).filter(Boolean);
+    const rc   = (rw[0] || '').toLowerCase();
+    const RECOVERY = ['bins', 'binpeek', 'binversions', 'binrestore', 'binuse', 'localpeek', 'localrestore'];
+
+    if (RECOVERY.includes(rc)) {
+      if (!JSONBIN_KEY && rc !== 'localpeek' && rc !== 'localrestore') {
+        await message.channel.send('❌ `JSONBIN_KEY` is not set in this process — nothing can be read from JSONBin.');
+        return;
+      }
+
+      if (rc === 'bins') {
+        await message.channel.send('🔍 Listing bins on this JSONBin account...');
+        const bins = await listBins();
+        const rows = bins.filter(b => b.id).map(b =>
+          `\`${b.id}\` — **${b.name}**${b.at ? ` · <t:${Math.floor(new Date(b.at).getTime() / 1000)}:R>` : ''}${b.id === auctionBinId ? ' ← **in use now**' : ''}`);
+        const errs = bins.filter(b => b.err).map(b => `⚠️ ${b.err}`);
+        await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🗄️ JSONBin bins').setColor(0x00B2FF)
+          .setDescription((rows.join('\n') || '*none listed — the account may keep them in a collection*').slice(0, 3500))
+          .addFields({ name: 'Next', value: `\`${recoveryPfx}binpeek <id>\` to see what is inside one.`, inline: false })
+          .setFooter({ text: errs.join(' · ').slice(0, 2000) || `Current auction bin: ${auctionBinId || 'none'}` })] });
+        return;
+      }
+
+      if (rc === 'binpeek') {
+        const id = rw[1] || auctionBinId;
+        if (!id) { await message.channel.send(`❌ Usage: \`${recoveryPfx}binpeek <binId> [version]\``); return; }
+        const res = await fetchBin(id, rw[2]);
+        if (!res.ok) { await message.channel.send(`❌ ${res.err}`); return; }
+        const sum = summariseAuctionRecord(res.record);
+        await message.channel.send({ embeds: [recoveryEmbed(`🗄️ ${id}${rw[2] ? ` · v${rw[2]}` : ''}`, sum, sum.ok ? 0x57F287 : 0xED4245)
+          .setFooter({ text: sum.ok ? `${recoveryPfx}binrestore ${id}${rw[2] ? ' ' + rw[2] : ''} confirm — to load this copy` : 'Nothing usable in this bin.' })] });
+        return;
+      }
+
+      if (rc === 'binversions') {
+        const id = rw[1] || auctionBinId;
+        if (!id) { await message.channel.send(`❌ Usage: \`${recoveryPfx}binversions <binId>\``); return; }
+        try {
+          const res  = await fetch(`https://api.jsonbin.io/v3/b/${id}/versions`, { headers: { 'X-Master-Key': JSONBIN_KEY } });
+          const body = await res.text();
+          await message.channel.send(`\`\`\`json\n${body.slice(0, 1800)}\n\`\`\`` + (res.ok ? `\nPeek at one with \`${recoveryPfx}binpeek ${id} <version>\`.` : '\n⚠️ Version history is a paid JSONBin feature — if this failed, that is why.'));
+        } catch (e) { await message.channel.send(`❌ ${e.message}`); }
+        return;
+      }
+
+      if (rc === 'binrestore') {
+        const id = rw[1];
+        if (!id) { await message.channel.send(`❌ Usage: \`${recoveryPfx}binrestore <binId> [version] confirm\``); return; }
+        const version   = /^\d+$/.test(rw[2] || '') ? rw[2] : null;
+        const confirmed = rw.some(w => w.toLowerCase() === 'confirm');
+        const res = await fetchBin(id, version);
+        if (!res.ok) { await message.channel.send(`❌ ${res.err}`); return; }
+        const sum = summariseAuctionRecord(res.record);
+        if (!sum.ok) { await message.channel.send('❌ That copy has no guild data — refusing to restore it over anything.'); return; }
+        const now = summariseAuctionRecord(auctionData);
+        if (!confirmed) {
+          await message.channel.send({ embeds: [recoveryEmbed(`♻️ Restore from ${id}${version ? ` v${version}` : ''}?`, sum, 0xFFA500)
+            .addFields({ name: 'Replacing what I have now', value: `${now.guilds} guild(s) · ${now.totalPlayers} player(s) held · ${(now.bytes / 1024).toFixed(1)} KB`, inline: false })
+            .setFooter({ text: `${recoveryPfx}binrestore ${id}${version ? ' ' + version : ''} confirm` })] });
+          return;
+        }
+        auctionData = { ...auctionData, ...res.record };
+        saveLocalAuction();
+        auctionUploadBlocked = false;      // the operator has chosen this copy on purpose
+        auctionDirty = true;
+        await flushAuction();
+        const after = summariseAuctionRecord(auctionData);
+        await message.channel.send({ embeds: [recoveryEmbed('✅ Restored and pushed to JSONBin', after, 0x57F287)
+          .setFooter({ text: `Restored by ${message.author.tag} from ${id}${version ? ` v${version}` : ''}` })] });
+        return;
+      }
+
+      if (rc === 'binuse') {
+        const id = rw[1];
+        if (!id) { await message.channel.send(`❌ Usage: \`${recoveryPfx}binuse <binId> confirm\` — points this bot at a different auction bin.`); return; }
+        if ((rw[2] || '').toLowerCase() !== 'confirm') {
+          await message.channel.send(`⚠️ This makes \`${id}\` the auction bin for every future save (current: \`${auctionBinId || 'none'}\`).\nRun \`${recoveryPfx}binuse ${id} confirm\`.`);
+          return;
+        }
+        auctionBinId = id;
+        cgData.auctionBinId = id;          // the durable pointer the boot code reads
+        cgDirty = true;
+        await flushCg();
+        await message.channel.send(`✅ Auction bin is now \`${id}\`, and the pointer is stored in the cgdrop bin so a restart keeps it.\n⚠️ Still add \`AUCTION_BIN_ID=${id}\` to the host env — that is the only copy nothing else can lose.`);
+        return;
+      }
+
+      if (rc === 'localpeek' || rc === 'localrestore') {
+        const local = loadLocalAuction();
+        if (!local) { await message.channel.send(`❌ No local file at \`${AUCTION_LOCAL_FILE}\` — this host wipes its disk on deploy.`); return; }
+        const sum = summariseAuctionRecord(local);
+        if (rc === 'localpeek') {
+          await message.channel.send({ embeds: [recoveryEmbed('💾 Local file', sum, sum.ok ? 0x57F287 : 0xED4245)
+            .setFooter({ text: sum.ok ? `${recoveryPfx}localrestore confirm — to load this copy` : 'Nothing usable in the local file.' })] });
+          return;
+        }
+        if (!sum.ok) { await message.channel.send('❌ The local file has no guild data — refusing to restore it.'); return; }
+        if ((rw[1] || '').toLowerCase() !== 'confirm') {
+          await message.channel.send({ embeds: [recoveryEmbed('♻️ Restore from the local file?', sum, 0xFFA500)
+            .setFooter({ text: `${recoveryPfx}localrestore confirm` })] });
+          return;
+        }
+        auctionData = { ...auctionData, ...local };
+        auctionUploadBlocked = false;
+        auctionDirty = true;
+        await flushAuction();
+        await message.channel.send({ embeds: [recoveryEmbed('✅ Restored from the local file and pushed up', summariseAuctionRecord(auctionData), 0x57F287)] });
+        return;
+      }
+    }
+  }
 
   // ════════════════════════════════════════════════════════════════════════
   //  CGDROP COMMANDS  (! prefix)
@@ -4794,6 +5029,22 @@ client.on('messageCreate', async (message) => {
         await message.channel.send('❌ You need **Administrator** or **Auctioneer** role.'); return;
       }
       const mode = (parts[1] || 'push').toLowerCase();
+
+      if (mode === 'force') {
+        if (!auctionUploadBlocked) { await message.channel.send('✅ Uploads are not blocked — plain `.sync` is all you need.'); return; }
+        const g = Object.keys(auctionData.guilds || {}).length;
+        const gdF = getGuildData(guildId);
+        const squads = Object.keys(gdF.squads || {}).length;
+        if ((parts[2] || '').toLowerCase() !== 'confirm') {
+          await message.channel.send(`⚠️ Uploads are blocked because this process could not read the JSONBin copy at boot — the stored data may be **newer than what I have in memory**.\nForcing will overwrite it with: **${g}** guild(s), **${squads}** squad(s) here.\nOnly do this if you are sure. Run \`${aucPfx}sync force confirm\`.`);
+          return;
+        }
+        auctionUploadBlocked = false;
+        auctionDirty = true;
+        await flushAuction();
+        await message.channel.send('⚠️ Upload block lifted and current state pushed to JSONBin.');
+        return;
+      }
 
       if (mode === 'pull' || mode === 'load' || mode === 'restore') {
         if (!auctionBinId) { await message.channel.send('❌ No auction bin to pull from yet.'); return; }
