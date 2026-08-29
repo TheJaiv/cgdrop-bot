@@ -1455,6 +1455,8 @@ function openDefaults() {
       dm:          true,      // outbid DMs
       days:        3          // default auction length
     },
+    setDeadlines: {},  // set name -> when that set closes, for sets sold on their own clock
+    setWarned:    {},  // set name -> last "closing soon" announcement
     players:  {},   // key -> { n, set, base, bid, uid, at, closesAt, closed, fl, best, hist, count, sniped }
     autobids: {},   // key -> { userId: maxBid }
     priority: {},   // userId -> [key, ...] most wanted first
@@ -1969,6 +1971,35 @@ async function openTickGuild(guild, gd) {
     }
   }
 
+  // Sets running on their own clock: warn, then settle as soon as every player
+  // in the set has closed. Anti-snipe extends players past the set deadline, so
+  // the deadline follows them rather than the other way round.
+  for (const [setName, endsAt] of Object.entries(o.setDeadlines || {})) {
+    const keys = Object.entries(o.players)
+      .filter(([, pl]) => (pl.set || 'Ungrouped') === setName && !pl.settled)
+      .map(([k]) => k);
+    if (!keys.length) { delete o.setDeadlines[setName]; delete o.setWarned[setName]; continue; }
+
+    const stillOpen = keys.filter(k => !o.players[k].closed);
+    if (stillOpen.length) {
+      const latest = Math.max(...stillOpen.map(k => o.players[k].closesAt || 0));
+      if (latest > endsAt) { o.setDeadlines[setName] = latest; scheduleAuctionSave(); }   // sniped, so the set waits
+      const left = (o.setDeadlines[setName] || endsAt) - now;
+      if (left > 0 && left <= 600000 && !o.setWarned[setName]) {
+        o.setWarned[setName] = now;
+        scheduleAuctionSave();
+        await openAnnounce(guild, gd, { embeds: [new EmbedBuilder().setColor(0xFFA500)
+          .setTitle(`⏳ ${setName} closes in under 10 minutes`)
+          .setDescription(`${stillOpen.length} player(s) still open. A bid in the last **${o.cfg.antiSnipe}m** pushes that player back, so a late raise still gets answered.`)] });
+      }
+      continue;
+    }
+
+    delete o.setDeadlines[setName];
+    delete o.setWarned[setName];
+    await settleOpenAuction(guild, gd, null, { onlyKeys: new Set(keys), label: setName });
+  }
+
   const anyOpen = Object.values(o.players).some(p => !p.closed);
   if (!anyOpen && now >= o.endsAt) await settleOpenAuction(guild, gd, null);
 }
@@ -2169,7 +2200,8 @@ function openHelpPage2(pfx) {
       { name: `\`${pfx}ocfg <key> <value>\``, value: '`maxsquad` (30) · `inc` min raise · `ladder on|off` · `antisnipe` mins · `overcommit on|off` · `base` default base · `dm on|off`. Plain `ocfg` shows all.', inline: false },
       { name: `\`${pfx}openextend <hours>\``, value: 'Push the deadline back for every player still open.', inline: true },
       { name: `\`${pfx}openpause\` / \`${pfx}openresume\``, value: 'Freeze/unfreeze bidding without losing anything.', inline: true },
-      { name: `\`${pfx}closeset <set>\``, value: 'Sell one set now and leave the rest of the pool running. Preview first, then `closeset <set> confirm`. Winners pay immediately, so their leads elsewhere may not survive.', inline: false },
+      { name: `\`${pfx}closeset <set> <30m|2h>\``, value: 'Put one set on its own countdown — anti-snipe applies to it exactly like the main deadline, and it settles itself when the last player in it closes. `closeset <set> cancel` puts it back on the main clock.', inline: false },
+      { name: `\`${pfx}closeset <set> confirm\``, value: 'Close that set on the spot instead. No warning to bidders, so the bot checks for fights in progress first. Winners pay immediately, so their leads elsewhere may not survive.', inline: false },
       { name: `\`${pfx}openend confirm\``, value: 'Close everything and settle right now.', inline: true },
       { name: `\`${pfx}openlog #channel\``, value: 'Where closes, warnings and results are posted.', inline: true },
       { name: `\`${pfx}openreset confirm\``, value: 'Wipe the open auction (pool, bids, results). `full` also clears squads bought here.', inline: true },
@@ -3047,10 +3079,14 @@ client.on('messageCreate', async (message) => {
       if (!host()) return noPerm();
       if (!o.active) { await message.channel.send('❌ No open auction is running.'); return; }
       const words     = rest.split(/\s+/).filter(Boolean);
-      const confirmed = words.length > 1 && /^(confirm|yes|y)$/i.test(words[words.length - 1]);
-      const wanted    = (confirmed ? words.slice(0, -1) : words).join(' ').trim();
+      const tail      = (words[words.length - 1] || '').toLowerCase();
+      const confirmed = words.length > 1 && /^(confirm|yes|y)$/i.test(tail);
+      const cancelling = words.length > 1 && /^(cancel|stop|off)$/i.test(tail);
+      // A trailing duration gives the set its own countdown instead of closing now.
+      const timer     = (words.length > 1 && !confirmed && !cancelling) ? parseDuration(tail) : null;
+      const wanted    = ((confirmed || cancelling || timer) ? words.slice(0, -1) : words).join(' ').trim();
       if (!wanted) {
-        await message.channel.send(`❌ Usage: \`${openPfx}closeset <set>\` to preview, then \`${openPfx}closeset <set> confirm\`. Sets: ${setNames().join(', ') || '*none*'}`);
+        await message.channel.send(`❌ Usage: \`${openPfx}closeset <set> 30m\` to put that set on a countdown, or \`${openPfx}closeset <set> confirm\` to close it right now. Sets: ${setNames().join(', ') || '*none*'}`);
         return;
       }
       const found = resolveSet(wanted);
@@ -3065,6 +3101,40 @@ client.on('messageCreate', async (message) => {
       const onlyKeys = new Set(keys);
       const preview  = computeOpenSettlement(gd, onlyKeys);
 
+      if (cancelling) {
+        if (!o.setDeadlines[found.name]) { await message.channel.send(`❌ **${found.name}** is not on a countdown.`); return; }
+        delete o.setDeadlines[found.name];
+        delete o.setWarned[found.name];
+        for (const k of keys) if (!o.players[k].closed) o.players[k].closesAt = o.endsAt;
+        scheduleAuctionSave();
+        await message.channel.send(`↩️ **${found.name}** is back on the main clock — closes ${ts(o.endsAt, 'R')}.`);
+        return;
+      }
+
+      // Own countdown: anti-snipe then protects this set exactly like the main
+      // deadline, and the ticker settles it once every player in it has closed.
+      if (timer) {
+        const endsAt = Date.now() + timer;
+        if (endsAt > o.endsAt) { await message.channel.send(`❌ That runs past the auction's own deadline (${ts(o.endsAt, 'R')}). Pick something shorter, or use \`${openPfx}openextend\` first.`); return; }
+        o.setDeadlines[found.name] = endsAt;
+        delete o.setWarned[found.name];
+        let armed = 0;
+        for (const k of keys) if (!o.players[k].closed) { o.players[k].closesAt = endsAt; armed++; }
+        scheduleAuctionSave();
+        const embed = new EmbedBuilder().setTitle(`⏳ ${found.name} closes soon`).setColor(0xFFA500)
+          .setDescription(`**${armed}** player(s) in **${found.name}** now close ${ts(endsAt, 'R')}. Everything else keeps running to the main deadline.`)
+          .addFields(
+            { name: 'Closes',     value: `${ts(endsAt, 'F')}`, inline: true },
+            { name: 'Anti-snipe', value: `${o.cfg.antiSnipe}m — a late bid pushes that player back`, inline: true },
+            { name: 'Bid now',    value: `\`${openPfx}bn <player>\` for the next step · \`${openPfx}max <player>\` for a private ceiling`, inline: false }
+          )
+          .setFooter({ text: `${openPfx}closeset ${found.name} cancel puts it back on the main clock` })
+          .setTimestamp();
+        await message.channel.send({ embeds: [embed] });
+        if (o.channelId !== message.channel.id) await openAnnounce(message.guild, gd, { embeds: [embed] });
+        return;
+      }
+
       if (!confirmed) {
         const byTeam = {};
         for (const a of preview.awards) (byTeam[a.uid] = byTeam[a.uid] || []).push(a);
@@ -3078,10 +3148,28 @@ client.on('messageCreate', async (message) => {
             { name: 'Squads',   value: (lines.join('\n') || '*no bids in this set*').slice(0, 1024), inline: false },
             { name: 'Careful',  value: 'Winners pay now, so money they had committed elsewhere may no longer cover their other leads.', inline: false }
           )
-          .setFooter({ text: `${openPfx}closeset ${found.name} confirm to go ahead` });
+          .setFooter({ text: `${openPfx}closeset ${found.name} 30m for a countdown · ${openPfx}closeset ${found.name} confirm to close right now` });
         await message.channel.send({ embeds: [embed] });
         return;
       }
+
+      // Closing on the spot cuts off any bidding still in progress — anti-snipe
+      // cannot help when there was no deadline to snipe. Say so rather than
+      // quietly guillotining a war.
+      const hot = keys.filter(k => {
+        const pl = o.players[k];
+        return !pl.closed && pl.at && Date.now() - pl.at < (o.cfg.antiSnipe || 10) * 60000;
+      });
+      if (hot.length) {
+        await message.channel.send(`⚠️ **${hot.length}** player(s) in **${found.name}** took a bid in the last ${o.cfg.antiSnipe}m: ${hot.map(k => o.players[k].n).slice(0, 8).join(', ')}.\nClosing now ends those fights mid-flow. \`${openPfx}closeset ${found.name} 30m\` gives everyone a fair warning instead — run the confirm again within a minute if you meant it.`);
+        if (!o.setWarned[`hot:${found.name}`] || Date.now() - o.setWarned[`hot:${found.name}`] > 60000) {
+          o.setWarned[`hot:${found.name}`] = Date.now();
+          scheduleAuctionSave();
+          return;
+        }
+      }
+      delete o.setWarned[`hot:${found.name}`];
+      delete o.setDeadlines[found.name];
 
       for (const k of keys) { o.players[k].closed = true; o.players[k].closesAt = Date.now(); }
       const status = await message.channel.send(`⚙️ Selling **${found.name}** — working out who keeps whom...`);
@@ -3571,7 +3659,8 @@ client.on('messageCreate', async (message) => {
       }
       const embed = new EmbedBuilder().setTitle('🗂️ Sets').setColor(0x00B2FF)
         .setDescription(Object.entries(rows).map(([s, e]) =>
-          `**${s}** — ${e.n} player(s) · ${e.open ? `${e.open} open` : 'all closed'}${e.sold ? ` · ${e.sold} sold` : ''} · ${formatAmount(e.money)} bid`
+          `**${s}** — ${e.n} player(s) · ${e.open ? `${e.open} open` : 'all closed'}${e.sold ? ` · ${e.sold} sold` : ''} · ${formatAmount(e.money)} bid` +
+          (o.setDeadlines[s] ? `\n   ⏳ closes ${ts(o.setDeadlines[s], 'R')}` : '')
         ).join('\n').slice(0, 4000))
         .setFooter({ text: `${openPfx}players <set> to browse one · hosts close a set with ${openPfx}closeset <set>` });
       await message.channel.send({ embeds: [embed] });
