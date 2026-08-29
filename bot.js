@@ -179,6 +179,75 @@ async function listBins() {
   return out;
 }
 
+// Last-resort recovery: the bot announced every sale, so channel history is a
+// backup nobody can delete by accident. These parse the bot's own embeds back
+// into (player, team, price) rows.
+function parseSaleEmbeds(message) {
+  const out = [];
+  for (const e of message.embeds || []) {
+    const title = e.title || '';
+    const desc  = e.description || '';
+
+    // Live auction: "**Player** has been sold to **Team** for **1.2cr**!"
+    const sold = desc.match(/\*\*(.+?)\*\* has been sold to \*\*(.+?)\*\* for \*\*(.+?)\*\*/);
+    if (/SOLD/i.test(title) && sold) {
+      out.push({ player: sold[1], team: sold[2], amount: parseMoney(sold[3]), src: 'sold', at: message.createdTimestamp });
+      continue;
+    }
+
+    // Open auction close announcement: "• **Player** — 1.2cr to **Team**"
+    if (/closed/i.test(title)) {
+      for (const line of desc.split('\n')) {
+        const m = line.match(/^•\s*\*\*(.+?)\*\*\s*—\s*(.+?)\s+to\s+\*\*(.+?)\*\*/);
+        if (m) out.push({ player: m[1], team: m[3], amount: parseMoney(m[2]), src: 'open-close', at: message.createdTimestamp });
+      }
+      continue;
+    }
+
+    // Results page: title "🏁 Team (Name)", lines "`1.` **Player** — 1.2cr"
+    const res = title.match(/^🏁\s+(.+)$/);
+    if (res && /^\s*`?\d+\.?`?\s*\*\*/m.test(desc)) {
+      const team = res[1].replace(/\s*\(.*\)\s*$/, '').trim();
+      for (const line of desc.split('\n')) {
+        const m = line.match(/\*\*(.+?)\*\*\s*—\s*(.+?)\s*$/);
+        if (m) out.push({ player: m[1], team, amount: parseMoney(m[2]), src: 'results', at: message.createdTimestamp });
+      }
+    }
+  }
+  return out;
+}
+
+// Team label -> member. Uses existing team names first, then a taught mapping,
+// then display/user names, so a wiped guild can still be pieced together.
+function resolveTeamLabel(gd, guild, label) {
+  const want = String(label || '').trim().toLowerCase();
+  if (!want) return null;
+  for (const [uid, name] of Object.entries(gd.teams || {})) if (String(name).toLowerCase() === want) return uid;
+  if (gd.rebuildMap && gd.rebuildMap[want]) return gd.rebuildMap[want];
+  const m = guild.members.cache.find(mem =>
+    mem.displayName.toLowerCase() === want || mem.user.username.toLowerCase() === want);
+  return m ? m.id : null;
+}
+
+// Walk back through a channel, newest first, collecting the bot's sale embeds.
+async function scanChannelForSales(channel, limit) {
+  const rows = [];
+  let before, seen = 0;
+  while (seen < limit) {
+    const batch = await channel.messages.fetch({ limit: Math.min(100, limit - seen), ...(before ? { before } : {}) });
+    if (!batch.size) break;
+    for (const msg of batch.values()) {
+      seen++;
+      if (!msg.author.bot) continue;
+      rows.push(...parseSaleEmbeds(msg));
+    }
+    before = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  rows.sort((a, b) => a.at - b.at);   // oldest first, so later sales win
+  return { rows, scanned: seen };
+}
+
 // ── Local file helpers ────────────────────────────────────────────────────
 function loadLocalAuction() {
   try {
@@ -2586,11 +2655,107 @@ client.on('messageCreate', async (message) => {
   if (recoveryPfx && userId === OWNER_ID) {
     const rw   = content.slice(recoveryPfx.length).trim().split(/\s+/).filter(Boolean);
     const rc   = (rw[0] || '').toLowerCase();
-    const RECOVERY = ['bins', 'binpeek', 'binversions', 'binrestore', 'binuse', 'localpeek', 'localrestore'];
+    const RECOVERY = ['bins', 'binpeek', 'binversions', 'binrestore', 'binuse', 'localpeek', 'localrestore', 'bininfo', 'rebuild'];
 
     if (RECOVERY.includes(rc)) {
       if (!JSONBIN_KEY && rc !== 'localpeek' && rc !== 'localrestore') {
         await message.channel.send('❌ `JSONBIN_KEY` is not set in this process — nothing can be read from JSONBin.');
+        return;
+      }
+
+      // Everything this process knows about where data lives. First thing to run.
+      if (rc === 'bininfo') {
+        const local = loadLocalAuction();
+        const mem   = summariseAuctionRecord(auctionData);
+        const embed = new EmbedBuilder().setTitle('🩺 Storage diagnosis').setColor(0x00B2FF)
+          .addFields(
+            { name: 'JSONBIN_KEY',        value: JSONBIN_KEY ? '✅ set' : '❌ MISSING — nothing can persist', inline: true },
+            { name: 'AUCTION_BIN_ID env', value: AUCTION_BIN_ID_ENV ? `\`${AUCTION_BIN_ID_ENV}\`` : '❌ not set', inline: true },
+            { name: 'Bin in use now',     value: auctionBinId ? `\`${auctionBinId}\`` : '❌ none', inline: true },
+            { name: 'CGDROP_BIN_ID',      value: cgdropBinId ? `\`${cgdropBinId}\`` : '❌ none', inline: true },
+            { name: 'Pointer in cg bin',  value: cgData.auctionBinId ? `\`${cgData.auctionBinId}\`` : '*none stored*', inline: true },
+            { name: 'Uploads',            value: auctionUploadBlocked ? '⛔ BLOCKED (bin unreadable at boot)' : '✅ allowed', inline: true },
+            { name: 'Local file',         value: local ? `✅ present · ${local._savedAt ? `<t:${Math.floor(local._savedAt / 1000)}:R>` : 'no timestamp'} · ${summariseAuctionRecord(local).guilds} guild(s)` : `❌ nothing at \`${AUCTION_LOCAL_FILE}\``, inline: false },
+            { name: 'In memory now',      value: `${mem.guilds} guild(s) · ${mem.totalPlayers} player(s) held · ${(mem.bytes / 1024).toFixed(1)} KB`, inline: false }
+          )
+          .setFooter({ text: 'A bin id here that you have not peeked at yet is your best lead.' });
+        await message.channel.send({ embeds: [embed] });
+        return;
+      }
+
+      // Rebuild squads from the bot's own announcements — the backup of last resort.
+      if (rc === 'rebuild') {
+        const gdR = getGuildData(guildId);
+
+        if ((rw[1] || '').toLowerCase() === 'map') {
+          const target = message.mentions.members.first();
+          const label  = rw.slice(2).join(' ').replace(/<@!?\d+>/g, '').trim();
+          if (!target || !label) { await message.channel.send(`❌ Usage: \`${recoveryPfx}rebuild map <team name> @user\``); return; }
+          gdR.rebuildMap = gdR.rebuildMap || {};
+          gdR.rebuildMap[label.toLowerCase()] = target.id;
+          scheduleAuctionSave();
+          await message.channel.send(`✅ **${label}** → ${target}. Re-run the scan.`);
+          return;
+        }
+
+        const ch = message.mentions.channels.first() || message.channel;
+        const limit = Math.min(parseInt(rw.find(w => /^\d+$/.test(w)) || '2000', 10), 10000);
+        const confirmed = rw.some(w => w.toLowerCase() === 'confirm');
+        const purseArg  = (() => { const i = rw.findIndex(w => w.toLowerCase() === 'purse'); return i === -1 ? null : parseMoney(rw[i + 1]); })();
+
+        const status = await message.channel.send(`🔍 Reading up to **${limit}** messages in ${ch}...`);
+        let scan;
+        try { scan = await scanChannelForSales(ch, limit); }
+        catch (e) { await status.edit(`❌ Could not read ${ch}: ${e.message}`); return; }
+
+        // Latest mention of a player wins, so a re-sale or correction is respected.
+        const byPlayer = new Map();
+        for (const r of scan.rows) if (r.player && r.amount) byPlayer.set(normPlayer(r.player), r);
+
+        const resolved = [], unknown = new Map();
+        for (const r of byPlayer.values()) {
+          const uid = resolveTeamLabel(gdR, message.guild, r.team);
+          if (uid) resolved.push({ ...r, uid });
+          else unknown.set(r.team, (unknown.get(r.team) || 0) + 1);
+        }
+
+        const byTeam = {};
+        for (const r of resolved) (byTeam[r.uid] = byTeam[r.uid] || []).push(r);
+
+        if (!confirmed) {
+          const lines = Object.entries(byTeam)
+            .sort((a, b) => b[1].length - a[1].length)
+            .map(([uid, list]) => `**${teamLabel(gdR, message.guild, uid)}** — ${list.length} player(s), ${formatAmount(list.reduce((s, r) => s + r.amount, 0))}`);
+          const embed = new EmbedBuilder().setTitle('♻️ Rebuild from channel history').setColor(0xFFA500)
+            .setDescription(`Scanned **${scan.scanned}** message(s) in ${ch} and found **${byPlayer.size}** sale(s).`)
+            .addFields(
+              { name: 'Would restore', value: (lines.join('\n') || '*nothing matched a team*').slice(0, 1024), inline: false },
+              { name: 'Unmatched team names', value: (unknown.size
+                  ? [...unknown.entries()].map(([t, n]) => `**${t}** — ${n} player(s) · \`${recoveryPfx}rebuild map ${t} @user\``).join('\n')
+                  : '*none — every team resolved*').slice(0, 1024), inline: false },
+              { name: 'Apply', value: `\`${recoveryPfx}rebuild ${ch} ${limit} confirm\`${purseArg ? '' : `\nAdd \`purse <amount>\` to also rebuild balances, e.g. \`purse 100cr\`.`}`, inline: false }
+            )
+            .setFooter({ text: 'Squads are replaced for the teams listed. Nothing else is touched.' });
+          await status.edit({ content: null, embeds: [embed] });
+          return;
+        }
+
+        if (!resolved.length) { await status.edit('❌ Nothing to restore — no sale matched a team. Teach the names with `rebuild map` first.'); return; }
+        gdR.squads = gdR.squads || {};
+        gdR.teams  = gdR.teams  || {};
+        gdR.purses = gdR.purses || {};
+        for (const [uid, list] of Object.entries(byTeam)) {
+          gdR.squads[uid] = list.map(r => ({ player: r.player, price: r.amount }));
+          if (!gdR.teams[uid]) gdR.teams[uid] = list[0].team.slice(0, 50);
+          if (purseArg) gdR.purses[uid] = Math.max(0, purseArg - list.reduce((s, r) => s + r.amount, 0));
+        }
+        scheduleAuctionSave();
+        await flushAuction();
+        const lines = Object.entries(byTeam).map(([uid, list]) =>
+          `**${teamLabel(gdR, message.guild, uid)}** — ${list.length} player(s)${purseArg ? ` · purse ${formatAmount(gdR.purses[uid])}` : ''}`);
+        await status.edit({ content: null, embeds: [new EmbedBuilder().setTitle('✅ Squads rebuilt from history').setColor(0x57F287)
+          .setDescription(lines.join('\n').slice(0, 3500))
+          .setFooter({ text: `${byPlayer.size} sale(s) from ${scan.scanned} message(s), rebuilt by ${message.author.tag}` })] });
         return;
       }
 
